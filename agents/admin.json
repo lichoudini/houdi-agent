@@ -1,0 +1,24 @@
+{
+  "name": "admin",
+  "description": "Agente de administración con comandos extendidos (usar con cuidado)",
+  "cwd": ".",
+  "allowCommands": [
+    "pwd",
+    "ls",
+    "whoami",
+    "date",
+    "uptime",
+    "uname",
+    "df",
+    "free",
+    "ps",
+    "rg",
+    "cat",
+    "head",
+    "tail",
+    "sudo",
+    "systemctl",
+    "shutdown",
+    "journalctl"
+  ]
+}

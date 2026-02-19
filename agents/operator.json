@@ -1,0 +1,20 @@
+{
+  "name": "operator",
+  "description": "Agente base para operaciones locales seguras",
+  "cwd": ".",
+  "allowCommands": [
+    "pwd",
+    "ls",
+    "whoami",
+    "date",
+    "uptime",
+    "uname",
+    "df",
+    "free",
+    "ps",
+    "rg",
+    "cat",
+    "head",
+    "tail"
+  ]
+}
