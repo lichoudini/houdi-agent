@@ -1683,6 +1683,28 @@ function decodeEscapedInlineText(raw: string): string {
     .replace(/\\t/g, "\t");
 }
 
+function formatNaturalInlineBulletList(raw: string): string {
+  const decoded = decodeEscapedInlineText(raw).trim();
+  if (!decoded) {
+    return decoded;
+  }
+
+  // If user writes "-item1 -item2 -item3" in one line, normalize to multi-line bullets.
+  if (!decoded.includes("\n")) {
+    const bulletMatches = decoded.match(/(^|\s)-\s*\S/g) ?? [];
+    if (bulletMatches.length >= 2 || decoded.startsWith("-")) {
+      const normalized = decoded
+        .replace(/\s+-\s*/g, "\n- ")
+        .replace(/^\s*-\s*/, "- ")
+        .replace(/\n{2,}/g, "\n")
+        .trim();
+      return normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+    }
+  }
+
+  return decoded;
+}
+
 function extractSimpleFilePathCandidate(text: string): string {
   const pattern =
     /(?:^|[\s"'`(])(?:workspace\/)?([^\s"'`()]+(?:\.[a-z0-9]{2,8}))(?:$|[\s"'`),.;!?])/gi;
@@ -1742,7 +1764,12 @@ function extractNaturalWorkspaceWriteContent(params: {
     /\b(?:con(?:tenido)?|contenido|texto|body|data|datos)\s*(?::|=)\s*([\s\S]+)$/i,
   );
   if (contentMatch?.[1]) {
-    return decodeEscapedInlineText(contentMatch[1].trim());
+    return formatNaturalInlineBulletList(contentMatch[1].trim());
+  }
+
+  const containMatch = text.match(/\b(?:que\s+contenga|que\s+tenga|contenga|contener)\s+([\s\S]+)$/i);
+  if (containMatch?.[1]) {
+    return formatNaturalInlineBulletList(containMatch[1].trim());
   }
 
   const withMatch = text.match(/\bcon\s+([\s\S]+)$/i);
@@ -1752,7 +1779,7 @@ function extractNaturalWorkspaceWriteContent(params: {
       .replace(/^(?:n[uú]mero|numero)\s+/i, "")
       .trim();
     if (candidate) {
-      return decodeEscapedInlineText(candidate);
+      return formatNaturalInlineBulletList(candidate);
     }
   }
 
