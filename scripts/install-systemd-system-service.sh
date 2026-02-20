@@ -21,6 +21,10 @@ TARGET_HOME="$(getent passwd "${TARGET_USER}" | cut -d: -f6)"
 TARGET_UID="$(id -u "${TARGET_USER}")"
 USER_UNIT_SYMLINK="${TARGET_HOME}/.config/systemd/user/default.target.wants/houdi-agent.service"
 USER_UNIT_FILE="${TARGET_HOME}/.config/systemd/user/houdi-agent.service"
+RESTART_POLICY="${RESTART_POLICY:-on-failure}"
+RESTART_SEC="${RESTART_SEC:-5}"
+START_LIMIT_INTERVAL="${START_LIMIT_INTERVAL:-60}"
+START_LIMIT_BURST="${START_LIMIT_BURST:-5}"
 
 if [[ ! -x "${RUNNER_SCRIPT}" ]]; then
   echo "No se encontró script ejecutable: ${RUNNER_SCRIPT}"
@@ -42,7 +46,8 @@ Description=Houdi Agent Telegram Bot (System)
 Wants=network-online.target
 After=network-online.target
 RequiresMountsFor=${PROJECT_DIR}
-StartLimitIntervalSec=0
+StartLimitIntervalSec=${START_LIMIT_INTERVAL}
+StartLimitBurst=${START_LIMIT_BURST}
 
 [Service]
 Type=simple
@@ -50,8 +55,8 @@ User=${TARGET_USER}
 Group=${TARGET_USER}
 WorkingDirectory=${PROJECT_DIR}
 ExecStart=${RUNNER_SCRIPT}
-Restart=always
-RestartSec=3
+Restart=${RESTART_POLICY}
+RestartSec=${RESTART_SEC}
 TimeoutStopSec=30
 KillSignal=SIGTERM
 Environment=NODE_ENV=production
@@ -84,3 +89,4 @@ systemctl status houdi-agent.service --no-pager --lines=30 || true
 echo
 echo "Instalación completada."
 echo "Ver logs: sudo journalctl -u houdi-agent.service -f"
+echo "Política de restart: ${RESTART_POLICY} (sec=${RESTART_SEC}, burst=${START_LIMIT_BURST}/${START_LIMIT_INTERVAL}s)"

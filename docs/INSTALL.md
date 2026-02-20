@@ -63,6 +63,8 @@ Opción A. Servicio de usuario (sin root):
 ./scripts/install-systemd-user-service.sh
 ```
 
+Este servicio queda con `Restart=on-failure` y límites de reintentos (evita loops de reinicio).
+
 Para que inicie tras reboot aunque no haya sesión abierta:
 
 ```bash
@@ -75,6 +77,9 @@ Opción B. Servicio de sistema (recomendado para producción):
 npm run build
 sudo ./scripts/install-systemd-system-service.sh
 ```
+
+También usa `Restart=on-failure` con límites configurables por env:
+`RESTART_POLICY`, `RESTART_SEC`, `START_LIMIT_INTERVAL`, `START_LIMIT_BURST`.
 
 ## 7. Verificación operativa
 

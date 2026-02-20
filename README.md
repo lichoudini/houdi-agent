@@ -553,6 +553,19 @@ Ver logs:
 sudo journalctl -u houdi-agent.service -f
 ```
 
+La unidad se instala con `Restart=on-failure` (no `always`) y límites de reinicio para evitar bucles infinitos.
+Si necesitas ajustar política:
+
+```bash
+sudo RESTART_POLICY=on-failure RESTART_SEC=5 START_LIMIT_INTERVAL=60 START_LIMIT_BURST=5 ./scripts/install-systemd-system-service.sh
+```
+
+Para detenerlo sin relanzado:
+
+```bash
+sudo systemctl disable --now houdi-agent.service
+```
+
 Desinstalar:
 
 ```bash
@@ -569,6 +582,8 @@ cd /home/houdi/houdi-agent
 ./scripts/install-systemd-user-service.sh
 sudo loginctl enable-linger $USER
 ```
+
+También usa `Restart=on-failure` con límites de reintentos.
 
 ## Checklist Post-Reboot (30s)
 
