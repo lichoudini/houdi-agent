@@ -557,6 +557,8 @@ type GmailNaturalIntent = {
   body?: string;
   cc?: string;
   bcc?: string;
+  draftRequested?: boolean;
+  draftInstruction?: string;
 };
 
 type DurableUserFact = {
@@ -3466,6 +3468,154 @@ function extractEmailAddresses(text: string): string[] {
   return [...deduped];
 }
 
+function parseGmailLabeledFields(text: string): {
+  subject: string;
+  body: string;
+  cc: string;
+  bcc: string;
+  hasSubjectLabel: boolean;
+  hasBodyLabel: boolean;
+} {
+  const pattern = /\b(asunto|subject|titulo|title|cuerpo|mensaje|texto|body|cc|bcc)\s*[:=-]\s*/gi;
+  const entries: Array<{ key: string; value: string }> = [];
+  const matches: Array<{ key: string; labelIndex: number; valueStart: number }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const key = (match[1] ?? "").toLowerCase();
+    const valueStart = match.index + match[0].length;
+    matches.push({ key, labelIndex: match.index, valueStart });
+  }
+
+  for (let index = 0; index < matches.length; index += 1) {
+    const current = matches[index];
+    const next = matches[index + 1];
+    const valueEnd = next ? next.labelIndex : text.length;
+    const rawValue = text.slice(current.valueStart, Math.max(current.valueStart, valueEnd));
+    const value = rawValue.replace(/^[\s"'`-]+|[\s"'`]+$/g, "").trim();
+    if (!value) {
+      continue;
+    }
+    entries.push({ key: current.key, value });
+  }
+
+  const subjectValues = entries
+    .filter((entry) => ["asunto", "subject", "titulo", "title"].includes(entry.key))
+    .map((entry) => entry.value);
+  const bodyValues = entries
+    .filter((entry) => ["cuerpo", "mensaje", "texto", "body"].includes(entry.key))
+    .map((entry) => entry.value);
+  const ccValues = entries.filter((entry) => entry.key === "cc").map((entry) => entry.value);
+  const bccValues = entries.filter((entry) => entry.key === "bcc").map((entry) => entry.value);
+
+  return {
+    subject: subjectValues.join(" ").trim(),
+    body: bodyValues.join("\n\n").trim(),
+    cc: ccValues.join(", ").trim(),
+    bcc: bccValues.join(", ").trim(),
+    hasSubjectLabel: subjectValues.length > 0,
+    hasBodyLabel: bodyValues.length > 0,
+  };
+}
+
+function detectGmailDraftRequested(textNormalized: string, hasBodyLabel: boolean): boolean {
+  if (hasBodyLabel) {
+    return false;
+  }
+
+  if (
+    /\b(redacta|redactar|escribe|escribir|arma|armar|genera|generar|pensa|pensar|inventa|crear)\b/.test(
+      textNormalized,
+    ) &&
+    /\b(correo|mail|email|mensaje|asunto|cuerpo|texto)\b/.test(textNormalized)
+  ) {
+    return true;
+  }
+
+  if (
+    /\b(que\s+(?:lo\s+)?(?:piense|redacte|escriba|arme|genere)\s+(?:el\s+)?(?:agente|bot|houdi))\b/.test(
+      textNormalized,
+    ) ||
+    /\b(redactalo|armalo|escribilo)\s+vos\b/.test(textNormalized) ||
+    /\b(que\s+sea\s+tu\s+mensaje|a\s+tu\s+criterio)\b/.test(textNormalized)
+  ) {
+    return true;
+  }
+
+  return /\b(asunto\s+vinculado|listado\s+de\s+las?\s+ultimas?\s+noticias)\b/.test(textNormalized);
+}
+
+function buildGmailDraftInstruction(text: string): string {
+  return text
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+    .replace(/\bcc\s*[:=-]\s*[^\n]+/gi, " ")
+    .replace(/\bbcc\s*[:=-]\s*[^\n]+/gi, " ")
+    .replace(
+      /\b(envia|enviar|enviame|manda|mandar|mandale|escribe|escribir|redacta|redactar|responde|responder|correo|correos|mail|mails|email|emails|gmail|a|para)\b/gi,
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tryParseGmailDraftJson(raw: string): { subject: string; body: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as { subject?: unknown; body?: unknown };
+    const subject = typeof parsed.subject === "string" ? parsed.subject.trim() : "";
+    const body = typeof parsed.body === "string" ? parsed.body.trim() : "";
+    if (!subject || !body) {
+      return null;
+    }
+    return { subject, body };
+  } catch {
+    return null;
+  }
+}
+
+async function draftGmailMessageWithAi(params: {
+  chatId: number;
+  to: string;
+  instruction: string;
+}): Promise<{ subject: string; body: string } | null> {
+  if (!openAi.isConfigured()) {
+    return null;
+  }
+
+  const instruction = params.instruction.trim();
+  if (!instruction) {
+    return null;
+  }
+
+  const prompt = [
+    "Redacta un email profesional en español.",
+    `Destinatario: ${params.to}`,
+    `Instrucción del usuario: ${instruction}`,
+    "Devuelve SOLO JSON válido con este schema exacto:",
+    '{"subject":"string","body":"string"}',
+    "Reglas:",
+    "- subject claro (max 90 caracteres).",
+    "- body natural, concreto, con saltos de línea.",
+    "- No incluyas markdown ni texto fuera del JSON.",
+  ].join("\n");
+
+  try {
+    const promptContext = await buildPromptContextForQuery(instruction, { chatId: params.chatId });
+    const answer = await openAi.ask(prompt, { context: promptContext });
+    return tryParseGmailDraftJson(answer);
+  } catch {
+    return null;
+  }
+}
+
 function parseNaturalLimit(textNormalized: string): number | undefined {
   const byCountWord =
     textNormalized.match(/\b(?:ultimos|ultimas|primeros|primeras|top|hasta|muestra|mostra|trae)\s+(\d{1,2})\b/) ??
@@ -3592,30 +3742,36 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
 
     let subject = "";
     let body = "";
+    let cc = "";
+    let bcc = "";
+    let draftInstruction = "";
 
     if (quotedSegments.length >= 2) {
       subject = quotedSegments[0] ?? "";
       body = quotedSegments.slice(1).join("\n\n").trim();
     } else {
-      const subjectMatch = original.match(/\basunto\s*[:=-]\s*(.+?)(?=\s+(?:cuerpo|mensaje|texto)\s*[:=-]|$)/i);
-      const bodyMatch = original.match(/\b(?:cuerpo|mensaje|texto)\s*[:=-]\s*(.+)$/i);
-      subject = subjectMatch?.[1]?.trim() ?? "";
-      body = bodyMatch?.[1]?.trim() ?? "";
+      const labeled = parseGmailLabeledFields(original);
+      subject = labeled.subject;
+      body = labeled.body;
+      cc = labeled.cc;
+      bcc = labeled.bcc;
       if (!body) {
         body = original.match(/\bque diga\b[:\s,-]*(.+)$/i)?.[1]?.trim() ?? "";
       }
+
+      const draftRequested = detectGmailDraftRequested(normalized, labeled.hasBodyLabel);
+      if (draftRequested) {
+        draftInstruction = buildGmailDraftInstruction(original);
+      }
+      if (!body && !draftRequested) {
+        body = buildGmailDraftInstruction(original);
+      }
     }
 
-    if (!body) {
-      body = original
-        .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
-        .replace(
-          /\b(envia|enviar|enviame|manda|mandar|mandale|escribe|escribir|redacta|redactar|responde|responder|correo|correos|mail|mails|email|emails|gmail|a|para)\b/gi,
-          " ",
-        )
-        .replace(/\s+/g, " ")
-        .trim();
+    if (!draftInstruction && !body && quotedSegments.length < 2 && detectGmailDraftRequested(normalized, false)) {
+      draftInstruction = buildGmailDraftInstruction(original);
     }
+    const draftRequested = Boolean(draftInstruction);
     if (!subject) {
       subject = "Mensaje desde Houdi Agent";
     }
@@ -3623,8 +3779,12 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
       body = "Mensaje enviado desde Houdi Agent.";
     }
 
-    const cc = original.match(/\bcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim();
-    const bcc = original.match(/\bbcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim();
+    if (!cc) {
+      cc = original.match(/\bcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim() ?? "";
+    }
+    if (!bcc) {
+      bcc = original.match(/\bbcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim() ?? "";
+    }
 
     return {
       shouldHandle: true,
@@ -3632,8 +3792,10 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
       to,
       subject,
       body,
-      cc,
-      bcc,
+      ...(cc ? { cc } : {}),
+      ...(bcc ? { bcc } : {}),
+      draftRequested,
+      ...(draftInstruction ? { draftInstruction } : {}),
     };
   }
 
@@ -8516,13 +8678,36 @@ async function maybeHandleNaturalGmailInstruction(params: {
 
     if (intent.action === "send") {
       const to = intent.to?.trim() ?? "";
-      const subject = intent.subject?.trim() || "Mensaje desde Houdi Agent";
-      const body = intent.body?.trim() || "Mensaje enviado desde Houdi Agent.";
+      let subject = intent.subject?.trim() || "Mensaje desde Houdi Agent";
+      let body = intent.body?.trim() || "";
       if (!to) {
         await params.ctx.reply(
           "No pude inferir el destinatario. Ejemplo natural: 'envía un correo a ana@empresa.com asunto: Hola cuerpo: te contacto por...'",
         );
         return true;
+      }
+      if (intent.draftRequested) {
+        const instruction = intent.draftInstruction?.trim() || params.text.trim();
+        if (openAi.isConfigured()) {
+          await replyProgress(params.ctx, "Redactando email...");
+          const draft = await draftGmailMessageWithAi({
+            chatId: params.ctx.chat.id,
+            to,
+            instruction,
+          });
+          if (draft) {
+            subject = draft.subject;
+            body = draft.body;
+          }
+        } else {
+          body = body || instruction;
+          if (!subject || subject === "Mensaje desde Houdi Agent") {
+            subject = "Mensaje generado por instrucción";
+          }
+        }
+      }
+      if (!body) {
+        body = "Mensaje enviado desde Houdi Agent.";
       }
       await replyProgress(params.ctx, `Enviando email a ${to}...`);
       const sent = await gmailAccount.sendMessage({
