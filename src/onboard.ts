@@ -691,9 +691,11 @@ async function main(): Promise<void> {
         "",
         "Onboarding completado.",
         "Siguientes pasos sugeridos:",
-        "1) Verifica estado con: npm run cli -- memory status",
-        "2) Inicia el bot (si no instalaste servicio): npm start",
-        "3) Prueba Telegram con /status y un mensaje natural.",
+        "1) Inicia el bot (si no instalaste servicio): npm start",
+        "2) Entra al CLI interactivo: npm run cli -- chat",
+        '3) Envío único por CLI: npm run cli -- agent -m "hola"',
+        "4) Diagnóstico rápido: npm run cli -- memory status",
+        "5) Prueba Telegram con /status y un mensaje natural.",
       ].join("\n"),
     );
   } finally {
