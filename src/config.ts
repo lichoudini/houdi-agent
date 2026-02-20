@@ -102,6 +102,49 @@ function parseBooleanFlag(value: string | undefined, defaultValue: boolean): boo
   throw new Error(`Invalid boolean flag value: ${value}`);
 }
 
+function isValidIPv4(host: string): boolean {
+  const chunks = host.split(".");
+  if (chunks.length !== 4) {
+    return false;
+  }
+  for (const chunk of chunks) {
+    if (!/^\d{1,3}$/.test(chunk)) {
+      return false;
+    }
+    const value = Number.parseInt(chunk, 10);
+    if (value < 0 || value > 255) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isValidHostname(host: string): boolean {
+  if (host.length > 253 || host.startsWith("-") || host.endsWith("-")) {
+    return false;
+  }
+  const labels = host.split(".");
+  if (labels.some((label) => label.length === 0 || label.length > 63)) {
+    return false;
+  }
+  return labels.every((label) => /^[A-Za-z0-9-]+$/.test(label) && !label.startsWith("-") && !label.endsWith("-"));
+}
+
+function normalizeLocalApiHost(raw: string): string {
+  const value = raw.trim();
+  if (!value) {
+    return "127.0.0.1";
+  }
+  const lowered = value.toLowerCase();
+  if (["y", "yes", "s", "si", "sí", "n", "no", "true", "false"].includes(lowered)) {
+    return "127.0.0.1";
+  }
+  if (lowered === "localhost" || value === "::1" || isValidIPv4(value) || isValidHostname(value)) {
+    return value;
+  }
+  return "127.0.0.1";
+}
+
 const env = EnvSchema.parse(process.env);
 
 export const config = {
@@ -157,7 +200,7 @@ export const config = {
   limPublicHealthUrl: env.LIM_PUBLIC_HEALTH_URL || env.CONNECTOR_PUBLIC_HEALTH_URL || "http://127.0.0.1:3333/health",
   limHealthTimeoutMs: env.LIM_HEALTH_TIMEOUT_MS ?? env.CONNECTOR_HEALTH_TIMEOUT_MS ?? 7000,
   localApiEnabled: parseBooleanFlag(env.HOUDI_LOCAL_API_ENABLED, true),
-  localApiHost: env.HOUDI_LOCAL_API_HOST,
+  localApiHost: normalizeLocalApiHost(env.HOUDI_LOCAL_API_HOST),
   localApiPort: env.HOUDI_LOCAL_API_PORT,
   localApiToken: env.HOUDI_LOCAL_API_TOKEN?.trim() || undefined,
   adminApprovalTtlSeconds: env.ADMIN_APPROVAL_TTL_SECONDS,

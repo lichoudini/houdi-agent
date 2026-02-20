@@ -257,6 +257,66 @@ function normalizeDirValue(raw: string, fallback: string): string {
   return value.startsWith("./") || value.startsWith("../") ? value : `./${value}`;
 }
 
+function isValidIPv4(host: string): boolean {
+  const chunks = host.split(".");
+  if (chunks.length !== 4) {
+    return false;
+  }
+  for (const chunk of chunks) {
+    if (!/^\d{1,3}$/.test(chunk)) {
+      return false;
+    }
+    const value = Number.parseInt(chunk, 10);
+    if (value < 0 || value > 255) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isValidHostname(host: string): boolean {
+  if (host.length > 253 || host.startsWith("-") || host.endsWith("-")) {
+    return false;
+  }
+  const labels = host.split(".");
+  if (labels.some((label) => label.length === 0 || label.length > 63)) {
+    return false;
+  }
+  return labels.every((label) => /^[A-Za-z0-9-]+$/.test(label) && !label.startsWith("-") && !label.endsWith("-"));
+}
+
+function normalizeLocalApiHostCandidate(raw: string | undefined): string {
+  const value = (raw || "").trim();
+  if (!value) {
+    return "127.0.0.1";
+  }
+  if (validateLocalApiHost(value) !== null) {
+    return "127.0.0.1";
+  }
+  return value;
+}
+
+function validateLocalApiHost(raw: string): string | null {
+  const value = raw.trim();
+  if (!value) {
+    return "Host requerido.";
+  }
+  if (/\s/.test(value)) {
+    return "Host inválido: no puede contener espacios.";
+  }
+
+  const lowered = value.toLowerCase();
+  if (["y", "yes", "s", "si", "sí", "n", "no", "true", "false"].includes(lowered)) {
+    return "Host inválido: parece una respuesta y/n. Usa 127.0.0.1, localhost, ::1 o un host válido.";
+  }
+
+  if (lowered === "localhost" || value === "::1" || isValidIPv4(value) || isValidHostname(value)) {
+    return null;
+  }
+
+  return "Host inválido. Usa 127.0.0.1, localhost, ::1 o un host/IP válido.";
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const assumeRiskAccepted = argv.includes("--accept-risk");
@@ -448,9 +508,11 @@ async function main(): Promise<void> {
     );
     envMap.set("HOUDI_LOCAL_API_ENABLED", normalizeBoolean(enableLocalApi));
     if (enableLocalApi) {
+      const localApiHostDefault = normalizeLocalApiHostCandidate(envMap.get("HOUDI_LOCAL_API_HOST"));
       const localApiHost = await promptLine(rl, "HOUDI_LOCAL_API_HOST", {
-        defaultValue: envMap.get("HOUDI_LOCAL_API_HOST") || "127.0.0.1",
+        defaultValue: localApiHostDefault,
         required: true,
+        validate: validateLocalApiHost,
       });
       const localApiPort = await promptLine(rl, "HOUDI_LOCAL_API_PORT", {
         defaultValue: envMap.get("HOUDI_LOCAL_API_PORT") || "3210",
