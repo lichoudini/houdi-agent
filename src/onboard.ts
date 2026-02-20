@@ -19,60 +19,70 @@ const ENV_PATH = path.join(PROJECT_DIR, ".env");
 const ENV_EXAMPLE_PATH = path.join(PROJECT_DIR, ".env.example");
 const ANSI_LIGHT_BLUE = "\x1b[94m";
 const ANSI_RESET = "\x1b[0m";
+const VRAND_GRADIENT = [
+  "\x1b[38;5;17m",
+  "\x1b[38;5;18m",
+  "\x1b[38;5;19m",
+  "\x1b[38;5;20m",
+  "\x1b[38;5;25m",
+  "\x1b[38;5;27m",
+  "\x1b[38;5;33m",
+  "\x1b[38;5;39m",
+];
 const VRAND_QUOTE =
   "The currents before us are ever changing. We must adapt and press forward if we are to see our journey's end.";
 
 function buildVrandAsciiLines(): string[] {
-  // 8-line ASCII banner (height fixed at 8)
+  // 8-line ASCII banner (height fixed at 8), thicker body.
   const v = [
-    "V     V",
-    "V     V",
-    "V     V",
-    "V     V",
-    " V   V ",
-    " V   V ",
-    "  V V  ",
-    "   V   ",
+    "VVVVVV        VVVVVV",
+    " VVVVVV      VVVVVV ",
+    "  VVVVVV    VVVVVV  ",
+    "   VVVVVV  VVVVVV   ",
+    "    VVVVVVVVVVVV    ",
+    "     VVVVVVVVVV     ",
+    "      VVVVVVVV      ",
+    "       VVVVVV       ",
   ];
   const r = [
-    "RRRRR  ",
-    "R    R ",
-    "R    R ",
-    "RRRRR  ",
-    "R  R   ",
-    "R   R  ",
-    "R    R ",
-    "R     R",
+    "RRRRRRRRRRRR ",
+    "RRRRRRRRRRRRR",
+    "RRRR      RRR",
+    "RRRR      RRR",
+    "RRRRRRRRRRRRR",
+    "RRRRRRRRRRRR ",
+    "RRRR   RRRRR ",
+    "RRRR    RRRRR",
   ];
   const a = [
-    "  AAA  ",
-    " A   A ",
-    "A     A",
-    "A     A",
-    "AAAAAAA",
-    "A     A",
-    "A     A",
-    "A     A",
+    "    AAAAAAAA    ",
+    "   AAAA  AAAA   ",
+    "  AAAA    AAAA  ",
+    " AAAAAAAAAAAAAA ",
+    " AAAAAAAAAAAAAA ",
+    " AAAA      AAAA ",
+    " AAAA      AAAA ",
+    " AAAA      AAAA ",
   ];
   const n = [
-    "N     N",
-    "NN    N",
-    "N N   N",
-    "N  N  N",
-    "N   N N",
-    "N    NN",
-    "N     N",
-    "N     N",
+    "NNNN      NNNN",
+    "NNNNN     NNNN",
+    "NNNNNN    NNNN",
+    "NNNN NNN  NNNN",
+    "NNNN  NNN NNNN",
+    "NNNN   NNNNNNN",
+    "NNNN    NNNNNN",
+    "NNNN      NNNN",
   ];
   const d = [
-    "DDDDD  ",
-    "D    D ",
-    "D     D",
-    "D     D",
-    "D     D",
-    "D     D",
-    "D    D ",
-    "DDDDD  ",
+    "DDDDDDDDDDD  ",
+    "DDDDDDDDDDDD ",
+    "DDDD     DDDD",
+    "DDDD      DDD",
+    "DDDD      DDD",
+    "DDDD      DDD",
+    "DDDD     DDDD",
+    "DDDDDDDDDDDD ",
   ];
   const lines: string[] = [];
   for (let i = 0; i < 8; i += 1) {
@@ -83,7 +93,7 @@ function buildVrandAsciiLines(): string[] {
 
 function printVrandWelcomeBanner(): void {
   const lines = buildVrandAsciiLines();
-  const output = lines.map((line) => `${ANSI_LIGHT_BLUE}${line}${ANSI_RESET}`).join("\n");
+  const output = lines.map((line, index) => `${VRAND_GRADIENT[index] ?? ANSI_LIGHT_BLUE}${line}${ANSI_RESET}`).join("\n");
   process.stdout.write(`${output}\n`);
   process.stdout.write(`${ANSI_LIGHT_BLUE}${VRAND_QUOTE}${ANSI_RESET}\n\n`);
 }

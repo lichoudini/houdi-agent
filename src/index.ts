@@ -500,6 +500,9 @@ type ScheduleNaturalIntent = {
   taskRef?: string;
   taskTitle?: string;
   dueAt?: Date;
+  scheduleEmail?: boolean;
+  emailTo?: string;
+  emailInstruction?: string;
 };
 
 type WorkspaceNameSelectorMode = "startsWith" | "contains" | "exact";
@@ -3212,6 +3215,36 @@ function extractTaskTitleForCreate(text: string): string {
   return sanitizeScheduleTitle(cleaned);
 }
 
+function inferDefaultSelfEmailRecipient(text: string): string {
+  const normalized = normalizeIntentText(text);
+  const selfDirected =
+    /\b(enviame|enviarme|mandame|mandarme|mandame|mandáme|enviamelo|enviámelo)\b/.test(normalized) ||
+    /\b(a mi|para mi|a mí|para mí)\b/.test(normalized);
+  if (!selfDirected) {
+    return "";
+  }
+  return config.gmailAccountEmail?.trim().toLowerCase() || "";
+}
+
+function extractScheduledEmailInstruction(text: string): string {
+  const quoted = extractQuotedSegments(text);
+  if (quoted.length > 0) {
+    return truncateInline(quoted.join(" ").trim(), 1000);
+  }
+
+  const cleaned = stripScheduleTemporalPhrases(text)
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+    .replace(
+      /\b(enviame|enviarme|envia|enviar|manda|mandar|mandame|mandarme|correo|mail|email|gmail|a|para|hoy|esta tarde|esta noche|esta manana|esta mañana)\b/gi,
+      " ",
+    )
+    .replace(/\b(con asunto|asunto|mensaje|cuerpo|texto)\s*[:=-]?\s*/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return truncateInline(cleaned, 1000);
+}
+
 function extractTaskTitleForEdit(text: string): string {
   const quoted = extractQuotedSegments(text);
   if (quoted.length > 0) {
@@ -3266,6 +3299,8 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
   const normalized = normalizeIntentText(original);
   const scheduleNouns = /\b(recordatorio|recordatorios|tarea|tareas|agenda)\b/.test(normalized);
   const parsedSchedule = parseNaturalScheduleDateTime(original, new Date());
+  const hasEmailNoun = /\b(correo|mail|email|gmail)\b/.test(normalized);
+  const hasSendVerb = /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme)\b/.test(normalized);
 
   const listRequested =
     /\b(lista|listar|mostra|mostrar|ver|cuales|cuantas|pendientes)\b/.test(normalized) &&
@@ -3305,6 +3340,24 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
     /\b(recordame|recordarme|recuerdame|agenda|agendame|agendar|programa|programar|crear|crea|genera|generar)\b/.test(
       normalized,
     ) && (scheduleNouns || parsedSchedule.hasTemporalSignal);
+  const scheduledEmailRequested = parsedSchedule.hasTemporalSignal && hasEmailNoun && hasSendVerb;
+  if (scheduledEmailRequested) {
+    const to = extractEmailAddresses(original)[0] ?? inferDefaultSelfEmailRecipient(original);
+    const emailInstruction = extractScheduledEmailInstruction(original);
+    const taskTitle = sanitizeScheduleTitle(
+      `Enviar email${to ? ` a ${to}` : ""}${emailInstruction ? `: ${emailInstruction}` : ""}`,
+    );
+    return {
+      shouldHandle: true,
+      action: "create",
+      scheduleEmail: true,
+      ...(taskTitle ? { taskTitle } : {}),
+      ...(to ? { emailTo: to } : {}),
+      ...(emailInstruction ? { emailInstruction } : {}),
+      ...(parsedSchedule.dueAt ? { dueAt: parsedSchedule.dueAt } : {}),
+    };
+  }
+
   if (createRequested || (scheduleNouns && parsedSchedule.hasTemporalSignal)) {
     const taskTitle = extractTaskTitleForCreate(original);
     return {
@@ -3550,7 +3603,7 @@ function buildGmailDraftInstruction(text: string): string {
     .replace(/\bcc\s*[:=-]\s*[^\n]+/gi, " ")
     .replace(/\bbcc\s*[:=-]\s*[^\n]+/gi, " ")
     .replace(
-      /\b(envia|enviar|enviame|manda|mandar|mandale|escribe|escribir|redacta|redactar|responde|responder|correo|correos|mail|mails|email|emails|gmail|a|para)\b/gi,
+      /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme|mandale|escribe|escribir|redacta|redactar|responde|responder|correo|correos|mail|mails|email|emails|gmail|a|para)\b/gi,
       " ",
     )
     .replace(/\s+/g, " ")
@@ -3678,7 +3731,7 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
   const quotedSegments = extractQuotedSegments(original);
 
   const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
-  const sendVerb = /\b(envia|enviar|enviame|manda|mandar|mandale|escribe|escribir|redacta|redactar|responde|responder)\b/.test(
+  const sendVerb = /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme|mandale|escribe|escribir|redacta|redactar|responde|responder)\b/.test(
     normalized,
   );
   const readVerb = /\b(lee|leer|abre|abrir|mostra|mostrar|detalle|contenido|revisa|revisar)\b/.test(normalized);
@@ -3738,7 +3791,8 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
   }
 
   if (sendVerb && (hasMailContext || emailCandidates.length > 0)) {
-    const to = emailCandidates[0] ?? "";
+    const inferredSelfTo = inferDefaultSelfEmailRecipient(original);
+    const to = emailCandidates[0] ?? inferredSelfTo;
 
     let subject = "";
     let body = "";
@@ -6035,6 +6089,105 @@ const bot = new Bot(config.telegramBotToken);
 let scheduleDeliveryLoopRunning = false;
 let spontaneousSuggestionLoopRunning = false;
 
+function parseScheduledEmailPayload(raw?: string): { to?: string; instruction?: string } | null {
+  if (!raw || !raw.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { to?: unknown; instruction?: unknown };
+    const to = typeof parsed.to === "string" ? parsed.to.trim().toLowerCase() : "";
+    const instruction = typeof parsed.instruction === "string" ? parsed.instruction.trim() : "";
+    return {
+      ...(to ? { to } : {}),
+      ...(instruction ? { instruction } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function buildScheduledEmailBody(params: { chatId: number; instruction: string }): Promise<string> {
+  const instruction = params.instruction.trim();
+  const normalized = normalizeIntentText(instruction);
+  const sections: string[] = [];
+
+  if (/\b(recordatorios?|tareas?|pendientes?)\b/.test(normalized)) {
+    const pending = scheduledTasks.listPending(params.chatId).slice(0, 20);
+    const lines =
+      pending.length > 0
+        ? pending.map((task, idx) => `${idx + 1}. ${task.title} (${formatScheduleDateTime(new Date(task.dueAt))})`)
+        : ["No hay recordatorios pendientes."];
+    sections.push(["Recordatorios pendientes:", ...lines].join("\n"));
+  }
+
+  const asksNews = /\b(noticias?|novedades?|titulares?|actualidad|news)\b/.test(normalized);
+  if (asksNews && config.enableWebBrowse) {
+    const rawTopic = instruction || "futbol";
+    const rawQuery = sanitizeNaturalWebQuery(rawTopic) || rawTopic;
+    const searchResult = await runWebSearchQuery({
+      rawQuery,
+      newsRequested: true,
+    });
+    const hits = searchResult.hits.slice(0, 4);
+    const lines =
+      hits.length > 0
+        ? hits.map((hit, idx) => `${idx + 1}. ${hit.title}\n${hit.url}`)
+        : ["No encontré noticias recientes para ese tema."];
+    sections.push(["Noticias recientes:", ...lines].join("\n"));
+  }
+
+  if (/\b(estoic|marco aurelio|reflexion|reflexión)\b/.test(normalized)) {
+    sections.push(
+      [
+        "Reflexión estoica:",
+        "Enfócate en lo que sí controlas hoy: tu atención, tus decisiones y tu carácter.",
+        "Lo externo cambia; tu criterio y disciplina son tu ventaja sostenible.",
+      ].join("\n"),
+    );
+  }
+
+  if (sections.length === 0) {
+    if (openAi.isConfigured()) {
+      const prompt = [
+        "Redacta un email breve en español.",
+        `Instrucción: ${instruction || "enviar una actualización útil"}`,
+        "Sin markdown. Solo texto plano.",
+      ].join("\n");
+      const promptContext = await buildPromptContextForQuery(instruction || "email programado", {
+        chatId: params.chatId,
+      });
+      const drafted = await openAi.ask(prompt, { context: promptContext });
+      if (drafted.trim()) {
+        return drafted.trim();
+      }
+    }
+    return instruction || "Recordatorio automático de Houdi Agent.";
+  }
+
+  return sections.join("\n\n");
+}
+
+async function deliverScheduledGmailTask(task: { chatId: number; deliveryPayload?: string; title: string }): Promise<void> {
+  const payload = parseScheduledEmailPayload(task.deliveryPayload);
+  const to = payload?.to?.trim() || config.gmailAccountEmail?.trim() || "";
+  if (!to) {
+    throw new Error("No hay destinatario configurado para envío programado.");
+  }
+
+  const instruction = payload?.instruction?.trim() || task.title;
+  const body = await buildScheduledEmailBody({
+    chatId: task.chatId,
+    instruction,
+  });
+  const subject = `Houdi | ${new Date().toLocaleString("es-AR", { hour12: false })}`;
+
+  await gmailAccount.sendMessage({
+    to,
+    subject,
+    body: body.trim() || "Actualización automática de Houdi Agent.",
+  });
+}
+
 async function processDueScheduledTasks(): Promise<void> {
   if (scheduleDeliveryLoopRunning) {
     return;
@@ -6044,6 +6197,29 @@ async function processDueScheduledTasks(): Promise<void> {
     const due = scheduledTasks.dueTasks(new Date());
     for (const task of due) {
       try {
+        if (task.deliveryKind === "gmail-send") {
+          await deliverScheduledGmailTask(task);
+          await bot.api.sendMessage(
+            task.chatId,
+            [
+              "Email programado enviado.",
+              `id: ${task.id}`,
+              `cuando: ${formatScheduleDateTime(new Date(task.dueAt))}`,
+              `detalle: ${task.title}`,
+            ].join("\n"),
+          );
+          await scheduledTasks.markDelivered(task.id, new Date());
+          await safeAudit({
+            type: "schedule.delivered",
+            chatId: task.chatId,
+            userId: task.userId,
+            details: {
+              taskId: task.id,
+              deliveryKind: "gmail-send",
+            },
+          });
+          continue;
+        }
         await bot.api.sendMessage(
           task.chatId,
           [
@@ -6868,16 +7044,41 @@ async function maybeHandleNaturalScheduleInstruction(params: {
         return true;
       }
 
+      if (intent.scheduleEmail) {
+        const accessIssue = getGmailAccessIssue(params.ctx);
+        if (accessIssue) {
+          await params.ctx.reply(accessIssue);
+          return true;
+        }
+      }
+
+      const scheduledEmailTo = intent.emailTo?.trim() || "";
+      if (intent.scheduleEmail && !scheduledEmailTo && !config.gmailAccountEmail?.trim()) {
+        await params.ctx.reply(
+          "No tengo destinatario para el email programado. Configura GMAIL_ACCOUNT_EMAIL o indícalo en el mensaje.",
+        );
+        return true;
+      }
+
       const created = await scheduledTasks.createTask({
         chatId: params.ctx.chat.id,
         userId: params.userId,
         title,
         dueAt,
+        ...(intent.scheduleEmail ? { deliveryKind: "gmail-send" as const } : {}),
+        ...(intent.scheduleEmail
+          ? {
+              deliveryPayload: JSON.stringify({
+                to: scheduledEmailTo || config.gmailAccountEmail?.trim() || "",
+                instruction: intent.emailInstruction?.trim() || title,
+              }),
+            }
+          : {}),
       });
       const pending = scheduledTasks.listPending(params.ctx.chat.id);
       const index = Math.max(1, pending.findIndex((item) => item.id === created.id) + 1);
       const responseText = [
-        "Tarea programada.",
+        intent.scheduleEmail ? "Email programado." : "Tarea programada.",
         `#${index} | id: ${created.id}`,
         `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
         `detalle: ${created.title}`,

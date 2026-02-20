@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 export type ScheduledTaskStatus = "pending" | "done" | "canceled";
+export type ScheduledTaskDeliveryKind = "reminder" | "gmail-send";
 
 export type ScheduledTask = {
   id: string;
@@ -17,6 +18,8 @@ export type ScheduledTask = {
   failureCount: number;
   lastError?: string;
   retryAfter?: string;
+  deliveryKind?: ScheduledTaskDeliveryKind;
+  deliveryPayload?: string;
 };
 
 type ScheduledTaskStorage = {
@@ -28,6 +31,8 @@ export type CreateScheduledTaskInput = {
   userId?: number;
   title: string;
   dueAt: Date;
+  deliveryKind?: ScheduledTaskDeliveryKind;
+  deliveryPayload?: string;
 };
 
 export type UpdateScheduledTaskInput = {
@@ -86,6 +91,11 @@ function normalizeTask(raw: unknown): ScheduledTask | null {
   const chatIdRaw = obj.chatId;
   const userIdRaw = obj.userId;
   const failureCountRaw = obj.failureCount;
+  const deliveryKindRaw = typeof obj.deliveryKind === "string" ? obj.deliveryKind.trim().toLowerCase() : "";
+  const deliveryPayloadRaw =
+    typeof obj.deliveryPayload === "string" && obj.deliveryPayload.trim().length > 0
+      ? obj.deliveryPayload.slice(0, 30_000)
+      : undefined;
 
   const chatId =
     typeof chatIdRaw === "number" && Number.isFinite(chatIdRaw)
@@ -134,6 +144,8 @@ function normalizeTask(raw: unknown): ScheduledTask | null {
     ...(canceledAt ? { canceledAt: new Date(canceledAt).toISOString() } : {}),
     ...(retryAfter ? { retryAfter: new Date(retryAfter).toISOString() } : {}),
     ...(lastError ? { lastError } : {}),
+    ...((deliveryKindRaw === "gmail-send" || deliveryKindRaw === "reminder") ? { deliveryKind: deliveryKindRaw } : {}),
+    ...(deliveryPayloadRaw ? { deliveryPayload: deliveryPayloadRaw } : {}),
     failureCount,
   };
 }
@@ -262,6 +274,10 @@ export class ScheduledTaskService {
       updatedAt: now,
       status: "pending",
       failureCount: 0,
+      ...(input.deliveryKind ? { deliveryKind: input.deliveryKind } : {}),
+      ...(typeof input.deliveryPayload === "string" && input.deliveryPayload.trim().length > 0
+        ? { deliveryPayload: input.deliveryPayload.slice(0, 30_000) }
+        : {}),
     };
 
     this.tasks.push(task);
@@ -397,4 +413,3 @@ export class ScheduledTaskService {
     return { ...next };
   }
 }
-

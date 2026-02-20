@@ -326,7 +326,7 @@ export class GmailAccountService {
     const cc = params.cc?.trim();
     const bcc = params.bcc?.trim();
 
-    const rawMessage = [
+    const headers = [
       from ? `From: ${from}` : "",
       `To: ${to}`,
       cc ? `Cc: ${cc}` : "",
@@ -335,11 +335,11 @@ export class GmailAccountService {
       "MIME-Version: 1.0",
       'Content-Type: text/plain; charset="UTF-8"',
       "Content-Transfer-Encoding: 8bit",
-      "",
-      body,
     ]
       .filter(Boolean)
       .join("\r\n");
+    // RFC 5322: headers and body must be separated by a blank line.
+    const rawMessage = `${headers}\r\n\r\n${body}`;
 
     const raw = Buffer.from(rawMessage, "utf8").toString("base64url");
     const gmail = await this.getGmailClient();
