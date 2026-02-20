@@ -1,5 +1,9 @@
 # Houdi Agent - Runbook Operativo
 
+## 0. Perfiles de operación
+- `full-control` (host propio): `DEFAULT_AGENT=admin`, habilitar solo integraciones necesarias y monitorear `journalctl`.
+- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false`/`ENABLE_LIM_CONTROL=false` salvo necesidad, usar `/adminmode on` para cambios sensibles.
+
 ## 1. Arranque normal
 ```bash
 sudo systemctl status houdi-agent.service --no-pager
@@ -46,3 +50,16 @@ sudo systemctl status houdi-agent.service --no-pager
 - Doble instancia:
   - verificar procesos de `dist/index.js`
   - mantener solo el servicio de sistema activo
+
+## 7. Publicación privada en GitHub
+1. Verificar workspace limpio y build:
+   - `git status`
+   - `npm run build`
+2. Commit:
+   - `git add -A`
+   - `git commit -m "chore: release houdi-agent"`
+3. Crear repo privado (si no existe) en tu usuario.
+4. Push:
+   - `git remote add origin git@github.com:<usuario>/houdi-agent.git`
+   - `git branch -M main`
+   - `git push -u origin main`

@@ -1,6 +1,6 @@
 {
   "name": "operator",
-  "description": "Agente base para operaciones locales seguras",
+  "description": "Agente operativo con permisos administrativos (equivalente a admin)",
   "cwd": ".",
   "allowCommands": [
     "pwd",
@@ -15,6 +15,11 @@
     "rg",
     "cat",
     "head",
-    "tail"
+    "tail",
+    "gmail-api",
+    "sudo",
+    "systemctl",
+    "shutdown",
+    "journalctl"
   ]
 }

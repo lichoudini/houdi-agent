@@ -6,12 +6,21 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "cli": "tsx src/cli.ts",
+    "onboard": "tsx src/onboard.ts",
+    "setup": "npm run onboard"
   },
   "dependencies": {
+    "cheerio": "^1.2.0",
     "dotenv": "^16.5.0",
+    "googleapis": "^171.4.0",
     "grammy": "^1.38.0",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.11.0",
     "openai": "^5.20.0",
+    "pdf-parse": "^2.4.5",
+    "xlsx": "^0.18.5",
     "zod": "^3.24.1"
   },
   "devDependencies": {

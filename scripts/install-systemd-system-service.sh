@@ -56,6 +56,7 @@ TimeoutStopSec=30
 KillSignal=SIGTERM
 Environment=NODE_ENV=production
 Environment=HOME=${TARGET_HOME}
+Environment="NODE_OPTIONS=--no-network-family-autoselection --dns-result-order=ipv4first"
 NoNewPrivileges=false
 PrivateTmp=true
 

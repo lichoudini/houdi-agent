@@ -16,6 +16,7 @@
     "cat",
     "head",
     "tail",
+    "gmail-api",
     "sudo",
     "systemctl",
     "shutdown",

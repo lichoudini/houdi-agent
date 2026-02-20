@@ -10,6 +10,10 @@ dist/
 *.lock
 houdi-audit.log
 backups/
+workspace/
+houdi-schedule.json
+houdi-interests.json
+houdi-selfskill-drafts.json
 
 # Local environment and secrets
 .env
