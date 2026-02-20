@@ -37,6 +37,8 @@ const ANSI_RESET = "\x1b[0m";
 const CLI_LOCAL_BRIDGE_MESSAGE_PATH = "/internal/cli/message";
 const CLI_LOCAL_BRIDGE_HEALTH_PATH = "/internal/cli/health";
 const CLI_LOCAL_BRIDGE_TIMEOUT_MS = 90_000;
+const VRAND_QUOTE =
+  "The currents before us are ever changing. We must adapt and press forward if we are to see our journey's end.";
 
 function printUsage(): void {
   const lines = [
@@ -134,6 +136,7 @@ function printVrandWelcomeBanner(): void {
   const lines = buildVrandAsciiLines();
   const output = lines.map((line) => `${ANSI_LIGHT_BLUE}${line}${ANSI_RESET}`).join("\n");
   process.stdout.write(`${output}\n`);
+  process.stdout.write(`${ANSI_LIGHT_BLUE}${VRAND_QUOTE}${ANSI_RESET}\n\n`);
 }
 
 function normalizeIntentText(text: string): string {

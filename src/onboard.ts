@@ -17,6 +17,76 @@ type PromptOptions = {
 const PROJECT_DIR = process.cwd();
 const ENV_PATH = path.join(PROJECT_DIR, ".env");
 const ENV_EXAMPLE_PATH = path.join(PROJECT_DIR, ".env.example");
+const ANSI_LIGHT_BLUE = "\x1b[94m";
+const ANSI_RESET = "\x1b[0m";
+const VRAND_QUOTE =
+  "The currents before us are ever changing. We must adapt and press forward if we are to see our journey's end.";
+
+function buildVrandAsciiLines(): string[] {
+  // 8-line ASCII banner (height fixed at 8)
+  const v = [
+    "V     V",
+    "V     V",
+    "V     V",
+    "V     V",
+    " V   V ",
+    " V   V ",
+    "  V V  ",
+    "   V   ",
+  ];
+  const r = [
+    "RRRRR  ",
+    "R    R ",
+    "R    R ",
+    "RRRRR  ",
+    "R  R   ",
+    "R   R  ",
+    "R    R ",
+    "R     R",
+  ];
+  const a = [
+    "  AAA  ",
+    " A   A ",
+    "A     A",
+    "A     A",
+    "AAAAAAA",
+    "A     A",
+    "A     A",
+    "A     A",
+  ];
+  const n = [
+    "N     N",
+    "NN    N",
+    "N N   N",
+    "N  N  N",
+    "N   N N",
+    "N    NN",
+    "N     N",
+    "N     N",
+  ];
+  const d = [
+    "DDDDD  ",
+    "D    D ",
+    "D     D",
+    "D     D",
+    "D     D",
+    "D     D",
+    "D    D ",
+    "DDDDD  ",
+  ];
+  const lines: string[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    lines.push(`${v[i]}  ${r[i]}  ${a[i]}  ${n[i]}  ${d[i]}`);
+  }
+  return lines;
+}
+
+function printVrandWelcomeBanner(): void {
+  const lines = buildVrandAsciiLines();
+  const output = lines.map((line) => `${ANSI_LIGHT_BLUE}${line}${ANSI_RESET}`).join("\n");
+  process.stdout.write(`${output}\n`);
+  process.stdout.write(`${ANSI_LIGHT_BLUE}${VRAND_QUOTE}${ANSI_RESET}\n\n`);
+}
 
 function maskSecret(value: string): string {
   const trimmed = value.trim();
@@ -220,6 +290,7 @@ async function main(): Promise<void> {
     terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
   });
 
+  printVrandWelcomeBanner();
   process.stdout.write(
     [
       "Houdi Onboarding Wizard",
