@@ -31,6 +31,12 @@ sudo systemctl restart houdi-agent.service
 sudo systemctl status houdi-agent.service --no-pager
 ```
 
+Alternativa desde Telegram:
+
+- `/selfupdate check` para ver si hay nueva versión.
+- `/selfupdate` para aplicar update in-place (`git pull --ff-only`, `npm install` si cambia `package*.json`, `npm run build` y reinicio).
+- Si `adminmode` está activo, requerirá `/approve <id>`.
+
 ## 5. Validación funcional mínima (Telegram)
 1. `/status`
 2. `/agent`
