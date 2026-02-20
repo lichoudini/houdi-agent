@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
+import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -88,6 +89,7 @@ const lastGmailMessageIdByChat = new Map<number, string>();
 const lastListedFilesByChat = new Map<number, Array<{ relPath: string; size: number; modifiedAt: string }>>();
 const lastProgressNoticeByChat = new Map<number, string>();
 const lastConnectorContextByChat = new Map<number, number>();
+let selfUpdateInProgress = false;
 let localBridgeServer: Server | null = null;
 type PendingWorkspaceDeleteConfirmation = {
   paths: string[];
@@ -115,10 +117,17 @@ const DOCUMENT_SEARCH_MAX_DEPTH = 6;
 const DOCUMENT_SEARCH_MAX_DIRS = 2000;
 const SELF_SKILLS_SECTION_TITLE = "## Dynamic Skills";
 const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
+const SELF_UPDATE_APPROVAL_COMMAND = "__selfupdate__";
 const NEWS_MAX_REDDIT_RESULTS = 2;
 const CONNECTOR_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const WORKSPACE_DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const WORKSPACE_DELETE_PATH_PROMPT_TTL_MS = 5 * 60 * 1000;
+const SELF_UPDATE_GIT_REMOTE = "origin";
+const SELF_UPDATE_STDIO_MAX_CHARS = 12_000;
+const SELF_UPDATE_SHORT_TIMEOUT_MS = 45_000;
+const SELF_UPDATE_FETCH_TIMEOUT_MS = 120_000;
+const SELF_UPDATE_INSTALL_TIMEOUT_MS = 900_000;
+const SELF_UPDATE_BUILD_TIMEOUT_MS = 900_000;
 const LOCAL_BRIDGE_MESSAGE_PATH = "/internal/cli/message";
 const LOCAL_BRIDGE_HEALTH_PATH = "/internal/cli/health";
 const LOCAL_BRIDGE_MAX_BODY_BYTES = 512_000;
@@ -170,6 +179,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "suggest",
   "selfskill",
   "selfrestart",
+  "selfupdate",
   "shellmode",
   "shell",
   "adminmode",
@@ -469,7 +479,7 @@ type WebIntent = {
 
 type SelfMaintenanceIntent = {
   shouldHandle: boolean;
-  action?: "add-skill" | "delete-skill" | "list-skills" | "restart-service";
+  action?: "add-skill" | "delete-skill" | "list-skills" | "restart-service" | "update-service";
   instruction?: string;
   skillIndex?: number;
 };
@@ -2801,6 +2811,15 @@ function detectSelfMaintenanceIntent(text: string): SelfMaintenanceIntent {
     return { shouldHandle: true, action: "restart-service" };
   }
 
+  const updateVerb =
+    /\b(actualiza|actualizar|actualizate|updatea|updatear|upgradea|upgrade|sincroniza|sincronizar|ponete al dia|ponte al dia)\b/.test(
+      normalized,
+    );
+  const updateNoun = /\b(agente|bot|houdi|repo|repositorio|version|versiones|codigo|release)\b/.test(normalized);
+  if (!isQuestion && updateVerb && updateNoun) {
+    return { shouldHandle: true, action: "update-service" };
+  }
+
   if (!isQuestion && isSkillDraftMultiMessageRequested(normalized)) {
     const instruction = extractSelfSkillInstructionFromText(original);
     return instruction
@@ -4484,6 +4503,13 @@ function approvalRemainingSeconds(approval: PendingApproval): number {
   return Math.max(0, Math.round((approval.expiresAt - Date.now()) / 1000));
 }
 
+function formatApprovalCommandLabel(commandLine: string): string {
+  if (commandLine === SELF_UPDATE_APPROVAL_COMMAND) {
+    return "/selfupdate (git pull + build + restart)";
+  }
+  return commandLine;
+}
+
 async function safeAudit(event: {
   type: string;
   chatId?: number;
@@ -5165,6 +5191,308 @@ async function runCommandForProfile(params: {
   });
 }
 
+type LocalCommandExecutionResult = {
+  command: string;
+  args: string[];
+  commandLine: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+  durationMs: number;
+};
+
+type SelfUpdateStatusSnapshot = {
+  branch: string;
+  remoteBranch: string;
+  currentShort: string;
+  remoteShort: string;
+  behindCount: number;
+  dirtyFiles: string[];
+};
+
+type SelfUpdateApplyResult = {
+  updated: boolean;
+  previousShort: string;
+  currentShort: string;
+  changedFiles: string[];
+  ranNpmInstall: boolean;
+};
+
+function appendStdioTail(base: string, chunk: string, maxChars: number): string {
+  const next = base + chunk;
+  if (next.length <= maxChars) {
+    return next;
+  }
+  return next.slice(next.length - maxChars);
+}
+
+function splitNonEmptyLines(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function formatSelfUpdateFilePreview(paths: string[], limit: number): string[] {
+  const selected = paths.slice(0, Math.max(1, Math.floor(limit)));
+  const lines = selected.map((filePath, index) => `${index + 1}. ${filePath}`);
+  if (paths.length > selected.length) {
+    lines.push(`... y ${paths.length - selected.length} más`);
+  }
+  return lines;
+}
+
+function parseSelfUpdateCount(raw: string, label: string): number {
+  const value = raw.trim();
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`No pude interpretar ${label}: "${value || "vacío"}"`);
+  }
+  return parsed;
+}
+
+async function runLocalCommandStep(params: {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  timeoutMs?: number;
+  maxChars?: number;
+}): Promise<LocalCommandExecutionResult> {
+  const args = params.args ?? [];
+  const cwd = params.cwd ?? process.cwd();
+  const timeoutMs = Math.max(1, Math.floor(params.timeoutMs ?? SELF_UPDATE_SHORT_TIMEOUT_MS));
+  const maxChars = Math.max(2000, Math.floor(params.maxChars ?? SELF_UPDATE_STDIO_MAX_CHARS));
+  const startedAt = Date.now();
+  const commandLine = [params.command, ...args].join(" ");
+
+  const child = spawn(params.command, args, {
+    cwd,
+    env: process.env,
+    shell: false,
+  });
+
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  let exitCode: number | null = null;
+  let signal: NodeJS.Signals | null = null;
+  let settled = false;
+
+  return await new Promise<LocalCommandExecutionResult>((resolve) => {
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutHandle);
+      resolve({
+        command: params.command,
+        args,
+        commandLine,
+        stdout,
+        stderr,
+        exitCode,
+        signal,
+        timedOut,
+        durationMs: Date.now() - startedAt,
+      });
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore kill failures; result is resolved by close/error handlers.
+      }
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = appendStdioTail(stdout, chunk.toString("utf8"), maxChars);
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = appendStdioTail(stderr, chunk.toString("utf8"), maxChars);
+    });
+
+    child.on("close", (code, signalCode) => {
+      exitCode = code;
+      signal = signalCode;
+      finish();
+    });
+
+    child.on("error", (error) => {
+      exitCode = 1;
+      signal = null;
+      stderr = appendStdioTail(stderr, `${error.message}\n`, maxChars);
+      finish();
+    });
+  });
+}
+
+async function runLocalCommandOrThrow(
+  stepLabel: string,
+  params: {
+    command: string;
+    args?: string[];
+    cwd?: string;
+    timeoutMs?: number;
+    maxChars?: number;
+  },
+): Promise<LocalCommandExecutionResult> {
+  const result = await runLocalCommandStep(params);
+  if (result.timedOut) {
+    throw new Error(`${stepLabel} excedió el timeout (${params.timeoutMs ?? SELF_UPDATE_SHORT_TIMEOUT_MS}ms).`);
+  }
+  if (result.exitCode === 0) {
+    return result;
+  }
+
+  const stdout = result.stdout.trim();
+  const stderr = result.stderr.trim();
+  const details = [
+    `${stepLabel} falló (exit=${result.exitCode ?? "null"}, signal=${result.signal ?? "none"}).`,
+    `Comando: ${result.commandLine}`,
+    ...(stdout ? [`stdout: ${truncateInline(stdout, 900)}`] : []),
+    ...(stderr ? [`stderr: ${truncateInline(stderr, 1200)}`] : []),
+  ];
+  throw new Error(details.join("\n"));
+}
+
+async function inspectSelfUpdateStatus(): Promise<SelfUpdateStatusSnapshot> {
+  const repoCheck = await runLocalCommandOrThrow("Verificación de repositorio Git", {
+    command: "git",
+    args: ["rev-parse", "--is-inside-work-tree"],
+    timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+  });
+  if (!/\btrue\b/i.test(repoCheck.stdout)) {
+    throw new Error("El proyecto no está dentro de un repositorio Git.");
+  }
+
+  const branchResult = await runLocalCommandOrThrow("Lectura de rama activa", {
+    command: "git",
+    args: ["rev-parse", "--abbrev-ref", "HEAD"],
+    timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+  });
+  const branch = branchResult.stdout.trim();
+  if (!branch || branch.toUpperCase() === "HEAD") {
+    throw new Error("No pude resolver la rama activa (HEAD detached).");
+  }
+
+  await runLocalCommandOrThrow("Sincronización con remoto", {
+    command: "git",
+    args: ["fetch", SELF_UPDATE_GIT_REMOTE, "--prune"],
+    timeoutMs: SELF_UPDATE_FETCH_TIMEOUT_MS,
+  });
+
+  const remoteBranch = `${SELF_UPDATE_GIT_REMOTE}/${branch}`;
+  const [currentResult, remoteResult, behindResult, dirtyResult] = await Promise.all([
+    runLocalCommandOrThrow("Lectura de commit local", {
+      command: "git",
+      args: ["rev-parse", "--short", "HEAD"],
+      timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+    }),
+    runLocalCommandOrThrow("Lectura de commit remoto", {
+      command: "git",
+      args: ["rev-parse", "--short", remoteBranch],
+      timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+    }),
+    runLocalCommandOrThrow("Cálculo de commits pendientes", {
+      command: "git",
+      args: ["rev-list", "--count", `HEAD..${remoteBranch}`],
+      timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+    }),
+    runLocalCommandOrThrow("Lectura de cambios locales", {
+      command: "git",
+      args: ["status", "--porcelain"],
+      timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+    }),
+  ]);
+
+  return {
+    branch,
+    remoteBranch,
+    currentShort: currentResult.stdout.trim(),
+    remoteShort: remoteResult.stdout.trim(),
+    behindCount: parseSelfUpdateCount(behindResult.stdout, "commits pendientes"),
+    dirtyFiles: splitNonEmptyLines(dirtyResult.stdout),
+  };
+}
+
+async function applySelfUpdateFromStatus(status: SelfUpdateStatusSnapshot): Promise<SelfUpdateApplyResult> {
+  if (status.behindCount <= 0) {
+    return {
+      updated: false,
+      previousShort: status.currentShort,
+      currentShort: status.currentShort,
+      changedFiles: [],
+      ranNpmInstall: false,
+    };
+  }
+
+  const previousShort = status.currentShort;
+  await runLocalCommandOrThrow("Descarga de nueva versión (git pull --ff-only)", {
+    command: "git",
+    args: ["pull", "--ff-only", SELF_UPDATE_GIT_REMOTE, status.branch],
+    timeoutMs: SELF_UPDATE_FETCH_TIMEOUT_MS,
+  });
+
+  const currentResult = await runLocalCommandOrThrow("Lectura de commit actualizado", {
+    command: "git",
+    args: ["rev-parse", "--short", "HEAD"],
+    timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+  });
+  const currentShort = currentResult.stdout.trim();
+
+  if (!currentShort || currentShort === previousShort) {
+    return {
+      updated: false,
+      previousShort,
+      currentShort: currentShort || previousShort,
+      changedFiles: [],
+      ranNpmInstall: false,
+    };
+  }
+
+  const changedResult = await runLocalCommandOrThrow("Listado de archivos actualizados", {
+    command: "git",
+    args: ["diff", "--name-only", `${previousShort}..${currentShort}`],
+    timeoutMs: SELF_UPDATE_SHORT_TIMEOUT_MS,
+    maxChars: 40_000,
+  });
+  const changedFiles = splitNonEmptyLines(changedResult.stdout);
+  const ranNpmInstall =
+    changedFiles.includes("package.json") ||
+    changedFiles.includes("package-lock.json") ||
+    changedFiles.some((entry) => entry.startsWith("package-lock."));
+
+  if (ranNpmInstall) {
+    await runLocalCommandOrThrow("Instalación de dependencias", {
+      command: "npm",
+      args: ["install"],
+      timeoutMs: SELF_UPDATE_INSTALL_TIMEOUT_MS,
+      maxChars: 20_000,
+    });
+  }
+
+  await runLocalCommandOrThrow("Compilación de proyecto", {
+    command: "npm",
+    args: ["run", "build"],
+    timeoutMs: SELF_UPDATE_BUILD_TIMEOUT_MS,
+    maxChars: 20_000,
+  });
+
+  return {
+    updated: true,
+    previousShort,
+    currentShort,
+    changedFiles,
+    ranNpmInstall,
+  };
+}
+
 async function queueApproval(params: {
   ctx: ChatReplyContext;
   profile: AgentProfile;
@@ -5200,7 +5528,7 @@ async function queueApproval(params: {
       `Aprobación requerida: ${approval.id}`,
       `Tipo: ${approval.kind}`,
       `Agente: ${approval.agentName}`,
-      `Comando: ${approval.commandLine}`,
+      `Comando: ${formatApprovalCommandLabel(approval.commandLine)}`,
       `Expira en: ${approvalRemainingSeconds(approval)}s`,
       "Usa /approve <id> para ejecutar o /deny <id> para cancelar.",
     ].join("\n"),
@@ -5211,6 +5539,7 @@ async function requestAgentServiceRestart(params: {
   ctx: ChatReplyContext;
   source: string;
   note?: string;
+  skipAdminApproval?: boolean;
 }): Promise<void> {
   if (adminSecurity.isPanicModeEnabled()) {
     await params.ctx.reply("Panic mode está activo: ejecución bloqueada.");
@@ -5228,7 +5557,7 @@ async function requestAgentServiceRestart(params: {
     return;
   }
 
-  if (adminSecurity.isAdminModeEnabled(params.ctx.chat.id)) {
+  if (adminSecurity.isAdminModeEnabled(params.ctx.chat.id) && !params.skipAdminApproval) {
     await queueApproval({
       ctx: params.ctx,
       profile,
@@ -5246,6 +5575,229 @@ async function requestAgentServiceRestart(params: {
     commandLine: SELF_RESTART_SERVICE_COMMAND,
     source: params.source,
     note: params.note ?? `requested via ${params.source}`,
+  });
+}
+
+async function executeAgentSelfUpdate(params: {
+  ctx: ChatReplyContext;
+  source: string;
+  note?: string;
+  userId?: number;
+  checkOnly: boolean;
+}): Promise<void> {
+  if (selfUpdateInProgress) {
+    await params.ctx.reply("Ya hay una actualización en curso. Espera a que termine y vuelve a intentar.");
+    return;
+  }
+
+  selfUpdateInProgress = true;
+  const startedAtMs = Date.now();
+  const actor = getActor(params.ctx);
+
+  try {
+    await params.ctx.reply(
+      params.checkOnly
+        ? "Revisando si hay actualizaciones disponibles en el repositorio..."
+        : "Iniciando actualización del agente desde el repositorio remoto...",
+    );
+    const status = await inspectSelfUpdateStatus();
+
+    if (params.checkOnly) {
+      const responseLines = [
+        "Estado de actualización:",
+        `rama: ${status.branch}`,
+        `local: ${status.currentShort}`,
+        `remoto: ${status.remoteShort} (${status.remoteBranch})`,
+        `commits pendientes: ${status.behindCount}`,
+        `cambios locales sin commit: ${status.dirtyFiles.length}`,
+      ];
+      if (status.dirtyFiles.length > 0) {
+        responseLines.push("Archivos locales modificados:");
+        responseLines.push(...formatSelfUpdateFilePreview(status.dirtyFiles, 8));
+      }
+      responseLines.push(
+        status.behindCount > 0
+          ? 'Hay actualización disponible. Ejecuta "/selfupdate" para aplicarla.'
+          : "No hay actualizaciones pendientes.",
+      );
+      await replyLong(params.ctx, responseLines.join("\n"));
+      await safeAudit({
+        type: "selfupdate.check",
+        chatId: actor.chatId,
+        userId: params.userId ?? actor.userId,
+        details: {
+          source: params.source,
+          branch: status.branch,
+          local: status.currentShort,
+          remote: status.remoteShort,
+          behindCount: status.behindCount,
+          dirtyCount: status.dirtyFiles.length,
+        },
+      });
+      return;
+    }
+
+    if (status.dirtyFiles.length > 0) {
+      const responseLines = [
+        "No puedo actualizar automáticamente porque hay cambios locales sin commit.",
+        "Esto evita pisar cambios y perder datos.",
+        "Archivos detectados:",
+        ...formatSelfUpdateFilePreview(status.dirtyFiles, 10),
+        "",
+        "Opciones:",
+        "1) commitear o descartar cambios locales",
+        "2) volver a ejecutar /selfupdate",
+      ];
+      await replyLong(params.ctx, responseLines.join("\n"));
+      await safeAudit({
+        type: "selfupdate.blocked_dirty",
+        chatId: actor.chatId,
+        userId: params.userId ?? actor.userId,
+        details: {
+          source: params.source,
+          branch: status.branch,
+          local: status.currentShort,
+          remote: status.remoteShort,
+          dirtyCount: status.dirtyFiles.length,
+          dirtyPreview: status.dirtyFiles.slice(0, 12),
+        },
+      });
+      return;
+    }
+
+    if (status.behindCount <= 0) {
+      await params.ctx.reply(
+        [
+          "Ya estás en la última versión.",
+          `rama: ${status.branch}`,
+          `commit: ${status.currentShort}`,
+        ].join("\n"),
+      );
+      await safeAudit({
+        type: "selfupdate.up_to_date",
+        chatId: actor.chatId,
+        userId: params.userId ?? actor.userId,
+        details: {
+          source: params.source,
+          branch: status.branch,
+          local: status.currentShort,
+          remote: status.remoteShort,
+        },
+      });
+      return;
+    }
+
+    await replyProgress(
+      params.ctx,
+      `Actualización detectada (${status.behindCount} commit${status.behindCount === 1 ? "" : "s"}). Aplicando cambios...`,
+    );
+    const applied = await applySelfUpdateFromStatus(status);
+    if (!applied.updated) {
+      await params.ctx.reply("No hubo cambios efectivos para aplicar (ya estabas actualizado).");
+      return;
+    }
+
+    const responseLines = [
+      "Actualización aplicada correctamente.",
+      `rama: ${status.branch}`,
+      `commit anterior: ${applied.previousShort}`,
+      `commit actual: ${applied.currentShort}`,
+      `commits aplicados: ${status.behindCount}`,
+      `dependencias: ${applied.ranNpmInstall ? "npm install ejecutado" : "sin cambios en package*.json"}`,
+      `archivos actualizados: ${applied.changedFiles.length}`,
+      ...formatSelfUpdateFilePreview(applied.changedFiles, 12),
+      "",
+      "Reiniciando servicio para activar la nueva versión...",
+    ];
+    await replyLong(params.ctx, responseLines.join("\n"));
+    await safeAudit({
+      type: "selfupdate.applied",
+      chatId: actor.chatId,
+      userId: params.userId ?? actor.userId,
+      details: {
+        source: params.source,
+        branch: status.branch,
+        from: applied.previousShort,
+        to: applied.currentShort,
+        behindCount: status.behindCount,
+        ranNpmInstall: applied.ranNpmInstall,
+        changedFilesCount: applied.changedFiles.length,
+        changedFilesPreview: applied.changedFiles.slice(0, 20),
+        durationMs: Date.now() - startedAtMs,
+      },
+    });
+
+    await requestAgentServiceRestart({
+      ctx: params.ctx,
+      source: `${params.source}:self-update`,
+      note: params.note ?? `requested via ${params.source}`,
+      skipAdminApproval: true,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await replyLong(
+      params.ctx,
+      [
+        "No pude completar la actualización automática.",
+        message,
+      ].join("\n\n"),
+    );
+    await safeAudit({
+      type: "selfupdate.failed",
+      chatId: actor.chatId,
+      userId: params.userId ?? actor.userId,
+      details: {
+        source: params.source,
+        error: message,
+        durationMs: Date.now() - startedAtMs,
+      },
+    });
+  } finally {
+    selfUpdateInProgress = false;
+  }
+}
+
+async function requestAgentSelfUpdate(params: {
+  ctx: ChatReplyContext;
+  source: string;
+  note?: string;
+  userId?: number;
+  checkOnly?: boolean;
+}): Promise<void> {
+  if (adminSecurity.isPanicModeEnabled()) {
+    await params.ctx.reply("Panic mode está activo: ejecución bloqueada.");
+    return;
+  }
+
+  const profile = agentRegistry.require(getActiveAgent(params.ctx.chat.id));
+  if (!profile.allowCommands.includes("systemctl")) {
+    await params.ctx.reply(
+      [
+        `El agente activo (${profile.name}) no permite auto-actualización.`,
+        "Habilita systemctl en allowCommands o cambia de agente.",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const checkOnly = Boolean(params.checkOnly);
+  if (!checkOnly && adminSecurity.isAdminModeEnabled(params.ctx.chat.id)) {
+    await queueApproval({
+      ctx: params.ctx,
+      profile,
+      commandLine: SELF_UPDATE_APPROVAL_COMMAND,
+      kind: "exec",
+      note: params.note ?? `requested via ${params.source}`,
+    });
+    return;
+  }
+
+  await executeAgentSelfUpdate({
+    ctx: params.ctx,
+    source: params.source,
+    note: params.note,
+    userId: params.userId,
+    checkOnly,
   });
 }
 
@@ -5820,6 +6372,24 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
       });
       await safeAudit({
         type: "selfrestart.intent",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+        },
+      });
+      return true;
+    }
+
+    if (intent.action === "update-service") {
+      await requestAgentSelfUpdate({
+        ctx: params.ctx,
+        source: `${params.source}:self-maintenance`,
+        note: "requested via natural self-maintenance",
+        userId: params.userId,
+      });
+      await safeAudit({
+        type: "selfupdate.intent",
         chatId: params.ctx.chat.id,
         userId: params.userId,
         details: {
@@ -8237,6 +8807,7 @@ bot.command("help", async (ctx) => {
       "/selfskill del <n|last> - Eliminar habilidad agregada",
       "/selfskill draft <start|add|show|apply|cancel> - Armar skill en varios mensajes",
       "/selfrestart - Reiniciar servicio del agente",
+      "/selfupdate [check] - Actualizar a la última versión del repositorio",
       "Enviar nota de voz/audio - Se transcribe y se responde con IA",
       "Enviar archivo (document) - Se guarda en workspace/files/...",
       "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
@@ -10347,6 +10918,23 @@ bot.command("selfrestart", async (ctx) => {
   });
 });
 
+bot.command("selfupdate", async (ctx) => {
+  const input = String(ctx.match ?? "").trim().toLowerCase();
+  const checkOnly = input === "check" || input === "status";
+  if (input && !checkOnly && input !== "apply" && input !== "run" && input !== "now") {
+    await ctx.reply("Uso: /selfupdate [check]");
+    return;
+  }
+
+  await requestAgentSelfUpdate({
+    ctx,
+    source: "selfupdate",
+    note: checkOnly ? "requested via /selfupdate check" : "requested via /selfupdate",
+    userId: ctx.from?.id,
+    checkOnly,
+  });
+});
+
 bot.command("shellmode", async (ctx) => {
   const raw = String(ctx.match ?? "").trim().toLowerCase();
   if (!raw) {
@@ -10433,7 +11021,7 @@ bot.command("approvals", async (ctx) => {
 
   const lines = approvals.map(
     (approval) =>
-      `- ${approval.id} | ${approval.kind} | ${approval.commandLine} | expira ${approvalRemainingSeconds(approval)}s`,
+      `- ${approval.id} | ${approval.kind} | ${formatApprovalCommandLabel(approval.commandLine)} | expira ${approvalRemainingSeconds(approval)}s`,
   );
   await replyLong(ctx, ["Aprobaciones pendientes:", ...lines].join("\n"));
 });
@@ -10474,6 +11062,17 @@ bot.command("approve", async (ctx) => {
       commandLine: approval.commandLine,
     },
   });
+
+  if (approval.commandLine === SELF_UPDATE_APPROVAL_COMMAND) {
+    await executeAgentSelfUpdate({
+      ctx,
+      source: `approval:${approval.kind}`,
+      note: approval.note,
+      userId: ctx.from?.id,
+      checkOnly: false,
+    });
+    return;
+  }
 
   await runCommandForProfile({
     ctx,

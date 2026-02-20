@@ -190,6 +190,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/selfskill del <n|last>`
 - `/selfskill draft <start|add|show|apply|cancel>`
 - `/selfrestart`
+- `/selfupdate [check]`
 - `/shell <instrucción>`
 - `/shellmode on|off`
 - `/exec <comando> [args]`
@@ -306,6 +307,7 @@ Puedes sumar habilidades persistentes sin tocar código fuente manualmente:
 - `/selfskill del <n|last>`: elimina una habilidad por índice (o la última).
 - `/selfskill draft ...`: permite construir una habilidad en varios mensajes y aplicarla al final.
 - `/selfrestart`: reinicia el servicio del agente (respeta `adminmode` si está activo).
+- `/selfupdate [check]`: revisa o aplica actualización a la última versión del repo (`git pull --ff-only`, `npm install` si cambia `package*.json`, `npm run build` y reinicio).
 
 Ejemplos:
 
@@ -324,6 +326,7 @@ Modo natural (sin comandos):
 - `agrega: prioriza acciones de alto impacto`
 - `listo, crea la habilidad`
 - `elimina la habilidad 2`
+- `actualizate a la ultima version del repo`
 - `reinicia el agente`
 
 ## Aprendizaje de Intereses y Sugerencias Proactivas
