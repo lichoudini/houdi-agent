@@ -300,6 +300,15 @@ async function main(): Promise<void> {
     ].join("\n"),
   );
 
+  let rlClosed = false;
+  const closeReadline = (): void => {
+    if (rlClosed) {
+      return;
+    }
+    rl.close();
+    rlClosed = true;
+  };
+
   try {
     if (!assumeRiskAccepted) {
       process.stdout.write(
@@ -336,8 +345,16 @@ async function main(): Promise<void> {
     const envMap = new Map<string, string>(envCurrentMap);
 
     process.stdout.write("Paso 1/7 - Configuración base\n");
+    process.stdout.write(
+      [
+        "La carpeta workspace es el directorio de trabajo del agente.",
+        "Ahí guarda archivos recibidos, imágenes, documentos y operaciones de workspace.",
+        "Puedes usar una ruta relativa (ej: ./workspace) o absoluta (ej: /home/usuario/houdi-workspace).",
+        "",
+      ].join("\n"),
+    );
     const workspaceDir = normalizeDirValue(
-      await promptLine(rl, "Directorio workspace", {
+      await promptLine(rl, "Directorio workspace (carpeta de trabajo)", {
         defaultValue: envMap.get("HOUDI_WORKSPACE_DIR") || envExampleMap.get("HOUDI_WORKSPACE_DIR") || "./workspace",
         required: true,
       }),
@@ -568,6 +585,16 @@ async function main(): Promise<void> {
       await runCommand("npm", ["run", "build"], PROJECT_DIR);
     }
 
+    process.stdout.write(
+      [
+        "",
+        "Modo de instalación de servicio:",
+        "- none: no instala servicio. Ejecutas el bot manualmente con npm start.",
+        "- user: instala systemd --user (sin sudo). Funciona para tu usuario.",
+        "- system: instala servicio global systemd (requiere sudo). Recomendado para producción.",
+        "",
+      ].join("\n"),
+    );
     const serviceMode = await promptChoice(
       rl,
       "Instalación de servicio",
@@ -585,7 +612,14 @@ async function main(): Promise<void> {
       if (!confirmSystem) {
         process.stdout.write("Instalación de servicio system omitida.\n");
       } else {
-        process.stdout.write("Se ejecutará instalador de servicio de sistema (puede pedir contraseña sudo).\n");
+        process.stdout.write(
+          [
+            "Se ejecutará instalador de servicio de sistema (puede pedir contraseña sudo).",
+            "Cierro el prompt interactivo para evitar bloqueo de teclado durante sudo.",
+            "",
+          ].join("\n"),
+        );
+        closeReadline();
         await runCommand("sudo", ["./scripts/install-systemd-system-service.sh"], PROJECT_DIR);
       }
     }
@@ -601,7 +635,7 @@ async function main(): Promise<void> {
       ].join("\n"),
     );
   } finally {
-    rl.close();
+    closeReadline();
   }
 }
 
