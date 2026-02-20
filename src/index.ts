@@ -5896,25 +5896,38 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
   generic: [
     "Moviendo engranajes internos...",
     "Acomodando piezas del rompecabezas...",
-    "Cargando motores con paciencia zen...",
+    "Cargando motores sin derramar el cafe...",
     "Haciendo magia sin trucos baratos...",
     "Preparando resultado con precision...",
   ],
 };
 
-const PROGRESS_CHAOS_VARIANTS = [
-  "Si el caos aprieta, la disciplina responde.",
-  "Obstáculo detectado: convertido en camino.",
-  "Respira, decide, ejecuta: orden estoico.",
-  "Criterio firme, pulso sereno, avance constante.",
-  "No drama, solo método.",
-  "Primero el deber, luego el ruido.",
-  "Menos impulso, más propósito.",
-  "Foco en lo controlable, progreso en lo importante.",
-  "La prisa grita; la estrategia construye.",
-  "Templanza activada, precisión en marcha.",
-  "Sin excusas, con estructura.",
-  "Serenidad por fuera, tracción por dentro.",
+const PROGRESS_COMIC_GARNISHES = [
+  "Prometo devolver todo en su lugar.",
+  "Sin romper nada importante... creo.",
+  "Con casco, guantes y dignidad.",
+  "Modo ninja de oficina activado.",
+  "Si explota, explota elegante.",
+  "Nivel de concentración: tostadora industrial.",
+  "Con más estilo que un script en viernes.",
+  "A velocidad legal pero sostenida.",
+  "Sin humo, solo resultados.",
+  "Con precisión de reloj suizo con mate.",
+  "Chequeando dos veces para no llorar después.",
+  "En piloto automático, pero despierto.",
+  "Atajando bugs como arquero en final.",
+  "Con bisturí digital y pulso firme.",
+  "Sin pánico, con teclado.",
+  "Métrica principal: que funcione.",
+  "Ajustando tornillos invisibles.",
+  "Con elegancia de planilla bien cerrada.",
+  "Sin atajos dudosos.",
+  "Como quien no quiere la cosa, pero bien.",
+  "Con atención quirúrgica al detalle molesto.",
+  "Sin drama, con método y café.",
+  "Haciendo que parezca fácil.",
+  "Respaldado por paciencia premium.",
+  "Con cero humo y bastante oficio.",
 ];
 
 function normalizeProgressText(text: string): string {
@@ -5962,121 +5975,33 @@ function classifyProgressNoticeKind(text: string): ProgressNoticeKind {
   return "generic";
 }
 
-function cleanProgressDetail(raw: string): string {
-  return raw.replace(/\.\.\.$/, "").replace(/\s+/g, " ").trim();
-}
-
-function extractProgressDetail(text: string, kind: ProgressNoticeKind): string | undefined {
-  if (kind === "web-search") {
-    const query = text.match(/web:\s*(.+)$/i)?.[1]?.trim();
-    return query ? cleanProgressDetail(query) : undefined;
-  }
-  if (kind === "web-open") {
-    const target = text.match(/abriendo\s+(.+)$/i)?.[1]?.trim();
-    return target ? cleanProgressDetail(target) : undefined;
-  }
-  if (kind === "doc-read") {
-    const target = text.match(/leyendo archivo(?: para consulta)?:\s*(.+)$/i)?.[1]?.trim();
-    return target ? cleanProgressDetail(target) : undefined;
-  }
-  if (kind === "doc-analyze") {
-    const target = text.match(/documento detectado:\s*(.+?)\.\s*analizando/i)?.[1]?.trim();
-    return target ? cleanProgressDetail(target) : undefined;
-  }
-  if (kind === "gmail-query") {
-    const query = text.match(/query:\s*([^)]+)\)/i)?.[1]?.trim();
-    return query ? cleanProgressDetail(query) : undefined;
-  }
-  if (kind === "gmail-send") {
-    const to = text.match(/enviando email a\s+(.+)$/i)?.[1]?.trim();
-    return to ? cleanProgressDetail(to) : undefined;
-  }
-  if (kind === "audio-transcribe") {
-    const source = text.match(/audio recibido\s*\(([^)]+)\)/i)?.[1]?.trim();
-    return source ? cleanProgressDetail(source) : undefined;
-  }
-  if (kind === "openai" || kind === "audio-analyze") {
-    return undefined;
-  }
-  if (kind === "shell-plan") {
-    const profile = text.match(/shell\s*\(([^)]+)\)/i)?.[1]?.trim();
-    return profile ? cleanProgressDetail(profile) : undefined;
-  }
-  return undefined;
-}
-
 function pickProgressNoticeVariant(kind: ProgressNoticeKind, chatId?: number): string {
   const variants = PROGRESS_NOTICE_VARIANTS[kind];
   if (!variants || variants.length === 0) {
     return "Trabajando en eso...";
   }
+  const base = variants[Math.floor(Math.random() * variants.length)] ?? "Trabajando en eso...";
+  const garnish = PROGRESS_COMIC_GARNISHES[Math.floor(Math.random() * PROGRESS_COMIC_GARNISHES.length)] ?? "";
+  const composed = garnish ? `${base} ${garnish}` : base;
+
   if (variants.length === 1 || typeof chatId !== "number") {
-    return variants[Math.floor(Math.random() * variants.length)] ?? "Trabajando en eso...";
+    return composed;
   }
 
   const last = lastProgressNoticeByChat.get(chatId) ?? "";
-  let chosen = variants[Math.floor(Math.random() * variants.length)] ?? variants[0] ?? "Trabajando en eso...";
+  let chosen = composed;
   for (let attempts = 0; attempts < 5 && chosen === last; attempts += 1) {
-    chosen = variants[Math.floor(Math.random() * variants.length)] ?? chosen;
+    const nextBase = variants[Math.floor(Math.random() * variants.length)] ?? base;
+    const nextGarnish = PROGRESS_COMIC_GARNISHES[Math.floor(Math.random() * PROGRESS_COMIC_GARNISHES.length)] ?? "";
+    chosen = nextGarnish ? `${nextBase} ${nextGarnish}` : nextBase;
   }
   lastProgressNoticeByChat.set(chatId, chosen);
   return chosen;
 }
 
-function buildStoicTaskLine(kind: ProgressNoticeKind, detail?: string): string {
-  const task = (detail ?? "").trim();
-  const taskLabel =
-    task ||
-    (kind === "web-search" || kind === "web-open"
-      ? "la búsqueda"
-      : kind === "gmail-send" || kind === "gmail-query"
-        ? "el correo"
-        : kind === "doc-read" || kind === "doc-analyze"
-          ? "el documento"
-          : kind === "audio-transcribe" || kind === "audio-analyze"
-            ? "el audio"
-            : kind === "shell-plan"
-              ? "el plan"
-              : "la tarea");
-  const chaos = PROGRESS_CHAOS_VARIANTS[Math.floor(Math.random() * PROGRESS_CHAOS_VARIANTS.length)] ?? "";
-  return `${chaos} Foco: ${taskLabel}.`;
-}
-
 function buildProgressNotice(text: string, chatId?: number): string {
   const kind = classifyProgressNoticeKind(text);
-  const headline = pickProgressNoticeVariant(kind, chatId);
-  const detail = extractProgressDetail(text, kind);
-  const stoicLine = buildStoicTaskLine(kind, detail);
-  if (!detail) {
-    return `${headline}\n${stoicLine}`;
-  }
-
-  if (kind === "web-search") {
-    return `${headline}\n${stoicLine}\nBusqueda: ${detail}`;
-  }
-  if (kind === "web-open") {
-    return `${headline}\n${stoicLine}\nURL: ${detail}`;
-  }
-  if (kind === "doc-read" || kind === "doc-analyze") {
-    return `${headline}\n${stoicLine}\nArchivo: ${detail}`;
-  }
-  if (kind === "gmail-send") {
-    return `${headline}\n${stoicLine}\nDestino: ${detail}`;
-  }
-  if (kind === "gmail-query") {
-    return `${headline}\n${stoicLine}\nFiltro: ${detail}`;
-  }
-  if (kind === "openai" || kind === "audio-analyze") {
-    return `${headline}\n${stoicLine}`;
-  }
-  if (kind === "audio-transcribe") {
-    return `${headline}\n${stoicLine}\nFuente: ${detail}`;
-  }
-  if (kind === "shell-plan") {
-    return `${headline}\n${stoicLine}\nPerfil: ${detail}`;
-  }
-
-  return `${headline}\n${stoicLine}`;
+  return pickProgressNoticeVariant(kind, chatId);
 }
 
 async function replyProgress(ctx: { reply: (text: string) => Promise<unknown>; chat?: { id: number } }, text: string) {
