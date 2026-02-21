@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
+    "check": "npm run test",
     "test": "npm run build && node --test dist/**/*.test.js",
     "bench:intent-router": "npm run build && node dist/intent-router-benchmark.js",
     "start": "node dist/index.js",

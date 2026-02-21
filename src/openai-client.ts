@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { z } from "zod";
 import type { PromptContextSnapshot } from "./agent-context-memory.js";
 import { config } from "./config.js";
+import { OpenAiUsageTracker, type OpenAiUsageSnapshot, type OpenAiUsageSource } from "./openai-usage.js";
 
 function extractTextOutput(response: unknown): string {
   const fromTopLevel =
@@ -181,6 +182,7 @@ function buildShellSystemPrompt(context?: PromptContextSnapshot): string {
 
 export class OpenAiService {
   private readonly client: OpenAI | null;
+  private readonly usage = new OpenAiUsageTracker();
 
   constructor() {
     this.client = config.openAiApiKey ? new OpenAI({ apiKey: config.openAiApiKey }) : null;
@@ -193,6 +195,45 @@ export class OpenAiService {
   getModel(modelOverride?: string): string {
     const candidate = modelOverride?.trim();
     return candidate || config.openAiModel;
+  }
+
+  getUsageSnapshot(): OpenAiUsageSnapshot {
+    return this.usage.snapshot();
+  }
+
+  resetUsageSnapshot(): void {
+    this.usage.reset();
+  }
+
+  private recordUsage(params: {
+    response: unknown;
+    model: string;
+    source: OpenAiUsageSource;
+  }): void {
+    const usage = (params.response as { usage?: unknown })?.usage;
+    const inputTokensRaw =
+      (usage as { input_tokens?: unknown; prompt_tokens?: unknown })?.input_tokens ??
+      (usage as { prompt_tokens?: unknown })?.prompt_tokens ??
+      0;
+    const outputTokensRaw =
+      (usage as { output_tokens?: unknown; completion_tokens?: unknown })?.output_tokens ??
+      (usage as { completion_tokens?: unknown })?.completion_tokens ??
+      0;
+    const totalTokensRaw = (usage as { total_tokens?: unknown })?.total_tokens ?? 0;
+    const inputTokensValue = Number(inputTokensRaw);
+    const outputTokensValue = Number(outputTokensRaw);
+    const totalTokensValue = Number(totalTokensRaw);
+    const inputTokens = Number.isFinite(inputTokensValue) ? inputTokensValue : 0;
+    const outputTokens = Number.isFinite(outputTokensValue) ? outputTokensValue : 0;
+    const totalTokens = Number.isFinite(totalTokensValue) ? totalTokensValue : inputTokens + outputTokens;
+    this.usage.record({
+      atMs: Date.now(),
+      model: params.model,
+      source: params.source,
+      inputTokens,
+      outputTokens,
+      totalTokens,
+    });
   }
 
   async ask(
@@ -208,8 +249,9 @@ export class OpenAiService {
       throw new Error("Pregunta vacía");
     }
 
+    const model = this.getModel(options?.model);
     const response = await this.client.responses.create({
-      model: this.getModel(options?.model),
+      model,
       max_output_tokens: options?.maxOutputTokens ?? config.openAiMaxOutputTokens,
       input: [
         {
@@ -222,6 +264,7 @@ export class OpenAiService {
         },
       ],
     });
+    this.recordUsage({ response, model, source: "ask" });
 
     const text = extractTextOutput(response);
     if (!text) {
@@ -251,10 +294,19 @@ export class OpenAiService {
       params.mimeType?.trim() ? { type: params.mimeType.trim() } : undefined,
     );
 
+    const model = config.openAiAudioModel;
     const response = await this.client.audio.transcriptions.create({
       file,
-      model: config.openAiAudioModel,
+      model,
       ...(language ? { language } : {}),
+    });
+    this.usage.record({
+      atMs: Date.now(),
+      model,
+      source: "audio",
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
     });
 
     const text = response.text?.trim() ?? "";
@@ -287,8 +339,9 @@ export class OpenAiService {
     const imageBase64 = params.image.toString("base64");
     const imageDataUrl = `data:${mimeType};base64,${imageBase64}`;
 
+    const model = this.getModel(params.model);
     const response = await this.client.responses.create({
-      model: this.getModel(params.model),
+      model,
       max_output_tokens: params.maxOutputTokens ?? config.openAiMaxOutputTokens,
       input: [
         {
@@ -304,6 +357,7 @@ export class OpenAiService {
         },
       ],
     });
+    this.recordUsage({ response, model, source: "image" });
 
     const text = extractTextOutput(response);
     if (!text) {
@@ -333,8 +387,9 @@ export class OpenAiService {
     );
     const allowedDisplay = allowed.join(", ");
 
+    const model = this.getModel(params.model);
     const response = await this.client.responses.create({
-      model: this.getModel(params.model),
+      model,
       max_output_tokens: 500,
       input: [
         {
@@ -351,6 +406,7 @@ export class OpenAiService {
         },
       ],
     });
+    this.recordUsage({ response, model, source: "shell" });
 
     const raw = extractTextOutput(response);
     if (!raw) {

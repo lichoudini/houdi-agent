@@ -24,11 +24,14 @@ import {
 import { logError, logInfo, logWarn } from "./logger.js";
 import { formatMemoryHitsNaturalText } from "./memory-presenter.js";
 import { OpenAiService } from "./openai-client.js";
+import { formatDoctorReport, runDoctor } from "./doctor.js";
 import { OpenMeteoApiTool } from "./open-meteo-api.js";
+import { formatUsd as formatUsageUsd } from "./openai-usage.js";
 import { RedditApiTool, type RedditPostResult } from "./reddit-api.js";
 import { type SavedEmailRecipient, EmailRecipientsSqliteService } from "./email-recipients-sqlite.js";
 import { ScheduledTaskSqliteService } from "./scheduled-tasks-sqlite.js";
 import { GmailRecipientsManager, isValidEmailAddress, normalizeRecipientEmail, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
+import { DomainRegistry } from "./domains/domain-registry.js";
 import {
   detectGmailNaturalIntent as detectGmailNaturalIntentDomain,
   detectGmailRecipientNaturalIntent as detectGmailRecipientNaturalIntentDomain,
@@ -198,6 +201,25 @@ const observability = new ObservabilityService();
 const sqliteState = new SqliteStateStore(config.stateDbFile);
 await sqliteState.init();
 const idempotency = new RequestIdempotencyService(sqliteState, config.idempotencyTtlMs);
+const domainRegistry = new DomainRegistry();
+domainRegistry.register({
+  id: "router",
+  summary: "Orquestación natural + semántica + calibración",
+  capabilities: ["intent-routing", "a-b", "canary", "calibration", "curation"],
+  ownerFile: "src/domains/router/*",
+});
+domainRegistry.register({
+  id: "workspace",
+  summary: "Operaciones de archivos y carpetas en workspace",
+  capabilities: ["list", "read", "write", "move", "rename", "delete", "send"],
+  ownerFile: "src/domains/workspace/*",
+});
+domainRegistry.register({
+  id: "gmail",
+  summary: "Lectura/envío y gestión de mensajes/recipients",
+  capabilities: ["list", "read", "send", "labels", "archive", "trash", "recipients"],
+  ownerFile: "src/domains/gmail/*",
+});
 
 const activeAgentByChat = new Map<number, string>();
 const aiShellModeByChat = new Map<number, boolean>();
@@ -502,6 +524,27 @@ function buildOpenAiModelListText(): string {
     return `${index + 1}. ${item.model} | costo ${item.tier} | ${item.notes}`;
   });
   return ["Modelos sugeridos (menor -> mayor costo):", ...lines].join("\n");
+}
+
+function buildOpenAiUsageLines(limit = 6): string[] {
+  const snapshot = openAi.getUsageSnapshot();
+  const top = snapshot.byModelAndSource.slice(0, Math.max(1, limit));
+  const lines = [
+    `OpenAI usage (desde proceso): calls=${snapshot.totalCalls} | in=${snapshot.totalInputTokens} | out=${snapshot.totalOutputTokens} | total=${snapshot.totalTokens} | estUSD=${formatUsageUsd(snapshot.estimatedCostUsd)}`,
+  ];
+  if (top.length === 0) {
+    lines.push("OpenAI usage top: sin llamadas registradas");
+    return lines;
+  }
+  lines.push(
+    `OpenAI usage top: ${top
+      .map(
+        (item) =>
+          `${item.model}/${item.source} calls=${item.calls} tok=${item.totalTokens} usd=${formatUsageUsd(item.estimatedCostUsd)}`,
+      )
+      .join(" | ")}`,
+  );
+  return lines;
 }
 
 function isAdminApprovalRequired(chatId: number): boolean {
@@ -11932,6 +11975,9 @@ bot.command("help", async (ctx) => {
       "/version - Ver versión del agente",
       "/model [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
       "/status - Estado del host y tareas en ejecución",
+      "/doctor - Diagnóstico operativo rápido del agente",
+      "/usage [topN|reset] - Métricas de tokens/costo OpenAI desde el arranque",
+      "/domains - Estado de dominios modulares cargados",
       "/agent - Ver agente activo y lista",
       "/agent set <nombre> - Cambiar agente activo para este chat",
       "/ask <pregunta> - Consultar IA de OpenAI",
@@ -12125,10 +12171,12 @@ bot.command("status", async (ctx) => {
       `Aprobaciones pendientes (chat): ${pendingCount}`,
       `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
+      ...buildOpenAiUsageLines(3),
       `Intent router: routes=${semanticIntentRouter.listRoutes().length} | alpha=${semanticIntentRouter.getHybridAlpha().toFixed(2)} | minGap=${semanticIntentRouter.getMinScoreGap().toFixed(3)} | file=${toProjectRelativePath(config.intentRouterRoutesFile)}`,
       `Intent router versions: file=${toProjectRelativePath(config.intentRouterVersionsFile)} | snapshots=${routerVersionStore.listSnapshots().length} | active=${routerVersionStore.getActiveSnapshot()?.id ?? "n/a"}`,
       `Intent router chat-routes: chats=${dynamicIntentRoutes.listChatIds().length} | file=${toProjectRelativePath(config.intentRouterChatRoutesFile)}`,
       `Intent router calibration: file=${toProjectRelativePath(config.intentRouterCalibrationFile)} | ab=${config.intentRouterAbEnabled ? `on (split=${config.intentRouterAbSplitPercent}%)` : "off"}`,
+      `Domains: ${domainRegistry.list().length}`,
       `Intent router cache: ${JSON.stringify(semanticIntentRouter.getDecisionCacheStats())}`,
       `Lector docs: maxFile=${Math.round(config.docMaxFileBytes / (1024 * 1024))}MB | maxText=${config.docMaxTextChars} chars`,
       `Web browse: ${config.enableWebBrowse ? `on (max results ${config.webSearchMaxResults})` : "off"}`,
@@ -12144,6 +12192,56 @@ bot.command("status", async (ctx) => {
       memoryStatusLine,
     ].join("\n"),
   );
+});
+
+bot.command("doctor", async (ctx) => {
+  try {
+    const report = await runDoctor({
+      openAiConfigured: openAi.isConfigured(),
+      gmail: gmailAccount.getStatus(),
+      botToken: config.telegramBotToken,
+    });
+    await replyLong(ctx, formatDoctorReport(report));
+    await safeAudit({
+      type: "doctor.run",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        ok: report.ok,
+        warn: report.warn,
+        fail: report.fail,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude ejecutar doctor: ${message}`);
+  }
+});
+
+bot.command("usage", async (ctx) => {
+  const input = String(ctx.match ?? "").trim();
+  const normalized = input.toLowerCase();
+  if (normalized === "reset") {
+    openAi.resetUsageSnapshot();
+    await ctx.reply("Métricas OpenAI reiniciadas para este proceso.");
+    return;
+  }
+
+  const parsed = input ? Number.parseInt(input, 10) : NaN;
+  const topN = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 20) : 8;
+  const snapshot = openAi.getUsageSnapshot();
+  const lines = [
+    ...buildOpenAiUsageLines(topN),
+    "",
+    ...snapshot.byModelAndSource.slice(0, topN).map((item, index) => {
+      return `${index + 1}. ${item.model}/${item.source} | calls=${item.calls} | in=${item.inputTokens} | out=${item.outputTokens} | total=${item.totalTokens} | estUSD=${formatUsageUsd(item.estimatedCostUsd)}`;
+    }),
+  ];
+  await replyLong(ctx, lines.join("\n"));
+});
+
+bot.command("domains", async (ctx) => {
+  await replyLong(ctx, domainRegistry.formatSummary());
 });
 
 bot.command("intentstats", async (ctx) => {

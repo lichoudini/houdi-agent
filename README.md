@@ -179,7 +179,10 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 ## Comandos Telegram
 
 - `/status`
+- `/doctor`
+- `/usage [topN|reset]`
 - `/model [show|list|set <modelo>|reset]`
+- `/domains`
 - `/agent`
 - `/agent set <nombre>`
 - `/ask <pregunta>`
@@ -250,6 +253,13 @@ Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo 
 Notas:
 - El override es en memoria (runtime): no modifica `.env`.
 - Aplica a consultas IA de chat, analisis de imagen y planificacion de `/shell`.
+
+## Operación y robustez
+
+- `/doctor`: ejecuta chequeos rápidos de runtime, permisos, credenciales y seguridad base.
+- `/usage`: muestra tokens/costo estimado OpenAI acumulado desde que inició el proceso.
+- `/usage reset`: reinicia contadores locales de uso OpenAI.
+- `/domains`: lista dominios modulares activos (router/workspace/gmail) y sus capacidades.
 
 ## CLI local
 

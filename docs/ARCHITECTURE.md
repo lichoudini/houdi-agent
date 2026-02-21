@@ -51,6 +51,9 @@
   - Rutas dinámicas por chat (overrides de utterances/threshold)
   - Soporte de experimento A/B por chat con split estable
   - Observabilidad: confusión, drift y alertas de precisión
+- `src/domains/domain-registry.ts`
+  - Registro explícito de dominios cargados (router/workspace/gmail)
+  - Inventario de capacidades por dominio (`/domains`)
 - `src/selfskill-drafts.ts`
   - Borrador persistente de habilidades en múltiples mensajes por chat
   - Soporte start/add/show/apply/cancel
@@ -69,6 +72,10 @@
   - `adminmode`, aprobaciones en memoria y `panic mode`
 - `src/audit-log.ts`
   - Registro de eventos en formato JSONL
+- `src/doctor.ts`
+  - Healthchecks operativos de runtime/config/permisos (`/doctor`)
+- `src/openai-usage.ts`
+  - Agregación de tokens y costo estimado por modelo/fuente (`/usage`, `/status`)
 - `src/single-instance-lock.ts`
   - Bloqueo de instancia única para evitar conflicto de polling
 
@@ -108,7 +115,15 @@
 - Corte global con `panic mode`.
 - `reboot` siempre con aprobación.
 
+## Calidad y CI
+- `.github/workflows/ci.yml`
+  - Build + tests en cada push/PR
+  - Benchmark de intent-router en PR para detectar regresiones
+- `.github/workflows/workflow-sanity.yml`
+  - Valida higiene/lint de workflows de GitHub Actions
+- `.github/workflows/secret-scan.yml`
+  - Escaneo de secretos con Gitleaks
+
 ## Limitaciones actuales
 - Aprobaciones de admin siguen en memoria (se pierden al reinicio).
 - Auditoría en archivo local sin rotación automática.
-- Sin pruebas automatizadas en CI.

@@ -39,11 +39,14 @@ Alternativa desde Telegram:
 
 ## 5. Validación funcional mínima (Telegram)
 1. `/status`
-2. `/agent`
-3. `/adminmode on`
-4. `/exec date` -> debe pedir aprobación
-5. `/approve <id>`
-6. `/reboot status`
+2. `/doctor`
+3. `/usage`
+4. `/domains`
+5. `/agent`
+6. `/adminmode on`
+7. `/exec date` -> debe pedir aprobación
+8. `/approve <id>`
+9. `/reboot status`
 
 ## 6. Incidentes frecuentes
 - Bot no responde:
