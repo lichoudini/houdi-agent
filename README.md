@@ -183,7 +183,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/memory`
 - `/memory search <texto>`
 - `/memory view <path> [from] [lines]`
-- `/interests`
+- `/interests [status|add|del|clear|suggest]`
 - `/suggest now|status`
 - `/selfskill <instrucción>`
 - `/selfskill list`
@@ -331,7 +331,7 @@ Modo natural (sin comandos):
 
 ## Aprendizaje de Intereses y Sugerencias Proactivas
 
-El agente aprende automáticamente por recurrencia de tus pedidos (categorías + keywords) y puede sugerir contenido/tareas sin que lo pidas.
+El agente aprende automaticamente por recurrencia en pedidos de noticias/novedades web y puede sugerir contenido reciente sin que lo pidas.
 
 - Límite duro diario configurable (default: `15` sugerencias por día).
 - Intervalo mínimo entre sugerencias configurable.
@@ -339,7 +339,11 @@ El agente aprende automáticamente por recurrencia de tus pedidos (categorías +
 
 Comandos útiles:
 
-- `/interests`: ver perfil aprendido (observaciones, categorías y keywords top).
+- `/interests`: ver perfil aprendido (observaciones, categorias y keywords top).
+- `/interests add <tema>`: agregar interes manual para noticias.
+- `/interests del <keyword>`: borrar un interes puntual.
+- `/interests clear`: borrar todo el perfil de intereses del chat.
+- `/interests suggest`: generar sugerencia inmediata de noticias recientes.
 - `/suggest status`: ver cuota/config.
 - `/suggest now`: forzar una sugerencia de prueba.
 

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-type InterestCategory = "gmail" | "schedule" | "web" | "documents" | "self" | "shell" | "audio";
+type InterestCategory = "gmail" | "schedule" | "web" | "documents" | "self" | "shell" | "audio" | "news";
 
 type ChatSuggestionState = {
   day: string;
@@ -35,6 +35,11 @@ type RecordUserTextInput = {
   text: string;
 };
 
+type AddInterestInput = {
+  chatId: number;
+  topic: string;
+};
+
 type EligibilityOptions = {
   maxPerDay: number;
   minIntervalMs: number;
@@ -61,7 +66,47 @@ const CATEGORY_PATTERNS: Record<InterestCategory, RegExp> = {
   self: /\b(skill|skills|habilidad|habilidades|agente|memoria|modelo|perfil|reinicia|reiniciar|servicio)\b/,
   shell: /\b(shell|exec|comando|comandos|terminal|script|git|npm|systemctl|bash)\b/,
   audio: /\b(audio|voz|voice|transcrib|transcripcion|transcripcion|whisper)\b/,
+  news: /\b(noticias?|novedades?|titulares?|actualidad|news|hoy|reciente|ultim[oa]s?|ultimas?\s+horas)\b/,
 };
+
+const NEWS_INTENT_PATTERN =
+  /\b(noticias?|novedades?|titulares?|actualidad|news|hoy|ayer|reciente|ultim[oa]s?|ultimas?\s+horas|internet|web|blog|blogs|post|posts|red(?:es)?\s+social(?:es)?|sitios?\s+web|fuentes?)\b/;
+
+const NEWS_NOISE_TERMS = new Set<string>([
+  "noticia",
+  "noticias",
+  "novedad",
+  "novedades",
+  "titular",
+  "titulares",
+  "actualidad",
+  "news",
+  "hoy",
+  "ayer",
+  "reciente",
+  "recientes",
+  "ultimo",
+  "ultimos",
+  "ultima",
+  "ultimas",
+  "internet",
+  "web",
+  "blog",
+  "blogs",
+  "post",
+  "posts",
+  "red",
+  "redes",
+  "social",
+  "sociales",
+  "sitio",
+  "sitios",
+  "fuente",
+  "fuentes",
+  "dia",
+  "dias",
+  "horas",
+]);
 
 const STOPWORDS = new Set<string>([
   "de",
@@ -244,6 +289,10 @@ function extractKeywords(normalized: string): string[] {
     }
   }
   return [...deduped];
+}
+
+function extractNewsKeywords(normalized: string): string[] {
+  return extractKeywords(normalized).filter((keyword) => !NEWS_NOISE_TERMS.has(keyword));
 }
 
 function topEntries(obj: Record<string, number>, limit: number): Array<{ key: string; value: number }> {
@@ -489,9 +538,14 @@ export class InterestLearningService {
     if (!normalized) {
       return;
     }
+    if (!NEWS_INTENT_PATTERN.test(normalized)) {
+      return;
+    }
 
     const profile = this.getOrCreateProfile(input.chatId);
     profile.observations = clampInt(profile.observations + 1, 1, 10_000_000);
+    profile.categories.web = clampInt((profile.categories.web ?? 0) + 1, 1, 10_000_000);
+    profile.categories.news = clampInt((profile.categories.news ?? 0) + 1, 1, 10_000_000);
 
     for (const [category, pattern] of Object.entries(CATEGORY_PATTERNS)) {
       if (!pattern.test(normalized)) {
@@ -500,7 +554,7 @@ export class InterestLearningService {
       profile.categories[category] = clampInt((profile.categories[category] ?? 0) + 1, 1, 10_000_000);
     }
 
-    const keywords = extractKeywords(normalized);
+    const keywords = extractNewsKeywords(normalized);
     for (const keyword of keywords) {
       profile.keywords[keyword] = clampInt((profile.keywords[keyword] ?? 0) + 1, 1, 10_000_000);
     }
@@ -510,6 +564,59 @@ export class InterestLearningService {
 
     profile.updatedAt = new Date().toISOString();
     await this.queuePersist();
+  }
+
+  async addManualInterest(input: AddInterestInput): Promise<void> {
+    this.ensureLoaded();
+    const topic = normalizeText(input.topic);
+    if (!topic) {
+      return;
+    }
+    const profile = this.getOrCreateProfile(input.chatId);
+    const keywords = extractNewsKeywords(topic);
+    if (keywords.length === 0) {
+      return;
+    }
+    profile.observations = clampInt(profile.observations + 1, 1, 10_000_000);
+    profile.categories.web = clampInt((profile.categories.web ?? 0) + 1, 1, 10_000_000);
+    profile.categories.news = clampInt((profile.categories.news ?? 0) + 1, 1, 10_000_000);
+    for (const keyword of keywords) {
+      profile.keywords[keyword] = clampInt((profile.keywords[keyword] ?? 0) + 2, 1, 10_000_000);
+    }
+    this.trimKeywordMap(profile);
+    profile.updatedAt = new Date().toISOString();
+    await this.queuePersist();
+  }
+
+  async removeInterestKeyword(chatIdInput: number, keywordInput: string): Promise<boolean> {
+    this.ensureLoaded();
+    const chatId = Math.floor(chatIdInput);
+    const profile = this.profiles.get(chatId);
+    if (!profile) {
+      return false;
+    }
+    const keyword = normalizeText(keywordInput);
+    if (!keyword) {
+      return false;
+    }
+    if (!(keyword in profile.keywords)) {
+      return false;
+    }
+    delete profile.keywords[keyword];
+    profile.updatedAt = new Date().toISOString();
+    await this.queuePersist();
+    return true;
+  }
+
+  async clearChat(chatIdInput: number): Promise<boolean> {
+    this.ensureLoaded();
+    const chatId = Math.floor(chatIdInput);
+    const existed = this.profiles.delete(chatId);
+    if (!existed) {
+      return false;
+    }
+    await this.queuePersist();
+    return true;
   }
 
   getSummary(chatIdInput: number, maxPerDay: number): InterestSummary | null {

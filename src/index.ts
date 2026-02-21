@@ -7210,6 +7210,7 @@ function interestCategoryLabel(category: string): string {
     gmail: "correo",
     schedule: "agenda",
     web: "web",
+    news: "noticias",
     documents: "documentos",
     self: "configuracion del agente",
     shell: "automatizacion",
@@ -7223,75 +7224,50 @@ async function buildSpontaneousSuggestion(chatId: number): Promise<{ type: strin
   if (!summary || summary.observations < config.suggestionsMinObservations) {
     return null;
   }
-
-  const topCategory = summary.topCategories[0]?.category ?? "";
-  const topKeyword = summary.topKeywords[0]?.keyword ?? "";
-  const topTwoKeywords = summary.topKeywords.slice(0, 2).map((item) => item.keyword).filter(Boolean);
-  const keywordPhrase = topTwoKeywords.length > 0 ? topTwoKeywords.join(", ") : "tus ultimos temas";
-
-  if (topCategory === "schedule") {
+  if (!config.enableWebBrowse) {
     return {
-      type: "task",
+      type: "news",
+      text: "Sugerencia: activa ENABLE_WEB_BROWSE=true para recibir noticias recientes segun tus intereses.",
+    };
+  }
+
+  const topKeywords = summary.topKeywords.slice(0, 3).map((item) => item.keyword).filter(Boolean);
+  const queryBase = topKeywords.length > 0 ? topKeywords.join(" ") : "tecnologia economia ia";
+  const searchResult = await runWebSearchQuery({
+    rawQuery: queryBase,
+    newsRequested: true,
+  });
+  const hits = searchResult.hits.slice(0, 3);
+  if (hits.length === 0) {
+    return {
+      type: "news",
       text: [
-        "Sugerencia proactiva:",
-        "Veo que usas bastante agenda/recordatorios.",
-        "Si quieres, te dejo una tarea ahora mismo (ej: 'recordame mañana 9:00 revisar pendientes').",
+        "Sugerencia proactiva (noticias):",
+        `No encontre novedades recientes para "${queryBase}".`,
+        "Puedes agregar un interes especifico con: /interests add <tema>.",
       ].join("\n"),
     };
   }
 
-  if (topCategory === "gmail") {
-    return {
-      type: "gmail",
-      text: [
-        "Sugerencia proactiva:",
-        "Detecte recurrencia en pedidos de correo.",
-        "Puedo revisar tus no leidos y devolverte un resumen rapido cuando quieras.",
-      ].join("\n"),
-    };
-  }
-
-  if (topCategory === "documents") {
-    return {
-      type: "documents",
-      text: [
-        "Sugerencia proactiva:",
-        "Si tienes un archivo en workspace, puedo leerlo y resumirlo en puntos accionables.",
-        'Ejemplo natural: "lee reporte.pdf y dame conclusiones".',
-      ].join("\n"),
-    };
-  }
-
-  if (config.enableWebBrowse && (topCategory === "web" || topKeyword)) {
-    const queryBase = topKeyword || "tendencias tecnologia";
-    try {
-      const results = await webBrowser.search(`${queryBase} novedades`, 1);
-      const first = results[0];
-      if (first) {
-        return {
-          type: "web",
-          text: [
-            "Sugerencia proactiva (segun tus intereses):",
-            `${first.title}`,
-            first.url,
-            "",
-            "Si quieres, lo abro y te hago un resumen.",
-          ].join("\n"),
-        };
-      }
-    } catch {
-      // if web search fails, fallback below
-    }
-  }
-
-  const topCategoryLabel = topCategory ? interestCategoryLabel(topCategory) : "tus pedidos frecuentes";
+  const now = new Date();
+  const lines = hits.map((hit, idx) => {
+    const date = extractDetectedNewsDate(hit, now);
+    return [
+      `${idx + 1}. ${hit.title}`,
+      `Fecha detectada: ${formatNewsDetectedDate(date)}`,
+      `Fuente: ${resolveWebResultDomain(hit.url)}`,
+      hit.url,
+    ].join("\n");
+  });
   return {
-    type: "general",
+    type: "news",
     text: [
-      "Sugerencia proactiva:",
-      `Estoy detectando recurrencia en ${topCategoryLabel}.`,
-      `Temas frecuentes: ${keywordPhrase}.`,
-      "Puedo proponerte una tarea o buscar una fuente web puntual sobre eso.",
+      "Sugerencia proactiva (noticias segun tus intereses):",
+      `Tema base: ${queryBase}`,
+      "",
+      ...lines,
+      "",
+      "Si quieres, abro una y te hago resumen con contexto y fechas.",
     ].join("\n"),
   };
 }
@@ -10724,7 +10700,7 @@ bot.command("help", async (ctx) => {
       "/memory - Estado de memoria",
       "/memory search <texto> - Buscar en memoria",
       "/memory view <path> [from] [lines] - Ver fragmento de memoria",
-      "/interests - Ver perfil aprendido de gustos/intereses",
+      "/interests [status|add|del|clear|suggest] - Gestion de intereses de noticias",
       "/suggest now|status - Forzar sugerencia o ver cuota/config",
       "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
       "/selfskill list - Ver habilidades agregadas",
@@ -12594,9 +12570,59 @@ bot.command("memory", async (ctx) => {
 });
 
 bot.command("interests", async (ctx) => {
+  const input = String(ctx.match ?? "").trim();
+  const [subRaw, ...rest] = input.split(/\s+/).filter(Boolean);
+  const sub = (subRaw || "status").toLowerCase();
+  const value = rest.join(" ").trim();
+
+  if (sub === "add") {
+    if (!value) {
+      await ctx.reply("Uso: /interests add <tema>");
+      return;
+    }
+    await interestLearning.addManualInterest({
+      chatId: ctx.chat.id,
+      topic: value,
+    });
+    await ctx.reply(`Interes agregado para noticias: ${value}`);
+    return;
+  }
+
+  if (sub === "del" || sub === "rm" || sub === "remove") {
+    if (!value) {
+      await ctx.reply("Uso: /interests del <keyword>");
+      return;
+    }
+    const removed = await interestLearning.removeInterestKeyword(ctx.chat.id, value);
+    await ctx.reply(removed ? `Interes eliminado: ${value}` : `No encontre ese interes: ${value}`);
+    return;
+  }
+
+  if (sub === "clear" || sub === "reset") {
+    const cleared = await interestLearning.clearChat(ctx.chat.id);
+    await ctx.reply(cleared ? "Perfil de intereses borrado para este chat." : "No habia perfil de intereses para borrar.");
+    return;
+  }
+
+  if (sub === "suggest") {
+    const candidate = await buildSpontaneousSuggestion(ctx.chat.id);
+    if (!candidate) {
+      await ctx.reply("Aun no hay senal suficiente de intereses de noticias.");
+      return;
+    }
+    await ctx.reply(candidate.text);
+    await interestLearning.markSuggestionSent(ctx.chat.id, candidate.type, new Date());
+    return;
+  }
+
   const summary = interestLearning.getSummary(ctx.chat.id, config.suggestionsMaxPerDay);
   if (!summary) {
-    await ctx.reply("Aun no hay perfil de intereses para este chat.");
+    await ctx.reply(
+      [
+        "Aun no hay perfil de intereses para este chat.",
+        "Usa: /interests add <tema> para cargar temas de noticias.",
+      ].join("\n"),
+    );
     return;
   }
 
@@ -12617,12 +12643,13 @@ bot.command("interests", async (ctx) => {
 
   await ctx.reply(
     [
-      "Perfil de intereses (aprendido por recurrencia):",
+      "Perfil de intereses (noticias web):",
       `Observaciones: ${summary.observations}`,
       `Categorias top: ${topCategories}`,
       `Keywords top: ${topKeywords}`,
       `Sugerencias hoy: ${summary.suggestionsToday}/${summary.suggestionsMaxPerDay}`,
       `Ultima sugerencia: ${summary.lastSuggestedAt ?? "nunca"}`,
+      "Uso: /interests add <tema> | /interests del <keyword> | /interests clear | /interests suggest",
     ].join("\n"),
   );
 });
@@ -12639,7 +12666,7 @@ bot.command("suggest", async (ctx) => {
         `Min intervalo: ${config.suggestionsMinIntervalMinutes} min`,
         `Min observaciones: ${config.suggestionsMinObservations}`,
         `Poll: ${config.suggestionsPollMs} ms`,
-        "Uso: /suggest now | /suggest status",
+        "Uso: /suggest now | /suggest status | /interests suggest",
       ].join("\n"),
     );
     return;
