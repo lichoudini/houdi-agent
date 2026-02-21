@@ -9,6 +9,8 @@ Proyecto base desde cero para arrancar un asistente de operación de PC por Tele
 - `docs/RUNBOOK.md`: operación diaria, rollout y troubleshooting
 - `docs/INSTALL.md`: instalación paso a paso en otra PC
 - `docs/AGENT_MEMORY_BASELINE.md`: baseline de memoria y personalidad
+- `docs/INTENT_ROUTER_HARDENING.md`: pipeline, tuning y operación del enrutador de intenciones
+- `docs/RELEASE_NOTES_2026-02-21.md`: cambios funcionales y operativos del release
 
 ## Enfoque de seguridad del MVP
 

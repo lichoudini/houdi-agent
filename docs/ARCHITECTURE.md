@@ -46,11 +46,17 @@
   - Servicios e intents de operaciones de workspace
 - `src/domains/router/*`
   - Filtro contextual y `route layers` (pre-filtros por contexto fuerte)
+  - Filtro jerarquico coarse->fine para reducir candidatos por dominio macro
   - Ensemble de decisión (semántico + AI judge + capas + boosts)
+  - Gate de parametros requeridos para intents sensibles
+  - Modo multi-intent secuencial para instrucciones encadenadas
   - Calibración de confianza por bins y archivo persistente
   - Rutas dinámicas por chat (overrides de utterances/threshold)
   - Soporte de experimento A/B por chat con split estable
   - Observabilidad: confusión, drift y alertas de precisión
+  - Workers de fondo:
+    - hard negatives mining desde dataset
+    - canary guard con auto-disable por brecha sostenida
 - `src/domains/domain-registry.ts`
   - Registro explícito de dominios cargados (router/workspace/gmail)
   - Inventario de capacidades por dominio (`/domains`)
@@ -109,12 +115,22 @@
    - se hace recall de memoria relevante
    - se envía prompt estructurado al modelo
 6. Se registra evento de auditoría cuando aplica.
-7. Loop interno revisa tareas vencidas y envía recordatorios automáticamente por Telegram.
-8. Loop interno opcional de sugerencias proactivas:
+7. Pipeline natural del router:
+   - route layers
+   - filtro jerarquico
+   - filtro contextual
+   - score semantico hibrido (cosine + BM25 + char n-gram + negativos)
+   - ensemble + calibracion de confianza
+   - abstencion por incertidumbre o aclaracion tipada
+8. Loop interno revisa tareas vencidas y envía recordatorios automáticamente por Telegram.
+9. Loop interno opcional de sugerencias proactivas:
    - evalúa recurrencia/intereses por chat
    - respeta cuota diaria e intervalo mínimo
    - puede sugerir web/tareas/correo de forma espontánea
-9. Inbound media:
+10. Workers de robustez de router:
+   - minado de hard negatives (persistencia de rutas + snapshot)
+   - guard de canary (desactivación automática si cae accuracy)
+11. Inbound media:
    - Imágenes: se guardan en `workspace/images/chat-<id>/YYYY-MM-DD/` y se analizan con IA si está configurada.
    - Archivos (document): se guardan en `workspace/files/chat-<id>/YYYY-MM-DD/`.
 
@@ -135,5 +151,6 @@
   - Escaneo de secretos con Gitleaks
 
 ## Limitaciones actuales
-- Aprobaciones de admin siguen en memoria (se pierden al reinicio).
+- El router depende de calidad de etiquetas en dataset (`finalHandler`) para auto-mejorar.
+- La calibración de confianza requiere volumen de muestras por ruta para ser estable.
 - Auditoría en archivo local sin rotación automática.

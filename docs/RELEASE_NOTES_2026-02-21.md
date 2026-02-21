@@ -124,3 +124,30 @@ Estado de suite:
 - Recuperación automática de respuestas no entregadas.
 - Mejor trazabilidad para diagnóstico en producción.
 
+---
+
+## Update: Intent Router Hardening (2026-02-21, tarde)
+
+Se incorporaron mejoras de robustez del pipeline de enrutamiento natural:
+
+- Router semántico híbrido con BM25, alpha adaptivo por ruta/mensaje y penalización de negativos.
+- Capa jerárquica coarse->fine para reducción temprana de candidatos por dominio.
+- Filtro contextual reforzado para casos críticos (`/lim`, Gmail, workspace, confirmaciones pendientes).
+- Abstención por incertidumbre (clarificación automática) y gating tipado para parámetros requeridos.
+- Soporte multi-intent secuencial con resumen final por pasos.
+- Dataset de enrutamiento enriquecido con señales de capas, jerarquía, ensemble y extracción tipada.
+
+Se agregan dos workers automáticos:
+
+- `hard negatives miner`: mina negativos desde dataset y versiona rutas al aplicar cambios.
+- `canary guard`: monitor de accuracy del canary con auto-disable por brecha sostenida.
+
+Variables nuevas destacadas:
+
+- `HOUDI_INTENT_ROUTER_ROUTE_ALPHA_OVERRIDES_JSON`
+- `HOUDI_INTENT_ROUTER_HARD_NEGATIVES_*`
+- `HOUDI_INTENT_ROUTER_CANARY_GUARD_*`
+
+Documentación técnica nueva:
+
+- `docs/INTENT_ROUTER_HARDENING.md`
