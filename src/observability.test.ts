@@ -20,3 +20,13 @@ test("observability counters and timings", () => {
   assert.equal(timing?.minMs, 100);
   assert.equal(timing?.maxMs, 250);
 });
+
+test("observability reset clears counters and timings", () => {
+  const metrics = new ObservabilityService();
+  metrics.increment("demo.counter", 1);
+  metrics.timing("demo.timing", 42);
+  metrics.reset();
+  const snapshot = metrics.snapshot();
+  assert.equal(snapshot.counters.length, 0);
+  assert.equal(snapshot.timings.length, 0);
+});

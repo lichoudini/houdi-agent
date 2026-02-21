@@ -12,6 +12,11 @@ export type PendingApproval = {
   note?: string;
 };
 
+export type AdminModeSnapshot = {
+  chatId: number;
+  enabled: boolean;
+};
+
 type AdminSecurityOptions = {
   approvalTtlMs: number;
 };
@@ -129,6 +134,52 @@ export class AdminSecurityController {
     const count = this.pendingById.size;
     this.pendingById.clear();
     return count;
+  }
+
+  replaceApprovals(approvals: PendingApproval[]): void {
+    this.pendingById.clear();
+    const now = Date.now();
+    for (const approval of approvals) {
+      const id = normalizeApprovalId(approval.id);
+      if (!id) {
+        continue;
+      }
+      if (!Number.isFinite(approval.chatId) || !Number.isFinite(approval.userId)) {
+        continue;
+      }
+      if (!Number.isFinite(approval.createdAt) || !Number.isFinite(approval.expiresAt)) {
+        continue;
+      }
+      if (approval.expiresAt <= now) {
+        continue;
+      }
+      this.pendingById.set(id, {
+        ...approval,
+        id,
+      });
+    }
+    this.purgeExpired();
+  }
+
+  snapshotApprovals(chatId?: number): PendingApproval[] {
+    return this.listApprovals(chatId);
+  }
+
+  snapshotAdminModes(): AdminModeSnapshot[] {
+    return [...this.adminModeByChat.entries()]
+      .map(([chatId, enabled]) => ({ chatId, enabled }))
+      .filter((entry) => Number.isFinite(entry.chatId))
+      .sort((a, b) => a.chatId - b.chatId);
+  }
+
+  replaceAdminModes(modes: AdminModeSnapshot[]): void {
+    this.adminModeByChat.clear();
+    for (const mode of modes) {
+      if (!Number.isFinite(mode.chatId)) {
+        continue;
+      }
+      this.adminModeByChat.set(Math.floor(mode.chatId), Boolean(mode.enabled));
+    }
   }
 
   getApprovalTtlMs(): number {

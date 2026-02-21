@@ -130,4 +130,9 @@ export class ObservabilityService {
       timings: this.listTimingStats(),
     };
   }
+
+  reset(): void {
+    this.counters.clear();
+    this.timings.clear();
+  }
 }

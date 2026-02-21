@@ -74,7 +74,7 @@
   - Flush de continuidad antes de razonar para reducir pérdida de contexto
   - Escritura de memoria diaria (`/remember`)
 - `src/admin-security.ts`
-  - `adminmode`, aprobaciones en memoria y `panic mode`
+  - `adminmode`, aprobaciones y `panic mode` (con restore desde estado persistido)
 - `src/audit-log.ts`
   - Registro de eventos en formato JSONL
 - `src/doctor.ts`
@@ -87,6 +87,7 @@
   - Bloqueo de instancia única para evitar conflicto de polling
 - `src/sqlite-state-store.ts`
   - Cola durable de outbox para respuestas fallidas y reintentos (`/outbox`)
+  - Snapshot/restore de estado runtime crítico por chat y global (modos, modelo, acciones pendientes)
 
 ## Flujo de ejecución
 1. Mensaje llega por Telegram.

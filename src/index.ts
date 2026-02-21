@@ -73,8 +73,19 @@ import { CoinGeckoApiTool } from "./coingecko-api.js";
 import type { WebSearchResult } from "./web-browser.js";
 import { WebBrowser } from "./web-browser.js";
 import { ObservabilityService } from "./observability.js";
+import { ChatMessageQueue } from "./chat-message-queue.js";
+import { ConversationLoopDetector } from "./conversation-loop-detector.js";
+import { ProgressNoticeService } from "./progress-notices.js";
 import { RequestIdempotencyService } from "./request-idempotency.js";
-import { SqliteStateStore } from "./sqlite-state-store.js";
+import {
+  SqliteStateStore,
+  type StoredChatRuntimeSettings,
+  type StoredOutboxMessage,
+  type StoredPendingApproval,
+  type StoredPlannedAction,
+  type StoredWorkspaceDeleteConfirmation,
+  type StoredWorkspaceDeletePathRequest,
+} from "./sqlite-state-store.js";
 import {
   isLocalBridgeAuthorized,
   parsePositiveInteger,
@@ -291,10 +302,12 @@ type IndexedListContext = {
   createdAtMs: number;
 };
 const indexedListByChat = new Map<number, IndexedListContext>();
-const lastProgressNoticeByChat = new Map<number, string>();
 const lastConnectorContextByChat = new Map<number, number>();
 let selfUpdateInProgress = false;
 let localBridgeServer: Server | null = null;
+let outboxRecoveryTimer: NodeJS.Timeout | null = null;
+let outboxRecoveryInFlight = false;
+let runtimeStatePersistenceTimer: NodeJS.Timeout | null = null;
 type PendingWorkspaceDeleteConfirmation = {
   paths: string[];
   requestedAtMs: number;
@@ -329,6 +342,9 @@ const pendingWorkspaceDeleteByChat = new Map<number, PendingWorkspaceDeleteConfi
 const pendingWorkspaceDeletePathByChat = new Map<number, PendingWorkspaceDeletePathRequest>();
 const workspaceClipboardByChat = new Map<number, WorkspaceClipboardState>();
 const pendingPlannedActionsById = new Map<string, PendingPlannedAction>();
+const incomingMessageQueue = new ChatMessageQueue();
+const conversationLoopDetector = new ConversationLoopDetector();
+const progressNoticeService = new ProgressNoticeService();
 const lastTaskActivityByChat = new Map<number, { text: string; atMs: number }>();
 type StoicSmalltalkSession = {
   expiresAtMs: number;
@@ -369,6 +385,11 @@ const SELF_UPDATE_BUILD_TIMEOUT_MS = 900_000;
 const LOCAL_BRIDGE_MESSAGE_PATH = "/internal/cli/message";
 const LOCAL_BRIDGE_HEALTH_PATH = "/internal/cli/health";
 const LOCAL_BRIDGE_MAX_BODY_BYTES = 512_000;
+const OUTBOX_MAX_RETRIES = 5;
+const OUTBOX_BACKOFF_MS: readonly number[] = [5_000, 25_000, 120_000, 600_000, 1_800_000];
+const OUTBOX_RECOVERY_INTERVAL_MS = 15_000;
+const OUTBOX_RECOVERY_BATCH_SIZE = 30;
+const RUNTIME_STATE_PERSIST_INTERVAL_MS = 5_000;
 const WORKSPACE_SELECTOR_MAX_DEPTH = 10;
 const WORKSPACE_SELECTOR_MAX_DIRS = 4000;
 const WORKSPACE_SELECTOR_MAX_MATCHES = 200;
@@ -440,6 +461,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "confirm",
   "cancelplan",
   "outbox",
+  "metrics",
   "panic",
   "intentstats",
   "intentfit",
@@ -451,6 +473,277 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "intentversion",
   "intentcanary",
 ]);
+
+function buildStoredPendingApprovalRows(): StoredPendingApproval[] {
+  return adminSecurity.snapshotApprovals().map((approval) => ({
+    id: approval.id,
+    kind: approval.kind,
+    chatId: approval.chatId,
+    userId: approval.userId,
+    agentName: approval.agentName,
+    commandLine: approval.commandLine,
+    createdAt: approval.createdAt,
+    expiresAt: approval.expiresAt,
+    ...(approval.note ? { note: approval.note } : {}),
+  }));
+}
+
+function buildStoredPlannedActionRows(): StoredPlannedAction[] {
+  return [...pendingPlannedActionsById.values()].map((planned) => ({
+    id: planned.id,
+    kind: planned.kind,
+    chatId: planned.chatId,
+    ...(typeof planned.userId === "number" ? { userId: planned.userId } : {}),
+    requestedAtMs: planned.requestedAtMs,
+    expiresAtMs: planned.expiresAtMs,
+    summary: planned.summary,
+    payloadJson: JSON.stringify(planned.payload ?? {}),
+  }));
+}
+
+function buildStoredWorkspaceDeleteConfirmationRows(): StoredWorkspaceDeleteConfirmation[] {
+  return [...pendingWorkspaceDeleteByChat.entries()].map(([chatId, pending]) => ({
+    chatId,
+    pathsJson: JSON.stringify(pending.paths ?? []),
+    requestedAtMs: pending.requestedAtMs,
+    expiresAtMs: pending.expiresAtMs,
+    source: pending.source,
+    ...(typeof pending.userId === "number" ? { userId: pending.userId } : {}),
+  }));
+}
+
+function buildStoredWorkspaceDeletePathRequestRows(): StoredWorkspaceDeletePathRequest[] {
+  return [...pendingWorkspaceDeletePathByChat.entries()].map(([chatId, pending]) => ({
+    chatId,
+    requestedAtMs: pending.requestedAtMs,
+    expiresAtMs: pending.expiresAtMs,
+    source: pending.source,
+    ...(typeof pending.userId === "number" ? { userId: pending.userId } : {}),
+  }));
+}
+
+function buildStoredChatRuntimeSettingsRows(): StoredChatRuntimeSettings[] {
+  const now = Date.now();
+  const chatIds = new Set<number>();
+  const adminModes = adminSecurity.snapshotAdminModes();
+  const adminByChat = new Map<number, boolean>();
+  for (const chatId of activeAgentByChat.keys()) {
+    chatIds.add(chatId);
+  }
+  for (const chatId of aiShellModeByChat.keys()) {
+    chatIds.add(chatId);
+  }
+  for (const chatId of ecoModeByChat.keys()) {
+    chatIds.add(chatId);
+  }
+  for (const chatId of safeModeByChat.keys()) {
+    chatIds.add(chatId);
+  }
+  for (const chatId of openAiModelByChat.keys()) {
+    chatIds.add(chatId);
+  }
+  for (const entry of adminModes) {
+    chatIds.add(entry.chatId);
+    adminByChat.set(entry.chatId, entry.enabled);
+  }
+
+  return [...chatIds]
+    .filter((chatId) => Number.isFinite(chatId))
+    .sort((a, b) => a - b)
+    .map((chatId) => {
+      const row: StoredChatRuntimeSettings = {
+        chatId,
+        updatedAtMs: now,
+      };
+      const activeAgent = activeAgentByChat.get(chatId)?.trim();
+      if (activeAgent) {
+        row.activeAgent = activeAgent;
+      }
+      if (aiShellModeByChat.has(chatId)) {
+        row.aiShellMode = Boolean(aiShellModeByChat.get(chatId));
+      }
+      if (ecoModeByChat.has(chatId)) {
+        row.ecoMode = Boolean(ecoModeByChat.get(chatId));
+      }
+      if (safeModeByChat.has(chatId)) {
+        row.safeMode = Boolean(safeModeByChat.get(chatId));
+      }
+      const openAiModel = openAiModelByChat.get(chatId)?.trim();
+      if (openAiModel) {
+        row.openAiModel = openAiModel;
+      }
+      if (adminByChat.has(chatId)) {
+        row.adminMode = Boolean(adminByChat.get(chatId));
+      }
+      return row;
+    });
+}
+
+function persistRuntimeStateSnapshot(source: string): void {
+  try {
+    sqliteState.replacePendingApprovals(buildStoredPendingApprovalRows());
+    sqliteState.replacePendingPlannedActions(buildStoredPlannedActionRows());
+    sqliteState.replaceWorkspaceDeleteConfirmations(buildStoredWorkspaceDeleteConfirmationRows());
+    sqliteState.replaceWorkspaceDeletePathRequests(buildStoredWorkspaceDeletePathRequestRows());
+    sqliteState.replaceChatRuntimeSettings(buildStoredChatRuntimeSettingsRows());
+    sqliteState.upsertGlobalRuntimeSettings({
+      panicMode: adminSecurity.isPanicModeEnabled(),
+      updatedAtMs: Date.now(),
+    });
+    observability.increment("runtime_state.persist.ok", 1, { source });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude persistir runtime state (${source}): ${message}`);
+    observability.increment("runtime_state.persist.failed", 1, { source });
+  }
+}
+
+function restoreRuntimeStateSnapshot(): void {
+  const now = Date.now();
+  try {
+    const approvals = sqliteState
+      .listPendingApprovals()
+      .filter((item) => item.expiresAt > now)
+      .map(
+        (item): PendingApproval => ({
+          id: item.id,
+          kind: item.kind as PendingApproval["kind"],
+          chatId: item.chatId,
+          userId: item.userId,
+          agentName: item.agentName,
+          commandLine: item.commandLine,
+          createdAt: item.createdAt,
+          expiresAt: item.expiresAt,
+          ...(item.note ? { note: item.note } : {}),
+        }),
+      );
+    adminSecurity.replaceApprovals(approvals);
+
+    const runtimeSettings = sqliteState.listChatRuntimeSettings();
+    activeAgentByChat.clear();
+    aiShellModeByChat.clear();
+    ecoModeByChat.clear();
+    safeModeByChat.clear();
+    openAiModelByChat.clear();
+    const adminModes: Array<{ chatId: number; enabled: boolean }> = [];
+    for (const item of runtimeSettings) {
+      const chatId = Math.floor(item.chatId);
+      if (!Number.isFinite(chatId) || chatId <= 0) {
+        continue;
+      }
+      const activeAgent = item.activeAgent?.trim() ?? "";
+      if (activeAgent && agentRegistry.get(activeAgent)) {
+        activeAgentByChat.set(chatId, activeAgent);
+      }
+      if (typeof item.aiShellMode === "boolean") {
+        aiShellModeByChat.set(chatId, item.aiShellMode);
+      }
+      if (typeof item.ecoMode === "boolean") {
+        ecoModeByChat.set(chatId, item.ecoMode);
+      }
+      if (typeof item.safeMode === "boolean") {
+        safeModeByChat.set(chatId, item.safeMode);
+      }
+      const openAiModel = item.openAiModel?.trim() ?? "";
+      if (openAiModel && /^[A-Za-z0-9._:-]{2,120}$/.test(openAiModel)) {
+        openAiModelByChat.set(chatId, openAiModel);
+      }
+      if (typeof item.adminMode === "boolean") {
+        adminModes.push({ chatId, enabled: item.adminMode });
+      }
+    }
+    adminSecurity.replaceAdminModes(adminModes);
+    const globalRuntime = sqliteState.getGlobalRuntimeSettings();
+    if (globalRuntime) {
+      adminSecurity.setPanicMode(globalRuntime.panicMode);
+    }
+
+    pendingPlannedActionsById.clear();
+    for (const item of sqliteState.listPendingPlannedActions()) {
+      if (item.expiresAtMs <= now) {
+        continue;
+      }
+      let payload: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(item.payloadJson) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          payload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        payload = {};
+      }
+      pendingPlannedActionsById.set(item.id, {
+        id: item.id,
+        kind: item.kind as PlannedActionKind,
+        chatId: item.chatId,
+        ...(typeof item.userId === "number" ? { userId: item.userId } : {}),
+        requestedAtMs: item.requestedAtMs,
+        expiresAtMs: item.expiresAtMs,
+        summary: item.summary,
+        payload,
+      });
+    }
+
+    pendingWorkspaceDeleteByChat.clear();
+    for (const item of sqliteState.listWorkspaceDeleteConfirmations()) {
+      if (item.expiresAtMs <= now) {
+        continue;
+      }
+      let paths: string[] = [];
+      try {
+        const parsed = JSON.parse(item.pathsJson) as unknown;
+        if (Array.isArray(parsed)) {
+          paths = parsed
+            .map((entry) => (typeof entry === "string" ? normalizeWorkspaceRelativePath(entry) : ""))
+            .filter(Boolean);
+        }
+      } catch {
+        paths = [];
+      }
+      if (paths.length === 0) {
+        continue;
+      }
+      pendingWorkspaceDeleteByChat.set(item.chatId, {
+        paths,
+        requestedAtMs: item.requestedAtMs,
+        expiresAtMs: item.expiresAtMs,
+        source: item.source,
+        ...(typeof item.userId === "number" ? { userId: item.userId } : {}),
+      });
+    }
+
+    pendingWorkspaceDeletePathByChat.clear();
+    for (const item of sqliteState.listWorkspaceDeletePathRequests()) {
+      if (item.expiresAtMs <= now) {
+        continue;
+      }
+      pendingWorkspaceDeletePathByChat.set(item.chatId, {
+        requestedAtMs: item.requestedAtMs,
+        expiresAtMs: item.expiresAtMs,
+        source: item.source,
+        ...(typeof item.userId === "number" ? { userId: item.userId } : {}),
+      });
+    }
+
+    observability.increment("runtime_state.restore.ok");
+    persistRuntimeStateSnapshot("restore-prune");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude restaurar runtime state: ${message}`);
+    observability.increment("runtime_state.restore.failed");
+  }
+}
+
+function startRuntimeStatePersistenceWorker(): void {
+  if (runtimeStatePersistenceTimer) {
+    return;
+  }
+  runtimeStatePersistenceTimer = setInterval(() => {
+    persistRuntimeStateSnapshot("timer");
+  }, RUNTIME_STATE_PERSIST_INTERVAL_MS);
+  runtimeStatePersistenceTimer.unref?.();
+}
+
 const workspaceFiles = new WorkspaceFilesService(
   config.workspaceDir,
   normalizeWorkspaceRelativePath,
@@ -500,6 +793,7 @@ function getActiveAgent(chatId: number): string {
 
 function setActiveAgent(chatId: number, agentName: string): void {
   activeAgentByChat.set(chatId, agentName);
+  persistRuntimeStateSnapshot("runtime:setActiveAgent");
 }
 
 function isAiShellModeEnabled(chatId: number): boolean {
@@ -508,6 +802,7 @@ function isAiShellModeEnabled(chatId: number): boolean {
 
 function setAiShellMode(chatId: number, enabled: boolean): void {
   aiShellModeByChat.set(chatId, enabled);
+  persistRuntimeStateSnapshot("runtime:setAiShellMode");
 }
 
 function isEcoModeEnabled(chatId: number): boolean {
@@ -516,6 +811,7 @@ function isEcoModeEnabled(chatId: number): boolean {
 
 function setEcoMode(chatId: number, enabled: boolean): void {
   ecoModeByChat.set(chatId, enabled);
+  persistRuntimeStateSnapshot("runtime:setEcoMode");
 }
 
 function isSafeModeEnabled(chatId: number): boolean {
@@ -524,6 +820,7 @@ function isSafeModeEnabled(chatId: number): boolean {
 
 function setSafeMode(chatId: number, enabled: boolean): void {
   safeModeByChat.set(chatId, enabled);
+  persistRuntimeStateSnapshot("runtime:setSafeMode");
 }
 
 function getOpenAiModelForChat(chatId: number): string {
@@ -540,10 +837,12 @@ function setOpenAiModelForChat(chatId: number, model: string): void {
     throw new Error("Modelo inválido. Usa letras, números, punto, guion, underscore o dos puntos.");
   }
   openAiModelByChat.set(chatId, normalized);
+  persistRuntimeStateSnapshot("runtime:setOpenAiModel");
 }
 
 function resetOpenAiModelForChat(chatId: number): void {
   openAiModelByChat.delete(chatId);
+  persistRuntimeStateSnapshot("runtime:resetOpenAiModel");
 }
 
 function buildOpenAiModelListText(): string {
@@ -572,6 +871,41 @@ function buildOpenAiUsageLines(limit = 6): string[] {
       .join(" | ")}`,
   );
   return lines;
+}
+
+function buildObservabilityReport(options?: { topCounters?: number; topTimings?: number }): string {
+  const topCounters = Math.max(1, Math.min(50, Math.floor(options?.topCounters ?? 12)));
+  const topTimings = Math.max(1, Math.min(50, Math.floor(options?.topTimings ?? 8)));
+  const snapshot = observability.snapshot();
+  const counters = [...snapshot.counters]
+    .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name))
+    .slice(0, topCounters);
+  const timings = [...snapshot.timings]
+    .sort((a, b) => b.p95Ms - a.p95Ms || b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, topTimings);
+  const queueTop = incomingMessageQueue.snapshot(8);
+  const outboxPending = sqliteState.listOutboxMessages(undefined, 500).length;
+  const outboxDue = sqliteState.listDueOutboxMessages({ limit: 500 }).length;
+  const outboxDeadLetterRecent = sqliteState.listOutboxDeadLetter(undefined, 100).length;
+  return [
+    "Observability snapshot:",
+    `Counters: ${snapshot.counters.length} | Timings: ${snapshot.timings.length}`,
+    `Incoming queue active chats: ${queueTop.length}`,
+    ...queueTop.map((item) => `- queue chat=${item.chatId} depth=${item.depth}`),
+    `Outbox pending=${outboxPending} | dueNow=${outboxDue} | deadLetterRecent=${outboxDeadLetterRecent}`,
+    `Top counters (${counters.length}):`,
+    ...counters.map((item) => {
+      const tags = Object.entries(item.tags)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(",");
+      return `- ${item.name}${tags ? ` {${tags}}` : ""}: ${item.value}`;
+    }),
+    `Top timings (${timings.length}):`,
+    ...timings.map(
+      (item) =>
+        `- ${item.name}: count=${item.count} p50=${item.p50Ms}ms p95=${item.p95Ms}ms min=${item.minMs}ms max=${item.maxMs}ms`,
+    ),
+  ].join("\n");
 }
 
 function isAdminApprovalRequired(chatId: number): boolean {
@@ -2011,6 +2345,7 @@ function queueWorkspaceDeleteConfirmation(params: {
     userId: params.userId,
   };
   pendingWorkspaceDeleteByChat.set(params.chatId, pending);
+  persistRuntimeStateSnapshot("workspace-delete-queue");
   return pending;
 }
 
@@ -2027,6 +2362,7 @@ function queueWorkspaceDeletePathRequest(params: {
     userId: params.userId,
   };
   pendingWorkspaceDeletePathByChat.set(params.chatId, pending);
+  persistRuntimeStateSnapshot("workspace-delete-path-queue");
   return pending;
 }
 
@@ -6059,10 +6395,15 @@ function getPolicyCapabilityBlockReason(chatId: number, capability: AgentCapabil
 
 function purgeExpiredPlannedActions(): void {
   const now = Date.now();
+  let removed = 0;
   for (const [id, item] of pendingPlannedActionsById.entries()) {
     if (item.expiresAtMs <= now) {
       pendingPlannedActionsById.delete(id);
+      removed += 1;
     }
+  }
+  if (removed > 0) {
+    persistRuntimeStateSnapshot("planned-purge");
   }
 }
 
@@ -6102,6 +6443,7 @@ function createPlannedAction(params: {
     payload: params.payload,
   };
   pendingPlannedActionsById.set(id, item);
+  persistRuntimeStateSnapshot("planned-create");
   return item;
 }
 
@@ -6112,6 +6454,7 @@ function consumePlannedAction(id: string, chatId: number): PendingPlannedAction 
     return null;
   }
   pendingPlannedActionsById.delete(item.id);
+  persistRuntimeStateSnapshot("planned-consume");
   return item;
 }
 
@@ -6122,6 +6465,7 @@ function denyPlannedAction(id: string, chatId: number): PendingPlannedAction | n
     return null;
   }
   pendingPlannedActionsById.delete(item.id);
+  persistRuntimeStateSnapshot("planned-deny");
   return item;
 }
 
@@ -6190,13 +6534,20 @@ async function reliableReply(
     const allowOutbox = options?.allowOutbox ?? true;
     if (allowOutbox) {
       try {
+        const failedAttempt = 1;
         sqliteState.enqueueOutboxMessage({
           chatId: ctx.chat.id,
           text,
           source: options?.source ?? "reply",
           createdAtMs: Date.now(),
-          attempts: 1,
+          attempts: failedAttempt,
+          nextAttemptAtMs: Date.now() + computeOutboxBackoffMs(failedAttempt),
           lastError: truncateInline(message, 300),
+        });
+        observability.increment("outbox.enqueued", 1, {
+          source: options?.source ?? "reply",
+          chatId: ctx.chat.id,
+          reason: "reply_error",
         });
       } catch (enqueueError) {
         const enqueueMessage = enqueueError instanceof Error ? enqueueError.message : String(enqueueError);
@@ -6207,6 +6558,44 @@ async function reliableReply(
   }
 }
 
+function computeOutboxBackoffMs(failedAttemptCount: number): number {
+  const attempt = Math.max(1, Math.floor(failedAttemptCount));
+  return OUTBOX_BACKOFF_MS[Math.min(attempt - 1, OUTBOX_BACKOFF_MS.length - 1)] ?? OUTBOX_BACKOFF_MS.at(-1) ?? 30_000;
+}
+
+function handleOutboxDeliveryFailure(params: {
+  entry: StoredOutboxMessage;
+  message: string;
+  source: string;
+}): "retry" | "dead-letter" {
+  const failedAttempt = Math.max(1, params.entry.attempts + 1);
+  const truncated = truncateInline(params.message, 300);
+  if (failedAttempt >= OUTBOX_MAX_RETRIES) {
+    sqliteState.moveOutboxToDeadLetter(params.entry.id, {
+      failureReason: `[${params.source}] ${truncateInline(params.message, 220)}`,
+      failedAtMs: Date.now(),
+    });
+    observability.increment("outbox.dead_letter", 1, {
+      source: params.source,
+      chatId: params.entry.chatId,
+      attempts: failedAttempt,
+    });
+    return "dead-letter";
+  }
+
+  const nextAttemptAtMs = Date.now() + computeOutboxBackoffMs(failedAttempt);
+  sqliteState.markOutboxAttempt(params.entry.id, {
+    lastError: truncated,
+    nextAttemptAtMs,
+  });
+  observability.increment("outbox.retry_scheduled", 1, {
+    source: params.source,
+    chatId: params.entry.chatId,
+    attempts: failedAttempt,
+  });
+  return "retry";
+}
+
 async function flushOutboxForChat(ctx: ChatReplyContext, maxItems = 10): Promise<{ delivered: number; pending: number }> {
   const list = sqliteState.listOutboxMessages(ctx.chat.id, maxItems);
   let delivered = 0;
@@ -6215,14 +6604,142 @@ async function flushOutboxForChat(ctx: ChatReplyContext, maxItems = 10): Promise
       await ctx.reply(entry.text);
       sqliteState.ackOutboxMessage(entry.id);
       delivered += 1;
+      observability.increment("outbox.delivered", 1, {
+        source: "manual_flush",
+        chatId: entry.chatId,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      sqliteState.markOutboxAttempt(entry.id, truncateInline(message, 300));
+      handleOutboxDeliveryFailure({
+        entry,
+        message,
+        source: "manual_flush",
+      });
       break;
     }
   }
   const pending = sqliteState.listOutboxMessages(ctx.chat.id, 200).length;
   return { delivered, pending };
+}
+
+async function recoverDueOutboxMessages(source: "startup" | "timer"): Promise<{
+  processed: number;
+  delivered: number;
+  retried: number;
+  deadLettered: number;
+}> {
+  const due = sqliteState.listDueOutboxMessages({
+    limit: OUTBOX_RECOVERY_BATCH_SIZE,
+  });
+  if (due.length === 0) {
+    return {
+      processed: 0,
+      delivered: 0,
+      retried: 0,
+      deadLettered: 0,
+    };
+  }
+
+  let delivered = 0;
+  let retried = 0;
+  let deadLettered = 0;
+
+  for (const entry of due) {
+    try {
+      await bot.api.sendMessage(entry.chatId, entry.text);
+      sqliteState.ackOutboxMessage(entry.id);
+      delivered += 1;
+      observability.increment("outbox.delivered", 1, {
+        source,
+        chatId: entry.chatId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const action = handleOutboxDeliveryFailure({
+        entry,
+        message,
+        source,
+      });
+      if (action === "dead-letter") {
+        deadLettered += 1;
+      } else {
+        retried += 1;
+      }
+    }
+  }
+
+  return {
+    processed: due.length,
+    delivered,
+    retried,
+    deadLettered,
+  };
+}
+
+async function runOutboxRecoveryTick(source: "startup" | "timer"): Promise<void> {
+  if (outboxRecoveryInFlight) {
+    observability.increment("outbox.recovery.skipped_in_flight", 1, { source });
+    return;
+  }
+  outboxRecoveryInFlight = true;
+  const startedAt = Date.now();
+  try {
+    const stats = await recoverDueOutboxMessages(source);
+    observability.increment("outbox.recovery.tick", 1, {
+      source,
+      processed: stats.processed,
+      delivered: stats.delivered,
+      retried: stats.retried,
+      deadLettered: stats.deadLettered,
+    });
+    observability.timing("outbox.recovery.tick_ms", Date.now() - startedAt);
+    if (stats.processed > 0) {
+      logInfo(
+        `Outbox recovery (${source}): processed=${stats.processed} delivered=${stats.delivered} retried=${stats.retried} dead=${stats.deadLettered}`,
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`Outbox recovery (${source}) falló: ${message}`);
+    observability.increment("outbox.recovery.failed", 1, { source });
+  } finally {
+    outboxRecoveryInFlight = false;
+  }
+}
+
+function startOutboxRecoveryWorker(): void {
+  if (outboxRecoveryTimer) {
+    return;
+  }
+  outboxRecoveryTimer = setInterval(() => {
+    void runOutboxRecoveryTick("timer");
+  }, OUTBOX_RECOVERY_INTERVAL_MS);
+  outboxRecoveryTimer.unref?.();
+  void runOutboxRecoveryTick("startup");
+}
+
+async function runInIncomingQueue<T>(params: {
+  chatId: number;
+  source: string;
+  executor: () => Promise<T>;
+}): Promise<T> {
+  const depthBefore = incomingMessageQueue.getDepth(params.chatId);
+  observability.increment("incoming.queue.enqueue", 1, {
+    source: params.source,
+    chatId: params.chatId,
+    depth: depthBefore + 1,
+  });
+  try {
+    const queued = await incomingMessageQueue.enqueue(params.chatId, params.executor);
+    observability.timing("incoming.queue.wait_ms", queued.waitMs);
+    return queued.result;
+  } catch (error) {
+    observability.increment("incoming.queue.failed", 1, {
+      source: params.source,
+      chatId: params.chatId,
+    });
+    throw error;
+  }
 }
 
 async function buildPromptContextForQuery(query: string, options?: { chatId?: number }) {
@@ -6357,224 +6874,6 @@ async function replyLong(ctx: { reply: (text: string) => Promise<unknown> }, tex
   }
 }
 
-type ProgressNoticeKind =
-  | "openai"
-  | "shell-plan"
-  | "doc-read"
-  | "doc-analyze"
-  | "web-search"
-  | "web-open"
-  | "gmail-query"
-  | "gmail-send"
-  | "audio-transcribe"
-  | "audio-analyze"
-  | "generic";
-
-const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
-  openai: [
-    "Calentando neuronas digitales...",
-    "Abriendo el cajon de ideas premium...",
-    "Consultando al oraculo de silicio...",
-    "Sincronizando sinapsis virtuales...",
-    "Poniendo cafe virtual al modelo...",
-    "Afinando la brújula mental del bot...",
-    "Ordenando ideas en modo quirúrgico...",
-    "Cargando contexto de alto octanaje...",
-    "Puliendo la respuesta para que salga fina...",
-    "Encendiendo motor de razonamiento sin humo...",
-  ],
-  "shell-plan": [
-    "Afilando la navaja suiza de comandos...",
-    "Revisando que no explote nada raro...",
-    "Negociando con la terminal para que coopere...",
-    "Montando plan de ataque con casco y linterna...",
-    "Ajustando tornillos del plan shell...",
-    "Mapeando comandos seguros antes de tocar nada...",
-    "Desarmando el problema en pasos ejecutables...",
-    "Chequeando permisos y bordes peligrosos...",
-    "Diseñando ruta de terminal con cinturón puesto...",
-    "Preparando comando limpio, corto y reversible...",
-  ],
-  "doc-read": [
-    "Abriendo el archivo con guantes blancos...",
-    "Pasando paginas a velocidad turbo...",
-    "Escaneando letras con lupa digital...",
-    "Activando modo bibliotecario serio...",
-    "Leyendo sin pestañear...",
-    "Extrayendo texto como arqueólogo paciente...",
-    "Desenrollando el documento hoja por hoja...",
-    "Inspeccionando el archivo con foco de precisión...",
-    "Levantando contenido útil del documento...",
-    "Decodificando formato y contenido en paralelo...",
-  ],
-  "doc-analyze": [
-    "Subrayando lo importante en fosforito imaginario...",
-    "Armando resumen con bisturi y cafe...",
-    "Buscando hallazgos entre lineas...",
-    "Conectando pistas del documento...",
-    "Montando analisis sin humo...",
-    "Separando señal de ruido en el documento...",
-    "Convirtiendo texto largo en conclusiones claras...",
-    "Sintetizando puntos críticos y accionables...",
-    "Cruzando secciones para detectar inconsistencias...",
-    "Preparando lectura ejecutiva del contenido...",
-  ],
-  "web-search": [
-    "Soltando sabuesos binarios por internet...",
-    "Rastreando la web sin perderse en clickbait...",
-    "Encendiendo radar anti-ruido en buscadores...",
-    "Pescando fuentes utiles en mar abierto...",
-    "Navegando con mapa, brujula y sentido comun...",
-    "Barrido web en curso con filtro anti-humo...",
-    "Levantando señales frescas entre titulares...",
-    "Escarbando fuentes recientes con criterio...",
-    "Explorando la red para traer solo lo relevante...",
-    "Cazando evidencias web con casco y paciencia...",
-  ],
-  "web-open": [
-    "Abriendo la pagina con casco de seguridad...",
-    "Entrando al sitio en modo inspector...",
-    "Chequeando el contenido sin tragar humo...",
-    "Aterrizando en la URL con tren de aterrizaje...",
-    "Desempolvando el contenido de la pagina...",
-    "Inspeccionando la URL en modo lupa forense...",
-    "Descargando y limpiando contenido de la página...",
-    "Abriendo enlace con protocolo anti-ruido...",
-    "Leyendo la página con ojos de auditor...",
-    "Extrayendo lo útil del sitio sin vueltas...",
-  ],
-  "gmail-query": [
-    "Revisando la bandeja con traje de detective...",
-    "Buscando correos como sabueso de oficina...",
-    "Peinando Gmail sin perder hilos...",
-    "Abriendo la correspondencia del dia...",
-    "Filtrando correos con lupa y mate...",
-    "Consultando Gmail con criterio de archivista...",
-    "Rastreando mensajes clave en la bandeja...",
-    "Ordenando correos por prioridad y contexto...",
-    "Buscando el hilo correcto sin perder el rumbo...",
-    "Escaneando inbox en modo precisión...",
-  ],
-  "gmail-send": [
-    "Puliendo el correo antes del despegue...",
-    "Ensobrando el mensaje con precision quirurgica...",
-    "Ajustando asunto y cuerpo para envio...",
-    "Despachando correo con sello oficial...",
-    "Empujando el email por la pista de salida...",
-    "Armando envío con asunto y cuerpo bien atados...",
-    "Revisando destinatario y contenido antes de salir...",
-    "Preparando correo para entrega sin rebotes...",
-    "Finalizando email en modo prolijo...",
-    "Lanzando correo con control de calidad...",
-  ],
-  "audio-transcribe": [
-    "Afinando oidos de robot para transcribir...",
-    "Convirtiendo ondas de audio en texto legible...",
-    "Escuchando con auriculares imaginarios...",
-    "Traduciendo vibraciones a palabras...",
-    "Procesando audio en modo estenografo turbo...",
-    "Desgranando el audio palabra por palabra...",
-    "Levantando texto desde la señal de voz...",
-    "Convirtiendo voz en texto con bisturí digital...",
-    "Transcribiendo audio con paciencia de relojero...",
-    "Capturando cada frase del audio sin perder contexto...",
-  ],
-  "audio-analyze": [
-    "Exprimiendo la transcripcion gota a gota...",
-    "Ordenando ideas del audio en fila india...",
-    "Armando respuesta a partir de la transcripcion...",
-    "Conectando puntos del audio transcripto...",
-    "Procesando lo dicho sin perder contexto...",
-    "Interpretando la transcripción con lupa semántica...",
-    "Traduciendo audio a acciones concretas...",
-    "Separando intención principal de detalles secundarios...",
-    "Convirtiendo voz transcripta en plan ejecutable...",
-    "Aterrizando el pedido de audio en pasos claros...",
-  ],
-  generic: [
-    "Moviendo engranajes internos...",
-    "Acomodando piezas del rompecabezas...",
-    "Cargando motores sin derramar el cafe...",
-    "Haciendo magia sin trucos baratos...",
-    "Preparando resultado con precision...",
-    "Alineando contexto para responder mejor...",
-    "Encajando piezas con paciencia quirúrgica...",
-    "Activando modo resolución de problemas...",
-    "Procesando solicitud con método y calma...",
-    "Terminando de cocinar una respuesta útil...",
-  ],
-};
-
-function normalizeProgressText(text: string): string {
-  return text
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "")
-    .toLowerCase()
-    .trim();
-}
-
-function classifyProgressNoticeKind(text: string): ProgressNoticeKind {
-  const normalized = normalizeProgressText(text);
-
-  if (normalized.includes("transcribiendo")) {
-    return "audio-transcribe";
-  }
-  if (normalized.includes("analizando transcripcion")) {
-    return "audio-analyze";
-  }
-  if (normalized.includes("enviando email")) {
-    return "gmail-send";
-  }
-  if (normalized.includes("consultando gmail")) {
-    return "gmail-query";
-  }
-  if (normalized.includes("buscando y sintetizando en web") || normalized.includes("buscando en web")) {
-    return "web-search";
-  }
-  if (normalized.includes("abriendo http") || (normalized.startsWith("abriendo ") && normalized.includes("://"))) {
-    return "web-open";
-  }
-  if (normalized.includes("documento detectado") && normalized.includes("analizando")) {
-    return "doc-analyze";
-  }
-  if (normalized.includes("leyendo archivo")) {
-    return "doc-read";
-  }
-  if (normalized.includes("instruccion para shell")) {
-    return "shell-plan";
-  }
-  if (normalized.includes("openai")) {
-    return "openai";
-  }
-
-  return "generic";
-}
-
-function pickProgressNoticeVariant(kind: ProgressNoticeKind, chatId?: number): string {
-  const variants = PROGRESS_NOTICE_VARIANTS[kind];
-  if (!variants || variants.length === 0) {
-    return "Trabajando en eso...";
-  }
-  const base = variants[Math.floor(Math.random() * variants.length)] ?? "Trabajando en eso...";
-
-  if (variants.length === 1 || typeof chatId !== "number") {
-    return base;
-  }
-
-  const last = lastProgressNoticeByChat.get(chatId) ?? "";
-  let chosen = base;
-  for (let attempts = 0; attempts < 5 && chosen === last; attempts += 1) {
-    chosen = variants[Math.floor(Math.random() * variants.length)] ?? base;
-  }
-  lastProgressNoticeByChat.set(chatId, chosen);
-  return chosen;
-}
-
-function buildProgressNotice(text: string, chatId?: number): string {
-  const kind = classifyProgressNoticeKind(text);
-  return pickProgressNoticeVariant(kind, chatId);
-}
-
 function isDetailedAnswerRequested(text: string): boolean {
   const normalized = normalizeIntentText(text);
   if (!normalized) {
@@ -6616,7 +6915,7 @@ async function replyProgress(ctx: { reply: (text: string) => Promise<unknown>; c
       atMs: Date.now(),
     });
   }
-  const notice = buildProgressNotice(text, ctx.chat?.id);
+  const notice = progressNoticeService.build(text, ctx.chat?.id);
   await ctx.reply(notice);
 }
 
@@ -7441,6 +7740,7 @@ async function queueApproval(params: {
     commandLine: params.commandLine,
     note: params.note,
   });
+  persistRuntimeStateSnapshot("approval-create");
 
   await safeAudit({
     type: "approval.created",
@@ -7889,6 +8189,9 @@ async function executeAiShellInstruction(ctx: ChatReplyContext, instruction: str
     note: instruction.slice(0, 300),
   });
 }
+
+restoreRuntimeStateSnapshot();
+startRuntimeStatePersistenceWorker();
 
 const bot = new Bot(config.telegramBotToken);
 let scheduleDeliveryLoopRunning = false;
@@ -12367,7 +12670,8 @@ bot.command("help", async (ctx) => {
       "/deny <id> - Rechazar ejecución pendiente",
       "/confirm <plan_id> - Confirmar plan preview sensible",
       "/cancelplan <plan_id> - Cancelar plan preview sensible",
-      "/outbox [status|flush] - Estado/reintento de respuestas pendientes",
+      "/outbox [status|flush|recover] - Estado/reintento de respuestas pendientes",
+      "/metrics [reset] - Snapshot de observabilidad (counters/timings/colas)",
       "/panic on|off|status - Bloqueo global de ejecución",
       "/tasks - Ver tareas activas",
       "/kill <taskId> - Terminar tarea activa",
@@ -12452,6 +12756,9 @@ bot.command("status", async (ctx) => {
   const totalMemMb = Math.round(os.totalmem() / (1024 * 1024));
   const pendingCount = adminSecurity.listApprovals(ctx.chat.id).length;
   const pendingOutboxCount = sqliteState.listOutboxMessages(ctx.chat.id, 500).length;
+  const deadLetterOutboxCount = sqliteState.listOutboxDeadLetter(ctx.chat.id, 200).length;
+  const queueDepthChat = incomingMessageQueue.getDepth(ctx.chat.id);
+  const queueActiveChats = incomingMessageQueue.snapshot(200).length;
   const activeProfile = agentRegistry.require(getActiveAgent(ctx.chat.id));
   let memoryStatusLine = "Memoria: n/d";
   try {
@@ -12508,7 +12815,8 @@ bot.command("status", async (ctx) => {
       `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"} (${rebootAllowedInAgent ? "permitido en agente actual" : "no permitido en agente actual"})`,
       `Aprobaciones pendientes (chat): ${pendingCount}`,
-      `Outbox pendiente (chat): ${pendingOutboxCount}`,
+      `Outbox pendiente (chat): ${pendingOutboxCount} | dead-letter recientes: ${deadLetterOutboxCount}`,
+      `Incoming queue: depth(chat)=${queueDepthChat} | chats activos=${queueActiveChats}`,
       `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
       ...buildOpenAiUsageLines(3),
@@ -12525,7 +12833,7 @@ bot.command("status", async (ctx) => {
       `Archivos inbound: maxFile=${Math.round(config.fileMaxFileBytes / (1024 * 1024))}MB | store=${toProjectRelativePath(path.join(config.workspaceDir, "files", `chat-${ctx.chat.id}`))}`,
       `Imagenes: maxFile=${Math.round(config.imageMaxFileBytes / (1024 * 1024))}MB | store=${imageStorePath}`,
       `Agenda: pending=${scheduledPendingCount} | poll=${config.schedulePollMs}ms | file=${config.scheduleFile}`,
-      `State DB: ${toProjectRelativePath(config.stateDbFile)} | idempotencyTTL=${config.idempotencyTtlMs}ms`,
+      `State DB: ${toProjectRelativePath(config.stateDbFile)} | idempotencyTTL=${config.idempotencyTtlMs}ms | runtimePersist=${RUNTIME_STATE_PERSIST_INTERVAL_MS}ms`,
       `Selfskill draft: ${selfSkillDraft ? `activo (${selfSkillDraft.lines.length} lineas)` : "off"} | file=${config.selfSkillDraftsFile}`,
       `${suggestionStatusLine} | enabled=${config.suggestionsEnabled ? "on" : "off"} | poll=${config.suggestionsPollMs}ms`,
       `Workspace: ${config.workspaceDir}`,
@@ -12578,6 +12886,31 @@ bot.command("usage", async (ctx) => {
     }),
   ];
   await replyLong(ctx, lines.join("\n"));
+});
+
+bot.command("metrics", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim().toLowerCase();
+  if (raw === "reset") {
+    observability.reset();
+    await ctx.reply("Observability reset ejecutado para este proceso.");
+    await safeAudit({
+      type: "metrics.reset",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+    });
+    return;
+  }
+
+  const text = buildObservabilityReport();
+  await replyLong(ctx, text);
+  await safeAudit({
+    type: "metrics.snapshot",
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    details: {
+      raw,
+    },
+  });
 });
 
 bot.command("domains", async (ctx) => {
@@ -15882,6 +16215,7 @@ bot.command("adminmode", async (ctx) => {
 
   const enabled = raw === "on";
   adminSecurity.setAdminMode(ctx.chat.id, enabled);
+  persistRuntimeStateSnapshot("runtime:setAdminMode");
   await ctx.reply(
     [
       `Admin mode ahora está ${enabled ? "on" : "off"}.`,
@@ -15930,6 +16264,7 @@ bot.command("approve", async (ctx) => {
     await ctx.reply(`No encontré aprobación pendiente con ID ${id} en este chat.`);
     return;
   }
+  persistRuntimeStateSnapshot("approval-consume");
 
   const profile = agentRegistry.get(approval.agentName);
   if (!profile) {
@@ -15982,6 +16317,7 @@ bot.command("deny", async (ctx) => {
     await ctx.reply(`No encontré aprobación pendiente con ID ${id} en este chat.`);
     return;
   }
+  persistRuntimeStateSnapshot("approval-deny");
 
   await ctx.reply(`Aprobación ${id} rechazada.`);
   await safeAudit({
@@ -16069,7 +16405,15 @@ bot.command("outbox", async (ctx) => {
   const raw = String(ctx.match ?? "").trim().toLowerCase();
   if (!raw || raw === "status") {
     const pending = sqliteState.listOutboxMessages(ctx.chat.id, 200).length;
-    await ctx.reply(`Outbox pending (chat): ${pending}`);
+    const dueNow = sqliteState.listDueOutboxMessages({ chatId: ctx.chat.id, limit: 200 }).length;
+    const deadLetterRecent = sqliteState.listOutboxDeadLetter(ctx.chat.id, 200).length;
+    await ctx.reply(
+      [
+        `Outbox pending (chat): ${pending}`,
+        `Outbox due now (chat): ${dueNow}`,
+        `Outbox dead-letter recientes (chat): ${deadLetterRecent}`,
+      ].join("\n"),
+    );
     return;
   }
   if (raw === "flush") {
@@ -16077,7 +16421,13 @@ bot.command("outbox", async (ctx) => {
     await ctx.reply(`Outbox flush: delivered=${result.delivered} pending=${result.pending}`);
     return;
   }
-  await ctx.reply("Uso: /outbox status|flush");
+  if (raw === "recover") {
+    await runOutboxRecoveryTick("timer");
+    const pending = sqliteState.listOutboxMessages(ctx.chat.id, 200).length;
+    await ctx.reply(`Outbox recover ejecutado. pending(chat)=${pending}`);
+    return;
+  }
+  await ctx.reply("Uso: /outbox status|flush|recover");
 });
 
 bot.command("policy", async (ctx) => {
@@ -16126,10 +16476,12 @@ bot.command("panic", async (ctx) => {
 
   const enable = raw === "on";
   adminSecurity.setPanicMode(enable);
+  persistRuntimeStateSnapshot("runtime:setPanicMode");
 
   if (enable) {
     const killed = taskRunner.killAll();
     const cleared = adminSecurity.clearAllApprovals();
+    persistRuntimeStateSnapshot("panic-clear-approvals");
     await ctx.reply(
       [
         "Panic mode ACTIVADO.",
@@ -16402,13 +16754,18 @@ bot.on("message:document", async (ctx, next) => {
           captionChars: captionTask.length,
         },
       });
-      await handleIncomingTextMessage({
-        ctx,
-        text: instructionText,
+      await runInIncomingQueue({
+        chatId: ctx.chat.id,
         source: "telegram:file:caption-task",
-        userId: ctx.from?.id,
-        persistUserTurn: false,
-        allowSlashPrefix: false,
+        executor: async () =>
+          handleIncomingTextMessage({
+            ctx,
+            text: instructionText,
+            source: "telegram:file:caption-task",
+            userId: ctx.from?.id,
+            persistUserTurn: false,
+            allowSlashPrefix: false,
+          }),
       });
     }
   } catch (error) {
@@ -16481,13 +16838,18 @@ bot.on(["message:voice", "message:audio", "message:document"], async (ctx, next)
     const textForExecution = incoming.caption ? `${transcript}\n\n${incoming.caption}` : transcript;
 
     await replyProgress(ctx, "Interpretando pedido de audio...");
-    await handleIncomingTextMessage({
-      ctx,
-      text: textForExecution,
+    await runInIncomingQueue({
+      chatId: ctx.chat.id,
       source: "telegram:audio",
-      userId: ctx.from?.id,
-      persistUserTurn: true,
-      allowSlashPrefix: false,
+      executor: async () =>
+        handleIncomingTextMessage({
+          ctx,
+          text: textForExecution,
+          source: "telegram:audio",
+          userId: ctx.from?.id,
+          persistUserTurn: true,
+          allowSlashPrefix: false,
+        }),
     });
 
     await safeAudit({
@@ -16554,6 +16916,35 @@ async function handleIncomingTextMessage(params: {
   // Never intercept Telegram slash commands from the free-text pipeline.
   if (!allowSlashPrefix && text.startsWith("/")) {
     return;
+  }
+
+  const loopDetection = conversationLoopDetector.record(params.ctx.chat.id, text);
+  if (loopDetection.stuck) {
+    observability.increment("loop.detected", 1, {
+      level: loopDetection.level,
+      detector: loopDetection.detector,
+      chatId: params.ctx.chat.id,
+      source,
+    });
+    await safeAudit({
+      type: "loop.detected",
+      chatId: params.ctx.chat.id,
+      userId,
+      details: {
+        level: loopDetection.level,
+        detector: loopDetection.detector,
+        count: loopDetection.count,
+        source,
+      },
+    });
+    if (loopDetection.level === "critical") {
+      await reliableReply(
+        params.ctx,
+        `${loopDetection.message}\nSi quieres, reescribo la acción en un plan paso a paso para ejecutarla una sola vez.`,
+        { source: "loop:critical", allowOutbox: true },
+      );
+      return;
+    }
   }
 
   const handledPendingWorkspaceDelete = await maybeHandlePendingWorkspaceDeleteConfirmation({
@@ -16805,13 +17196,18 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
   };
 
   try {
-    await handleIncomingTextMessage({
-      ctx,
-      text,
+    await runInIncomingQueue({
+      chatId,
       source,
-      userId,
-      persistUserTurn: true,
-      allowSlashPrefix: true,
+      executor: async () =>
+        handleIncomingTextMessage({
+          ctx,
+          text,
+          source,
+          userId,
+          persistUserTurn: true,
+          allowSlashPrefix: true,
+        }),
     });
     writeJsonResponse(res, 200, {
       ok: true,
@@ -16915,22 +17311,27 @@ bot.on("message:text", async (ctx) => {
     return typeof firstName === "string" ? firstName : "";
   })();
 
-  await handleIncomingTextMessage({
-    ctx,
-    text: ctx.message.text,
+  await runInIncomingQueue({
+    chatId: ctx.chat.id,
     source: "telegram:message",
-    userId: ctx.from?.id,
-    persistUserTurn: true,
-    allowSlashPrefix: false,
-    ...(repliedTextRaw.trim()
-      ? {
-          replyReference: {
-            ...(typeof repliedMessageId === "number" ? { messageId: repliedMessageId } : {}),
-            ...(repliedFromName.trim() ? { fromName: repliedFromName.trim() } : {}),
-            text: repliedTextRaw.trim(),
-          },
-        }
-      : {}),
+    executor: async () =>
+      handleIncomingTextMessage({
+        ctx,
+        text: ctx.message.text,
+        source: "telegram:message",
+        userId: ctx.from?.id,
+        persistUserTurn: true,
+        allowSlashPrefix: false,
+        ...(repliedTextRaw.trim()
+          ? {
+              replyReference: {
+                ...(typeof repliedMessageId === "number" ? { messageId: repliedMessageId } : {}),
+                ...(repliedFromName.trim() ? { fromName: repliedFromName.trim() } : {}),
+                text: repliedTextRaw.trim(),
+              },
+            }
+          : {}),
+      }),
   });
 });
 
@@ -16954,6 +17355,8 @@ try {
   const message = error instanceof Error ? error.message : String(error);
   logWarn(`No pude iniciar Local CLI bridge API: ${message}`);
 }
+
+startOutboxRecoveryWorker();
 
 logInfo("Starting Telegram bot...");
 await bot.start();

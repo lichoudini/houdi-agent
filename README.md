@@ -234,7 +234,8 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/deny <id>`
 - `/confirm <plan_id>`
 - `/cancelplan <plan_id>`
-- `/outbox [status|flush]`
+- `/outbox [status|flush|recover]`
+- `/metrics [reset]`
 - `/panic on|off|status`
 - `/tasks`
 - `/kill <taskId>`
@@ -259,7 +260,7 @@ Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo 
 - `/model reset`: vuelve al default de `.env`.
 
 Notas:
-- El override es en memoria (runtime): no modifica `.env`.
+- El override persiste en la base de estado (sobrevive reinicios), no modifica `.env`.
 - Aplica a consultas IA de chat, analisis de imagen y planificacion de `/shell`.
 
 ## Operación y robustez
@@ -267,7 +268,9 @@ Notas:
 - `/doctor`: ejecuta chequeos rápidos de runtime, permisos, credenciales y seguridad base.
 - `/usage`: muestra tokens/costo estimado OpenAI acumulado desde que inició el proceso.
 - `/usage reset`: reinicia contadores locales de uso OpenAI.
+- `/metrics`: snapshot de observabilidad (counters/timings/colas/outbox).
 - `/domains`: lista dominios modulares activos (router/workspace/gmail) y sus capacidades.
+- Estado runtime crítico persistente en SQLite: aprobaciones, planes pendientes, confirmaciones de borrado, modo admin/panic y settings por chat (agente activo, shellmode, eco, safe y modelo OpenAI).
 
 ## CLI local
 
