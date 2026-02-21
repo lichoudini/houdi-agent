@@ -121,8 +121,6 @@ cp .env.example .env
 - `WEB_FETCH_TIMEOUT_MS` (default: `20000`)
 - `WEB_FETCH_MAX_BYTES` (default: `2000000`)
 - `WEB_CONTENT_MAX_CHARS` (default: `15000`)
-- `GNEWS_API_KEY` (opcional, proveedor recomendado para `/news`)
-- `NEWSAPI_KEY` (opcional, fallback para `/news`)
 - `ENABLE_GMAIL_ACCOUNT` (default: `false`)
 - `GMAIL_CLIENT_ID` (OAuth client ID)
 - `GMAIL_CLIENT_SECRET` (OAuth client secret)
@@ -411,10 +409,22 @@ Con `ENABLE_LIM_CONTROL=true`, puedes operar una app externa y su túnel sin com
 - `apagá LIM`
 - `levantá LIM solo app` (sin tunnel)
 
+Regla de activación:
+
+- El dominio LIM solo se activa si el mensaje incluye explícitamente `LIM`/`lim` (o `/lim`).
+- Si no aparece `lim`, el bot no entra al flujo LIM (evita confusiones con otras conversaciones).
+
 Consulta directa de mensajes LIM (contacto + fuente):
 
 - `/lim first_name:Juan last_name:Perez fuente:account_demo_c_jack count:3`
 - `consulta LIM first_name:Juan last_name:Perez fuente:account_demo_c_jack`
+- `revisar LIM de Rodrigo Toscano en linkedin marylin`
+- `trae los ultimos 3 mensajes de Rodrigo Toscano en linkedin marylin`
+
+Notas de consulta LIM:
+
+- En lenguaje natural, `count` por defecto es `3` (max `10`).
+- La lectura prioriza mensajes del prospecto (entrantes/no propios).
 
 `fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
 
@@ -439,7 +449,6 @@ El script crea:
 Comandos:
 
 - `/web <consulta>`: busca en la web y devuelve resultados numerados.
-- `/news <consulta> [limit]`: noticias recientes (últimos 7 días) vía GNews/NewsAPI.
 - `/crypto [consulta] [limit]`: mercado crypto en USD (CoinGecko).
 - `/weather [ubicación]`: clima actual + próximos días (Open-Meteo).
 - `/reddit <consulta> [limit]`: búsqueda de posts en Reddit API.

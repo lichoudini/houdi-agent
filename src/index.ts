@@ -22,7 +22,6 @@ import {
 } from "./intent-semantic-router.js";
 import { logError, logInfo, logWarn } from "./logger.js";
 import { formatMemoryHitsNaturalText } from "./memory-presenter.js";
-import { NewsApiTool, type NewsArticleResult } from "./news-api.js";
 import { OpenAiService } from "./openai-client.js";
 import { OpenMeteoApiTool } from "./open-meteo-api.js";
 import { RedditApiTool, type RedditPostResult } from "./reddit-api.js";
@@ -62,11 +61,6 @@ const webBrowser = new WebBrowser({
 });
 const redditApi = new RedditApiTool({
   timeoutMs: config.webFetchTimeoutMs,
-});
-const newsApi = new NewsApiTool({
-  timeoutMs: config.webFetchTimeoutMs,
-  gnewsApiKey: config.gnewsApiKey,
-  newsApiKey: config.newsApiKey,
 });
 const coinGeckoApi = new CoinGeckoApiTool({
   timeoutMs: config.webFetchTimeoutMs,
@@ -276,7 +270,6 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "getfile",
   "web",
   "lim",
-  "news",
   "crypto",
   "weather",
   "reddit",
@@ -645,6 +638,7 @@ type ConnectorNaturalIntent = {
   lastName?: string;
   sourceName?: string;
   count?: number;
+  prospectOnly?: boolean;
 };
 
 type ScheduleNaturalAction = "create" | "list" | "delete" | "edit";
@@ -3840,16 +3834,6 @@ function redditPostsToWebSearchResults(posts: RedditPostResult[]): WebSearchResu
   });
 }
 
-function newsArticlesToWebSearchResults(articles: NewsArticleResult[]): WebSearchResult[] {
-  return articles.map((item) => ({
-    title: item.title,
-    url: item.url,
-    snippet: [item.source, formatIsoDateCompact(item.publishedAt), normalizeSearchSnippet(item.description, 180)]
-      .filter(Boolean)
-      .join(" | "),
-  }));
-}
-
 function detectWebIntent(text: string): WebIntent {
   const original = text.trim();
   if (!original) {
@@ -3942,31 +3926,13 @@ async function runWebSearchQuery(params: {
 
     const to = new Date();
     const from = new Date(to.getTime() - NEWS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000);
-    const [redditPosts, apiNewsEs, apiNewsEn, recentGeneralHits, generalHits, specializedResults] = await Promise.all([
+    const [redditPosts, recentGeneralHits, generalHits, specializedResults] = await Promise.all([
       redditApi.searchPosts({
         query: queryText,
         limit: Math.max(NEWS_MAX_REDDIT_RESULTS * 2, expandedLimit),
         sort: "new",
         time: "week",
       }),
-      newsApi.isConfigured()
-        ? newsApi.searchLatest({
-            query: queryText,
-            limit: Math.max(3, Math.min(10, expandedLimit)),
-            language: "es",
-            from,
-            to,
-          })
-        : Promise.resolve([]),
-      newsApi.isConfigured()
-        ? newsApi.searchLatest({
-            query: queryText,
-            limit: Math.max(2, Math.min(6, Math.floor(expandedLimit / 2))),
-            language: "en",
-            from,
-            to,
-          })
-        : Promise.resolve([]),
       webBrowser.search(`${queryText} hoy ultimas horas`, expandedLimit),
       webBrowser.search(queryText, expandedLimit),
       Promise.allSettled(domainSearchTasks),
@@ -3975,9 +3941,8 @@ async function runWebSearchQuery(params: {
     const specializedHits = specializedResults.flatMap((entry) =>
       entry.status === "fulfilled" ? entry.value : [],
     );
-    const apiNewsHits = newsArticlesToWebSearchResults([...apiNewsEs, ...apiNewsEn]);
     const mergedGeneral = mergeWebSearchResults(
-      [...apiNewsHits, ...specializedHits, ...recentGeneralHits, ...generalHits],
+      [...specializedHits, ...recentGeneralHits, ...generalHits],
       expandedLimit * 3,
     );
     return prioritizeNewsResultsWithRedditCap({
@@ -4095,43 +4060,120 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
   }
 
   const normalized = normalizeIntentText(original);
-  const mentionsConnector =
-    /\b(lim|lim-api|connector|connector-api|message retriever|message-retriever|retriever api|retriever)\b/.test(
-      normalized,
-    ) || /\bapi de (?:lim|connector)\b/.test(normalized);
+  const mentionsConnector = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
   const mentionsCloudflared = /\b(cloudflared|tunel|tunnel|cloudflare)\b/.test(normalized);
   const explicitContext = mentionsConnector || mentionsCloudflared;
 
-  const firstNameMatch = original.match(/\bfirst[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i);
-  const lastNameMatch = original.match(/\blast[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i);
-  const sourceMatch = original.match(/\b(fuente|source)\s*[:=]\s*([^\n,;|]+)/i);
+  const extractLimTaggedValue = (fieldPattern: string): string => {
+    const match = original.match(
+      new RegExp(
+        `\\b${fieldPattern}\\s*[:=]\\s*([\\s\\S]*?)(?=\\s+(?:first[_\\s-]?name|last[_\\s-]?name|fuente|source|count)\\s*[:=]|$)`,
+        "i",
+      ),
+    );
+    return (match?.[1] ?? "").trim();
+  };
+  const firstName = extractLimTaggedValue("first[_\\s-]?name");
+  const lastName = extractLimTaggedValue("last[_\\s-]?name");
+  const sourceName = extractLimTaggedValue("(?:fuente|source)");
   const countMatch = original.match(/\bcount\s*[:=]\s*(\d{1,2})\b/i);
-  const queryVerb = /\b(consulta|consultar|busca|buscar|trae|traer|lee|leer|mensaje|mensajes)\b/.test(normalized);
-  const hasLimParams = Boolean(firstNameMatch && lastNameMatch && sourceMatch);
+  const naturalCountMatch =
+    original.match(/\b(?:ultimos?|últimos?)\s+(\d{1,2})\s+mensajes?\b/i) ??
+    original.match(/\b(\d{1,2})\s+mensajes?\b/i);
+  const parsedCount = Number.parseInt(countMatch?.[1] ?? naturalCountMatch?.[1] ?? "", 10);
+  const count = Number.isFinite(parsedCount) ? Math.max(1, Math.min(10, parsedCount)) : 3;
+  const queryVerb =
+    /\b(consulta|consultar|busca|buscar|trae|traer|lee|leer|revisa|revisar|ver|mira|mirar|mensaje|mensajes)\b/.test(
+      normalized,
+    );
+  const hasLimParams = Boolean(firstName && lastName && sourceName);
   if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && hasLimParams) {
-    const parsedCount = Number.parseInt(countMatch?.[1] ?? "", 10);
     return {
       shouldHandle: true,
       action: "query",
-      firstName: (firstNameMatch?.[1] ?? "").trim(),
-      lastName: (lastNameMatch?.[1] ?? "").trim(),
-      sourceName: (sourceMatch?.[2] ?? "").trim(),
-      ...(Number.isFinite(parsedCount) ? { count: Math.max(1, Math.min(10, parsedCount)) } : {}),
+      firstName,
+      lastName,
+      sourceName,
+      count,
+      prospectOnly: true,
     };
   }
   const fullNameMatch = original.match(
     /\b(?:de|para)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\b/i,
   );
-  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && sourceMatch && fullNameMatch) {
-    const parsedCount = Number.parseInt(countMatch?.[1] ?? "", 10);
+  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && sourceName && fullNameMatch) {
     return {
       shouldHandle: true,
       action: "query",
       firstName: (fullNameMatch?.[1] ?? "").trim(),
       lastName: (fullNameMatch?.[2] ?? "").trim(),
-      sourceName: (sourceMatch?.[2] ?? "").trim(),
-      ...(Number.isFinite(parsedCount) ? { count: Math.max(1, Math.min(10, parsedCount)) } : {}),
+      sourceName,
+      count,
+      prospectOnly: true,
     };
+  }
+  const naturalSourceMatch = original.match(
+    /\b(?:en|desde|fuente|source)\s+([A-Za-z0-9ÁÉÍÓÚáéíóúÑñ'`._-]+(?:\s+[A-Za-z0-9ÁÉÍÓÚáéíóúÑñ'`._-]+){0,3})\s*$/i,
+  );
+  const naturalSourceRaw = (naturalSourceMatch?.[1] ?? "").trim();
+  const naturalSource = naturalSourceRaw
+    .replace(/\b(?:ultimos?|últimos?|mensajes?|mensaje|prospecto|no|propios?|mios?|mías?|mias)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const naturalNameBeforeSource = naturalSource
+    ? original.slice(0, naturalSourceMatch?.index ?? original.length)
+    : original;
+  const naturalNameMatch = naturalNameBeforeSource.match(
+    /\b(?:de|del|para|a)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\b/i,
+  );
+  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && naturalSource && naturalNameMatch) {
+    return {
+      shouldHandle: true,
+      action: "query",
+      firstName: (naturalNameMatch[1] ?? "").trim(),
+      lastName: (naturalNameMatch[2] ?? "").trim(),
+      sourceName: naturalSource,
+      count,
+      prospectOnly: true,
+    };
+  }
+  if ((explicitContext || Boolean(options?.allowImplicit)) && naturalSource && naturalNameMatch) {
+    return {
+      shouldHandle: true,
+      action: "query",
+      firstName: (naturalNameMatch[1] ?? "").trim(),
+      lastName: (naturalNameMatch[2] ?? "").trim(),
+      sourceName: naturalSource,
+      count,
+      prospectOnly: true,
+    };
+  }
+
+  // Fallback flexible: "lim Rodrigo Toscano Linkedin_Marylin [count:2]"
+  const rawNoCount = original
+    .replace(/\bcount\s*[:=]\s*\d{1,2}\b/gi, " ")
+    .replace(/\b(?:ultimos?|últimos?)\s+\d{1,2}\s+mensajes?\b/gi, " ")
+    .trim();
+  const fallbackTokens = rawNoCount
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .filter((token) => !/^(lim|connector|message|retriever|mensajes?|mensaje|de|en|del|para)$/i.test(token));
+  if ((explicitContext || Boolean(options?.allowImplicit)) && fallbackTokens.length >= 3) {
+    const maybeFirstName = fallbackTokens[0] ?? "";
+    const maybeLastName = fallbackTokens[1] ?? "";
+    const maybeSource = fallbackTokens.slice(2).join(" ").trim();
+    if (maybeFirstName && maybeLastName && maybeSource) {
+      return {
+        shouldHandle: true,
+        action: "query",
+        firstName: maybeFirstName,
+        lastName: maybeLastName,
+        sourceName: maybeSource,
+        count,
+        prospectOnly: true,
+      };
+    }
   }
 
   const restartRequested = /\b(reinicia|reiniciar|reiniciala|reinicialo|restart|rearranca|rearrancar)\b/.test(
@@ -5133,8 +5175,9 @@ function buildIntentRouterContextFilter(params: {
   const connectorControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
     normalized,
   );
+  const explicitLimCue = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
   const mentionsOtherDomain = /\b(gmail|correo|email|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(normalized);
-  if (hasRecentConnectorContext && connectorControlVerb && !mentionsOtherDomain) {
+  if (hasRecentConnectorContext && explicitLimCue && connectorControlVerb && !mentionsOtherDomain) {
     allowed = narrowRouteCandidates(allowed, ["connector"]);
     reasons.push("recent-connector-context");
   }
@@ -7590,6 +7633,7 @@ async function queryLimMessages(params: {
   lastName: string;
   sourceName: string;
   count?: number;
+  prospectOnly?: boolean;
 }): Promise<LimQueryResult> {
   const firstName = params.firstName.trim();
   const lastName = params.lastName.trim();
@@ -7604,7 +7648,7 @@ async function queryLimMessages(params: {
 
   const endpoint = buildLimMessagesUrl(resolved.account, firstName, lastName, params.count ?? 3);
   const controller = new AbortController();
-  const timeoutMs = Math.max(2000, config.limHealthTimeoutMs);
+  const timeoutMs = Math.max(120_000, config.limHealthTimeoutMs * 8);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(endpoint, {
@@ -7633,23 +7677,40 @@ async function queryLimMessages(params: {
     }
 
     const rows = Array.isArray(parsed?.messages) ? parsed?.messages : [];
+    const mappedRows = rows
+      .slice(0, 50)
+      .map((row) => (typeof row === "object" && row !== null ? row : {}))
+      .map((row) => ({
+        index: typeof row.index === "number" ? row.index : undefined,
+        direction: typeof row.direction === "string" ? row.direction : undefined,
+        time: typeof row.time === "string" ? row.time : undefined,
+        text: typeof row.text === "string" ? row.text : undefined,
+      }));
+    const isProspectDirection = (value?: string): boolean => {
+      const direction = normalizeIntentText(value ?? "");
+      if (!direction) {
+        return true;
+      }
+      if (/\b(out|outgoing|sent|mine|my|self|own|agent|bot|me|yo|mio|mia|propio|nuestra)\b/.test(direction)) {
+        return false;
+      }
+      if (/\b(in|incoming|inbound|received|prospect|lead|contact|cliente|reply)\b/.test(direction)) {
+        return true;
+      }
+      return true;
+    };
+    const filteredRows = params.prospectOnly ? mappedRows.filter((row) => isProspectDirection(row.direction)) : mappedRows;
+    const maxRows = Math.max(1, Math.min(10, Math.floor(params.count ?? 3)));
+    const selectedRows = filteredRows.slice(0, maxRows);
     return {
       ok: Boolean(parsed?.ok),
       found: Boolean(parsed?.found),
       account: typeof parsed?.account === "string" ? parsed.account : resolved.account,
       contact: typeof parsed?.contact === "string" ? parsed.contact : undefined,
       totalMessages: typeof parsed?.totalMessages === "number" ? parsed.totalMessages : undefined,
-      returnedMessages: typeof parsed?.returnedMessages === "number" ? parsed.returnedMessages : undefined,
+      returnedMessages: selectedRows.length,
       queryUsed: typeof parsed?.queryUsed === "string" ? parsed.queryUsed : undefined,
-      messages: rows
-        .slice(0, 10)
-        .map((row) => (typeof row === "object" && row !== null ? row : {}))
-        .map((row) => ({
-          index: typeof row.index === "number" ? row.index : undefined,
-          direction: typeof row.direction === "string" ? row.direction : undefined,
-          time: typeof row.time === "string" ? row.time : undefined,
-          text: typeof row.text === "string" ? row.text : undefined,
-        })),
+      messages: selectedRows,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -9258,19 +9319,31 @@ async function maybeHandleNaturalConnectorInstruction(params: {
   userId?: number;
   persistUserTurn: boolean;
 }): Promise<boolean> {
-  if (!config.enableLimControl) {
-    return false;
-  }
   const chatId = params.ctx.chat.id;
   const now = Date.now();
-  const hasRecentContext = (lastConnectorContextByChat.get(chatId) ?? 0) + CONNECTOR_CONTEXT_TTL_MS > now;
+  const normalizedText = normalizeIntentText(params.text);
+  const hasExplicitLimCue = /\b\/?lim\b/.test(normalizedText) || /\blim-api\b/.test(normalizedText);
 
-  let intent = detectConnectorNaturalIntent(params.text);
-  if ((!intent.shouldHandle || !intent.action) && hasRecentContext) {
-    intent = detectConnectorNaturalIntent(params.text, { allowImplicit: true });
+  if (!hasExplicitLimCue) {
+    return false;
   }
+
+  const intent = detectConnectorNaturalIntent(params.text);
   if (!intent.shouldHandle || !intent.action) {
     return false;
+  }
+  if (!config.enableLimControl) {
+    await params.ctx.reply("LIM está deshabilitado por configuración (ENABLE_LIM_CONTROL=false).");
+    await safeAudit({
+      type: "connector.intent_disabled",
+      chatId,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        action: intent.action,
+      },
+    });
+    return true;
   }
 
   lastConnectorContextByChat.set(chatId, now);
@@ -9302,6 +9375,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       lastName,
       sourceName,
       count: intent.count ?? 3,
+      prospectOnly: intent.prospectOnly ?? true,
     });
     if (!result.ok) {
       await params.ctx.reply(
@@ -12786,7 +12860,6 @@ bot.command("help", async (ctx) => {
       "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
       "/web <consulta> - Buscar en la web",
       '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
-      "/news <consulta> [limit] - Noticias recientes (GNews/NewsAPI, últimos 7 días)",
       "/crypto [consulta] [limit] - Precios crypto con CoinGecko",
       "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
       "/reddit <consulta> [limit] - Buscar posts en Reddit (API)",
@@ -14072,9 +14145,18 @@ bot.command("lim", async (ctx) => {
     return;
   }
 
-  const firstName = input.match(/\bfirst[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i)?.[1]?.trim() ?? "";
-  const lastName = input.match(/\blast[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i)?.[1]?.trim() ?? "";
-  const sourceName = input.match(/\b(fuente|source)\s*[:=]\s*([^\n,;|]+)/i)?.[2]?.trim() ?? "";
+  const extractLimTaggedValue = (fieldPattern: string): string => {
+    const match = input.match(
+      new RegExp(
+        `\\b${fieldPattern}\\s*[:=]\\s*([\\s\\S]*?)(?=\\s+(?:first[_\\s-]?name|last[_\\s-]?name|fuente|source|count)\\s*[:=]|$)`,
+        "i",
+      ),
+    );
+    return (match?.[1] ?? "").trim();
+  };
+  const firstName = extractLimTaggedValue("first[_\\s-]?name");
+  const lastName = extractLimTaggedValue("last[_\\s-]?name");
+  const sourceName = extractLimTaggedValue("(?:fuente|source)");
   const countRaw = Number.parseInt(input.match(/\bcount\s*[:=]\s*(\d{1,2})\b/i)?.[1] ?? "", 10);
   const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : 3;
 
@@ -14089,6 +14171,7 @@ bot.command("lim", async (ctx) => {
     lastName,
     sourceName,
     count,
+    prospectOnly: true,
   });
 
   if (!result.ok) {
@@ -14149,101 +14232,6 @@ bot.command("lim", async (ctx) => {
       returnedMessages: result.returnedMessages ?? 0,
     },
   });
-});
-
-bot.command("news", async (ctx) => {
-  const rawInput = String(ctx.match ?? "").trim();
-  if (!rawInput) {
-    await ctx.reply("Uso: /news <consulta> [limit]");
-    return;
-  }
-
-  const tokens = rawInput.split(/\s+/).filter(Boolean);
-  const maybeLimit = Number.parseInt(tokens[tokens.length - 1] ?? "", 10);
-  const limit = Number.isFinite(maybeLimit) && maybeLimit > 0 ? Math.min(10, maybeLimit) : 5;
-  const query =
-    Number.isFinite(maybeLimit) && maybeLimit > 0 ? tokens.slice(0, -1).join(" ").trim() : rawInput;
-  if (!query) {
-    await ctx.reply("Uso: /news <consulta> [limit]");
-    return;
-  }
-
-  if (!newsApi.isConfigured()) {
-    await ctx.reply("News API no configurada. Define GNEWS_API_KEY o NEWSAPI_KEY en .env.");
-    return;
-  }
-
-  const to = new Date();
-  const from = new Date(to.getTime() - NEWS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000);
-  await replyProgress(ctx, `Buscando noticias recientes (${NEWS_MAX_AGE_DAYS} días): ${query}`);
-
-  try {
-    const articles = await newsApi.searchLatest({
-      query,
-      limit,
-      language: "es",
-      from,
-      to,
-    });
-    if (articles.length === 0) {
-      await ctx.reply("No encontré noticias recientes con ese criterio.");
-      return;
-    }
-
-    const lines = articles.map((item, index) =>
-      [
-        `${index + 1}. ${item.title}`,
-        item.description ? `Resumen: ${normalizeSearchSnippet(item.description, 200)}` : "Resumen: sin extracto.",
-        `Fuente: ${item.source} | Fecha: ${formatIsoDateCompact(item.publishedAt)}`,
-        `Link: ${item.url}`,
-      ].join("\n"),
-    );
-    const text = [
-      `Noticias recientes (${articles.length}) para: ${query}`,
-      ...lines,
-      `Proveedor: ${newsApi.providerName()}`,
-      "Tip: usa /webopen <n> para abrir y analizar un resultado.",
-    ].join("\n\n");
-
-    const hits = articles.map((item) => ({
-      title: item.title,
-      url: item.url,
-      snippet: [item.source, item.publishedAt, item.description].filter(Boolean).join(" | "),
-    }));
-    lastWebResultsByChat.set(ctx.chat.id, hits);
-    rememberWebResultsListContext({
-      chatId: ctx.chat.id,
-      title: `News API: ${query}`,
-      hits,
-      source: "telegram:/news",
-    });
-
-    await replyLong(ctx, text);
-    await safeAudit({
-      type: "news.search",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query,
-        limit,
-        provider: newsApi.providerName(),
-        results: articles.length,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`No pude consultar News API: ${message}`);
-    await safeAudit({
-      type: "news.search_failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query,
-        limit,
-        error: message,
-      },
-    });
-  }
 });
 
 bot.command("crypto", async (ctx) => {
