@@ -45,7 +45,12 @@
 - `src/domains/workspace/*`
   - Servicios e intents de operaciones de workspace
 - `src/domains/router/*`
-  - Filtro contextual y utilidades del router semántico/natural
+  - Filtro contextual y `route layers` (pre-filtros por contexto fuerte)
+  - Ensemble de decisión (semántico + AI judge + capas + boosts)
+  - Calibración de confianza por bins y archivo persistente
+  - Rutas dinámicas por chat (overrides de utterances/threshold)
+  - Soporte de experimento A/B por chat con split estable
+  - Observabilidad: confusión, drift y alertas de precisión
 - `src/selfskill-drafts.ts`
   - Borrador persistente de habilidades en múltiples mensajes por chat
   - Soporte start/add/show/apply/cancel

@@ -100,8 +100,17 @@ cp .env.example .env
 - `HOUDI_SCHEDULE_POLL_MS` (default: `15000`)
 - `HOUDI_INTENT_ROUTER_DATASET_FILE` (default: `./houdi-intent-router-dataset.jsonl`)
 - `HOUDI_INTENT_ROUTER_ROUTES_FILE` (default: `./workspace/state/intent-routes.json`)
+- `HOUDI_INTENT_ROUTER_CHAT_ROUTES_FILE` (default: `./workspace/state/intent-routes-by-chat.json`)
+- `HOUDI_INTENT_ROUTER_CALIBRATION_FILE` (default: `./workspace/state/intent-calibration.json`)
 - `HOUDI_INTENT_ROUTER_HYBRID_ALPHA` (default: `0.72`, balance léxico vs char n-gram)
 - `HOUDI_INTENT_ROUTER_MIN_SCORE_GAP` (default: `0.03`, brecha mínima entre primer y segundo intent)
+- `HOUDI_INTENT_ROUTER_AB_ENABLED` (default: `false`)
+- `HOUDI_INTENT_ROUTER_AB_SPLIT_PERCENT` (default: `50`)
+- `HOUDI_INTENT_ROUTER_AB_VARIANT_B_ALPHA` (default: `0.66`)
+- `HOUDI_INTENT_ROUTER_AB_VARIANT_B_MIN_GAP` (default: `0.02`)
+- `HOUDI_INTENT_ROUTER_AB_VARIANT_B_THRESHOLD_SHIFT` (default: `0`)
+- `HOUDI_INTENT_ROUTER_ALERT_PRECISION_MIN` (default: `0.55`)
+- `HOUDI_INTENT_ROUTER_ALERT_MIN_SAMPLES` (default: `20`)
 - `HOUDI_SELFSKILL_DRAFTS_FILE` (default: `./houdi-selfskill-drafts.json`)
 - `HOUDI_INTERESTS_FILE` (default: `./houdi-interests.json`)
 - `HOUDI_SUGGESTIONS_ENABLED` (default: `true`)
@@ -201,6 +210,9 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/intentfit [n] [iter]`
 - `/intentreload`
 - `/intentroutes`
+- `/intentcalibrate [n]`
+- `/intentcurate [n] [apply]`
+- `/intentab`
 - `/shell <instrucción>`
 - `/shellmode on|off`
 - `/exec <comando> [args]`

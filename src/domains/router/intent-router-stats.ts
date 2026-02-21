@@ -22,6 +22,12 @@ export type IntentRouterDatasetEntry = {
     handler: string;
     reason?: string;
   };
+  semanticCalibratedConfidence?: number;
+  semanticGap?: number;
+  routerAbVariant?: "A" | "B";
+  routerLayers?: string[];
+  routerLayerReason?: string;
+  routerEnsembleTop?: Array<{ name: string; score: number }>;
   finalHandler: string;
   handled: boolean;
 };
@@ -121,6 +127,8 @@ export async function buildIntentRouterStatsReport(params: {
   toProjectRelativePath: (inputPath: string) => string;
   datasetFilePath: string;
   routeThresholds: Array<{ name: string; threshold: number }>;
+  alertMinPrecision?: number;
+  alertMinSamples?: number;
 }): Promise<string> {
   const entries = await params.repository.read(params.limit);
   if (entries.length === 0) {
@@ -163,13 +171,26 @@ export async function buildIntentRouterStatsReport(params: {
   }
 
   let filteredCount = 0;
+  let semanticTotal = 0;
+  let semanticHit = 0;
+  const confusion = new Map<string, Map<string, number>>();
+  const byVariant = new Map<string, { total: number; hit: number }>();
   for (const entry of entries) {
     if ((entry.routeFilterAllowed?.length ?? 0) > 0 && (entry.routeFilterAllowed?.length ?? 0) < entry.routeCandidates.length) {
       filteredCount += 1;
     }
+    if (entry.routerAbVariant) {
+      const variantStats = byVariant.get(entry.routerAbVariant) ?? { total: 0, hit: 0 };
+      variantStats.total += 1;
+      if (entry.semantic && entry.semantic.handler === entry.finalHandler) {
+        variantStats.hit += 1;
+      }
+      byVariant.set(entry.routerAbVariant, variantStats);
+    }
     if (!entry.semantic) {
       continue;
     }
+    semanticTotal += 1;
     const routeStats = byRoute.get(entry.semantic.handler);
     if (!routeStats) {
       continue;
@@ -178,16 +199,30 @@ export async function buildIntentRouterStatsReport(params: {
     routeStats.avgScoreNumerator += entry.semantic.score;
     if (entry.finalHandler === entry.semantic.handler) {
       routeStats.hit += 1;
+      semanticHit += 1;
       routeStats.tpScores.push(entry.semantic.score);
     } else {
       routeStats.falsePositive += 1;
       routeStats.fpScores.push(entry.semantic.score);
+      const row = confusion.get(entry.finalHandler) ?? new Map<string, number>();
+      row.set(entry.semantic.handler, (row.get(entry.semantic.handler) ?? 0) + 1);
+      confusion.set(entry.finalHandler, row);
     }
   }
 
   lines.push(`route_filter aplicado: ${filteredCount}/${entries.length}`);
+  lines.push(`accuracy_semantic: ${semanticTotal > 0 ? ((semanticHit / semanticTotal) * 100).toFixed(2) : "0.00"}% (${semanticHit}/${semanticTotal})`);
+  if (byVariant.size > 0) {
+    const chunks = Array.from(byVariant.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([name, stats]) => `${name}=${stats.total > 0 ? ((stats.hit / stats.total) * 100).toFixed(2) : "0.00"}% (${stats.hit}/${stats.total})`);
+    lines.push(`ab_variants: ${chunks.join(" | ")}`);
+  }
   lines.push("");
   lines.push("Por ruta:");
+  const alertMinPrecision = Math.max(0, Math.min(1, params.alertMinPrecision ?? 0.55));
+  const alertMinSamples = Math.max(1, Math.min(1000, Math.floor(params.alertMinSamples ?? 20)));
+  const alerts: string[] = [];
   for (const routeName of routeNames) {
     const stats = byRoute.get(routeName);
     if (!stats) {
@@ -201,6 +236,11 @@ export async function buildIntentRouterStatsReport(params: {
       truePositiveScores: stats.tpScores,
       falsePositiveScores: stats.fpScores,
     });
+    if (stats.selected >= alertMinSamples && precision < alertMinPrecision) {
+      alerts.push(
+        `- ${routeName}: precision ${(precision * 100).toFixed(1)}% < ${(alertMinPrecision * 100).toFixed(1)}% con ${stats.selected} muestras`,
+      );
+    }
     lines.push(
       [
         `- ${routeName}`,
@@ -213,6 +253,57 @@ export async function buildIntentRouterStatsReport(params: {
         `suggested=${suggested === null ? "sin cambio" : suggested.toFixed(3)}`,
       ].join(" | "),
     );
+  }
+
+  const topConfusions = Array.from(confusion.entries())
+    .flatMap(([finalHandler, predicted]) =>
+      Array.from(predicted.entries()).map(([predictedHandler, count]) => ({
+        finalHandler,
+        predictedHandler,
+        count,
+      })),
+    )
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+  if (topConfusions.length > 0) {
+    lines.push("");
+    lines.push("Top confusiones:");
+    for (const item of topConfusions) {
+      lines.push(`- final=${item.finalHandler} <- predicted=${item.predictedHandler} | n=${item.count}`);
+    }
+  }
+
+  if (entries.length >= 40) {
+    const half = Math.floor(entries.length / 2);
+    const previous = entries.slice(0, half);
+    const recent = entries.slice(half);
+    const accuracy = (rows: IntentRouterDatasetEntry[]) => {
+      let ok = 0;
+      let total = 0;
+      for (const row of rows) {
+        if (!row.semantic) {
+          continue;
+        }
+        total += 1;
+        if (row.semantic.handler === row.finalHandler) {
+          ok += 1;
+        }
+      }
+      return total > 0 ? ok / total : 0;
+    };
+    const prevAcc = accuracy(previous);
+    const recentAcc = accuracy(recent);
+    const delta = recentAcc - prevAcc;
+    lines.push("");
+    lines.push(
+      `Drift (mitad anterior vs reciente): ${(prevAcc * 100).toFixed(2)}% -> ${(recentAcc * 100).toFixed(2)}% (delta ${(delta * 100).toFixed(2)}pp)`,
+    );
+  }
+
+  if (alerts.length > 0) {
+    lines.push("");
+    lines.push("Alertas:");
+    lines.push(...alerts);
   }
 
   return lines.join("\n");
