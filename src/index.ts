@@ -4082,6 +4082,11 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     original.match(/\b(\d{1,2})\s+mensajes?\b/i);
   const parsedCount = Number.parseInt(countMatch?.[1] ?? naturalCountMatch?.[1] ?? "", 10);
   const count = Number.isFinite(parsedCount) ? Math.max(1, Math.min(10, parsedCount)) : 3;
+  const asksProspectOnly =
+    /\b(prospecto|lead|contacto)\b/.test(normalized) ||
+    /\b(no\s+(?:propios?|mios?|mías?|mias|nuestros?|nuestras?))\b/.test(normalized) ||
+    /\b(sin\s+(?:propios?|mios?|mías?|mias|nuestros?|nuestras?))\b/.test(normalized) ||
+    /\b(entrantes|recibidos)\b/.test(normalized);
   const queryVerb =
     /\b(consulta|consultar|busca|buscar|trae|traer|lee|leer|revisa|revisar|ver|mira|mirar|mensaje|mensajes)\b/.test(
       normalized,
@@ -4095,7 +4100,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       lastName,
       sourceName,
       count,
-      prospectOnly: true,
+      prospectOnly: asksProspectOnly,
     };
   }
   const fullNameMatch = original.match(
@@ -4109,7 +4114,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       lastName: (fullNameMatch?.[2] ?? "").trim(),
       sourceName,
       count,
-      prospectOnly: true,
+      prospectOnly: asksProspectOnly,
     };
   }
   const naturalSourceMatch = original.match(
@@ -4134,7 +4139,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       lastName: (naturalNameMatch[2] ?? "").trim(),
       sourceName: naturalSource,
       count,
-      prospectOnly: true,
+      prospectOnly: asksProspectOnly,
     };
   }
   if ((explicitContext || Boolean(options?.allowImplicit)) && naturalSource && naturalNameMatch) {
@@ -4145,7 +4150,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       lastName: (naturalNameMatch[2] ?? "").trim(),
       sourceName: naturalSource,
       count,
-      prospectOnly: true,
+      prospectOnly: asksProspectOnly,
     };
   }
 
@@ -4166,7 +4171,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
         lastName: (limInlineMatch[2] ?? "").trim(),
         sourceName: sourceInline,
         count,
-        prospectOnly: true,
+        prospectOnly: asksProspectOnly,
       };
     }
   }
@@ -4199,7 +4204,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
         lastName: maybeLastName,
         sourceName: maybeSource,
         count,
-        prospectOnly: true,
+        prospectOnly: asksProspectOnly,
       };
     }
   }
@@ -4275,12 +4280,7 @@ function tryParseConnectorIntentWithAi(raw: string): ConnectorNaturalIntent | nu
     const sourceName = typeof parsed.sourceName === "string" ? parsed.sourceName.trim() : "";
     const countRaw = Number.parseInt(String(parsed.count ?? ""), 10);
     const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : undefined;
-    const prospectOnly =
-      typeof parsed.prospectOnly === "boolean"
-        ? parsed.prospectOnly
-        : actionRaw === "query"
-          ? true
-          : undefined;
+    const prospectOnly = typeof parsed.prospectOnly === "boolean" ? parsed.prospectOnly : undefined;
 
     return {
       shouldHandle: true,
@@ -7815,7 +7815,11 @@ async function queryLimMessages(params: {
     };
     const filteredRows = params.prospectOnly ? mappedRows.filter((row) => isProspectDirection(row.direction)) : mappedRows;
     const maxRows = Math.max(1, Math.min(10, Math.floor(params.count ?? 3)));
-    const selectedRows = filteredRows.slice(0, maxRows);
+    const selectedRowsPrimary = filteredRows.slice(0, maxRows);
+    const selectedRows =
+      params.prospectOnly && selectedRowsPrimary.length === 0 && mappedRows.length > 0
+        ? mappedRows.slice(0, maxRows)
+        : selectedRowsPrimary;
     return {
       ok: Boolean(parsed?.ok),
       found: Boolean(parsed?.found),
@@ -9513,7 +9517,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       lastName,
       sourceName,
       count: intent.count ?? 3,
-      prospectOnly: intent.prospectOnly ?? true,
+      prospectOnly: intent.prospectOnly ?? false,
     });
     if (!result.ok) {
       await params.ctx.reply(
@@ -14309,7 +14313,7 @@ bot.command("lim", async (ctx) => {
     lastName,
     sourceName,
     count,
-    prospectOnly: true,
+    prospectOnly: false,
   });
 
   if (!result.ok) {

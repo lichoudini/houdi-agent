@@ -430,7 +430,7 @@ Notas de consulta LIM:
 `fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
 
 ```env
-LIM_SOURCE_ACCOUNT_MAP_JSON={"account_demo_c":"account_demo_c_jack","account_demo_b":"account_demo_b_marylin"}
+LIM_SOURCE_ACCOUNT_MAP_JSON={"linkedin":"linkedin_marylin","linkedin_marylin":"linkedin_marylin","linkedin_martin":"linkedin_martin","account_demo_b":"account_demo_b_marylin","account_demo_b_manuel":"account_demo_b_manuel","account_demo_c":"account_demo_c_jack","account_demo_a":"account_demo_a"}
 ```
 
 Instalación de servicios `systemd --user` para dejarlo persistente:

@@ -134,6 +134,29 @@ function parseStringMapJson(value: string | undefined): Record<string, string> {
   }
 }
 
+function normalizeLimSourceMapKey(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function parseLimSourceAccountMapJson(value: string | undefined): Record<string, string> {
+  const base = parseStringMapJson(value);
+  const output: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(base)) {
+    const normalizedKey = normalizeLimSourceMapKey(rawKey);
+    const normalizedValue = rawValue.trim();
+    if (!normalizedKey || !normalizedValue) {
+      continue;
+    }
+    output[normalizedKey] = normalizedValue;
+  }
+  return output;
+}
+
 function isValidIPv4(host: string): boolean {
   const chunks = host.split(".");
   if (chunks.length !== 4) {
@@ -235,7 +258,7 @@ export const config = {
   limLocalHealthUrl: env.LIM_LOCAL_HEALTH_URL || env.CONNECTOR_LOCAL_HEALTH_URL || "http://127.0.0.1:3333/health",
   limPublicHealthUrl: env.LIM_PUBLIC_HEALTH_URL || env.CONNECTOR_PUBLIC_HEALTH_URL || "http://127.0.0.1:3333/health",
   limHealthTimeoutMs: env.LIM_HEALTH_TIMEOUT_MS ?? env.CONNECTOR_HEALTH_TIMEOUT_MS ?? 7000,
-  limSourceAccountMap: parseStringMapJson(env.LIM_SOURCE_ACCOUNT_MAP_JSON),
+  limSourceAccountMap: parseLimSourceAccountMapJson(env.LIM_SOURCE_ACCOUNT_MAP_JSON),
   localApiEnabled: parseBooleanFlag(env.HOUDI_LOCAL_API_ENABLED, true),
   localApiHost: normalizeLocalApiHost(env.HOUDI_LOCAL_API_HOST),
   localApiPort: env.HOUDI_LOCAL_API_PORT,
