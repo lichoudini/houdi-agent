@@ -14,6 +14,8 @@ workspace/
 houdi-schedule.json
 houdi-interests.json
 houdi-selfskill-drafts.json
+houdi-intent-router-dataset.jsonl
+houdi-recipients.local-*.json
 
 # Local environment and secrets
 .env
