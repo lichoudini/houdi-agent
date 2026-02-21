@@ -15510,6 +15510,11 @@ async function handleIncomingTextMessage(params: {
       ].join("\n")
     : text;
 
+  // Never intercept Telegram slash commands from the free-text pipeline.
+  if (!allowSlashPrefix && text.startsWith("/")) {
+    return;
+  }
+
   const handledPendingWorkspaceDelete = await maybeHandlePendingWorkspaceDeleteConfirmation({
     ctx: params.ctx,
     text,
@@ -15527,10 +15532,6 @@ async function handleIncomingTextMessage(params: {
     userId,
   });
   if (handledPendingWorkspaceDeletePath) {
-    return;
-  }
-
-  if (!allowSlashPrefix && text.startsWith("/")) {
     return;
   }
 
@@ -15847,6 +15848,9 @@ async function startLocalBridgeServer(): Promise<void> {
 }
 
 bot.on("message:text", async (ctx) => {
+  if (ctx.message.text.trim().startsWith("/")) {
+    return;
+  }
   const replied = (ctx.message as { reply_to_message?: Record<string, unknown> }).reply_to_message;
   const repliedTextRaw =
     replied && typeof replied === "object"
