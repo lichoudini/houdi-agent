@@ -98,6 +98,10 @@ cp .env.example .env
 - `HOUDI_MEMORY_BACKEND` (`hybrid` o `scan`, default: `hybrid`)
 - `HOUDI_SCHEDULE_FILE` (default: `./houdi-schedule.json`)
 - `HOUDI_SCHEDULE_POLL_MS` (default: `15000`)
+- `HOUDI_INTENT_ROUTER_DATASET_FILE` (default: `./houdi-intent-router-dataset.jsonl`)
+- `HOUDI_INTENT_ROUTER_ROUTES_FILE` (default: `./workspace/state/intent-routes.json`)
+- `HOUDI_INTENT_ROUTER_HYBRID_ALPHA` (default: `0.72`, balance léxico vs char n-gram)
+- `HOUDI_INTENT_ROUTER_MIN_SCORE_GAP` (default: `0.03`, brecha mínima entre primer y segundo intent)
 - `HOUDI_SELFSKILL_DRAFTS_FILE` (default: `./houdi-selfskill-drafts.json`)
 - `HOUDI_INTERESTS_FILE` (default: `./houdi-interests.json`)
 - `HOUDI_SUGGESTIONS_ENABLED` (default: `true`)
@@ -193,6 +197,10 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/selfskill draft <start|add|show|apply|cancel>`
 - `/selfrestart`
 - `/selfupdate [check]`
+- `/intentstats [n]`
+- `/intentfit [n] [iter]`
+- `/intentreload`
+- `/intentroutes`
 - `/shell <instrucción>`
 - `/shellmode on|off`
 - `/exec <comando> [args]`

@@ -16,6 +16,7 @@ import type { GmailMessageSummary } from "./gmail-account.js";
 import { GmailAccountService } from "./gmail-account.js";
 import { InterestLearningService } from "./interest-learning.js";
 import {
+  type FitResult,
   IntentSemanticRouter,
   type IntentRouteName,
   type SemanticRouteDecision,
@@ -115,7 +116,18 @@ acquireSingleInstanceLock();
 
 const taskRunner = new TaskRunner(config.execTimeoutMs, config.maxStdioChars);
 const openAi = new OpenAiService();
-const semanticIntentRouter = new IntentSemanticRouter();
+const semanticIntentRouter = new IntentSemanticRouter({
+  hybridAlpha: config.intentRouterHybridAlpha,
+  minScoreGap: config.intentRouterMinScoreGap,
+});
+try {
+  await semanticIntentRouter.loadFromFile(config.intentRouterRoutesFile, {
+    createIfMissing: true,
+  });
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  logWarn(`No pude cargar intent routes desde archivo, uso defaults: ${message}`);
+}
 const adminSecurity = new AdminSecurityController({
   approvalTtlMs: config.adminApprovalTtlSeconds * 1000,
 });
@@ -325,6 +337,9 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "deny",
   "panic",
   "intentstats",
+  "intentfit",
+  "intentreload",
+  "intentroutes",
 ]);
 const workspaceFiles = new WorkspaceFilesService(
   config.workspaceDir,
@@ -4208,6 +4223,47 @@ function buildIntentRouterContextFilter(params: {
     allowed: decision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
     reason: decision.reason,
   };
+}
+
+function buildIntentRouterScoreBoosts(params: {
+  chatId: number;
+  text: string;
+  hasMailContext: boolean;
+  hasMemoryRecallCue: boolean;
+}): Partial<Record<IntentRouteName, number>> {
+  const normalized = normalizeIntentText(params.text);
+  const boosts: Partial<Record<IntentRouteName, number>> = {};
+  const addBoost = (name: IntentRouteName, value: number) => {
+    boosts[name] = (boosts[name] ?? 0) + value;
+  };
+
+  if (params.hasMailContext && !params.hasMemoryRecallCue) {
+    addBoost("gmail", 0.04);
+    addBoost("gmail-recipients", 0.03);
+  }
+  if (params.hasMemoryRecallCue) {
+    addBoost("memory", 0.05);
+  }
+  if (/\b(workspace|archivo|carpeta|documento|pdf|txt|csv|json|md)\b/.test(normalized)) {
+    addBoost("workspace", 0.02);
+    addBoost("document", 0.02);
+  }
+  if (/\b(web|internet|noticias|reddit|url|link)\b/.test(normalized)) {
+    addBoost("web", 0.02);
+  }
+
+  const listContext = getIndexedListContext(params.chatId);
+  if (listContext?.kind === "gmail-list") {
+    addBoost("gmail", 0.05);
+    addBoost("gmail-recipients", 0.03);
+  } else if (listContext?.kind === "workspace-list" || listContext?.kind === "stored-files") {
+    addBoost("workspace", 0.04);
+    addBoost("document", 0.03);
+  } else if (listContext?.kind === "web-results") {
+    addBoost("web", 0.05);
+  }
+
+  return boosts;
 }
 
 async function appendIntentRouterDatasetEntry(entry: IntentRouterDatasetEntry): Promise<void> {
@@ -11182,25 +11238,37 @@ async function maybeHandleNaturalIntentPipeline(params: {
     hasMemoryRecallCue,
   });
   const semanticAllowedCandidates = routeFilterDecision?.allowed ?? routeCandidates;
+  const routeScoreBoosts = buildIntentRouterScoreBoosts({
+    chatId: params.ctx.chat.id,
+    text: params.text,
+    hasMailContext,
+    hasMemoryRecallCue,
+  });
 
   semanticRouteDecision = semanticIntentRouter.route(params.text, {
     allowed: semanticAllowedCandidates as IntentRouteName[],
+    boosts: routeScoreBoosts,
     topK: 3,
   });
   if (semanticRouteDecision) {
-    const preferred = handlers.find((item) => item.name === semanticRouteDecision?.handler);
-    if (preferred) {
-      routedHandlers = [preferred, ...handlers.filter((item) => item.name !== preferred.name)];
+    const orderedBySemantic = semanticRouteDecision.alternatives
+      .map((item) => item.name)
+      .map((name) => handlers.find((handler) => handler.name === name))
+      .filter((handler): handler is (typeof handlers)[number] => Boolean(handler));
+    if (orderedBySemantic.length > 0) {
+      const used = new Set(orderedBySemantic.map((item) => item.name));
+      routedHandlers = [...orderedBySemantic, ...handlers.filter((item) => !used.has(item.name))];
       await safeAudit({
         type: "intent.router.semantic",
         chatId: params.ctx.chat.id,
         userId: params.userId,
         details: {
           source: params.source,
-          selected: preferred.name,
+          selected: semanticRouteDecision.handler,
           score: semanticRouteDecision.score,
           reason: semanticRouteDecision.reason,
           alternatives: semanticRouteDecision.alternatives,
+          boosts: routeScoreBoosts,
           textPreview: truncateInline(params.text, 220),
         },
       });
@@ -11441,6 +11509,9 @@ bot.command("help", async (ctx) => {
       "/selfupdate [check] - Actualizar a la última versión del repositorio",
       "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
       "/intentstats [n] - Métricas de enrutamiento y sugerencias de threshold",
+      "/intentfit [n] [iter] - Ajusta thresholds del router semántico con dataset",
+      "/intentreload - Recarga configuración de rutas semánticas desde archivo",
+      "/intentroutes - Ver rutas/thresholds y parámetros del router semántico",
       "Enviar nota de voz/audio - Se transcribe y se responde con IA",
       "Enviar archivo (document) - Se guarda en workspace/files/...",
       "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
@@ -11585,6 +11656,7 @@ bot.command("status", async (ctx) => {
       `Aprobaciones pendientes (chat): ${pendingCount}`,
       `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
+      `Intent router: routes=${semanticIntentRouter.listRoutes().length} | alpha=${semanticIntentRouter.getHybridAlpha().toFixed(2)} | minGap=${semanticIntentRouter.getMinScoreGap().toFixed(3)} | file=${toProjectRelativePath(config.intentRouterRoutesFile)}`,
       `Lector docs: maxFile=${Math.round(config.docMaxFileBytes / (1024 * 1024))}MB | maxText=${config.docMaxTextChars} chars`,
       `Web browse: ${config.enableWebBrowse ? `on (max results ${config.webSearchMaxResults})` : "off"}`,
       `Gmail account: ${gmailSummary}`,
@@ -11619,6 +11691,141 @@ bot.command("intentstats", async (ctx) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await ctx.reply(`No pude generar intent stats: ${message}`);
+  }
+});
+
+bot.command("intentroutes", async (ctx) => {
+  try {
+    const routes = semanticIntentRouter.listRoutes();
+    const lines = [
+      "Intent router routes",
+      `file: ${toProjectRelativePath(config.intentRouterRoutesFile)}`,
+      `alpha: ${semanticIntentRouter.getHybridAlpha().toFixed(3)}`,
+      `minGap: ${semanticIntentRouter.getMinScoreGap().toFixed(3)}`,
+      `routes: ${routes.length}`,
+      "",
+      ...routes.map(
+        (route) =>
+          `- ${route.name} | threshold=${route.threshold.toFixed(3)} | utterances=${route.utterances.length}`,
+      ),
+    ];
+    await replyLong(ctx, lines.join("\n"));
+    await safeAudit({
+      type: "intent.router.routes",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        routes: routes.length,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude listar intent routes: ${message}`);
+  }
+});
+
+bot.command("intentreload", async (ctx) => {
+  try {
+    await semanticIntentRouter.loadFromFile(config.intentRouterRoutesFile, {
+      createIfMissing: true,
+    });
+    const routes = semanticIntentRouter.listRoutes();
+    await ctx.reply(
+      [
+        "Intent router recargado.",
+        `file: ${toProjectRelativePath(config.intentRouterRoutesFile)}`,
+        `alpha: ${semanticIntentRouter.getHybridAlpha().toFixed(3)}`,
+        `minGap: ${semanticIntentRouter.getMinScoreGap().toFixed(3)}`,
+        `routes: ${routes.length}`,
+      ].join("\n"),
+    );
+    await safeAudit({
+      type: "intent.router.reload",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        routes: routes.length,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude recargar intent routes: ${message}`);
+  }
+});
+
+bot.command("intentfit", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim();
+  const tokens = raw.split(/\s+/).filter(Boolean);
+  const parsedLimit = tokens[0] ? Number.parseInt(tokens[0], 10) : NaN;
+  const parsedIter = tokens[1] ? Number.parseInt(tokens[1], 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 20_000) : 2_000;
+  const maxIter = Number.isFinite(parsedIter) && parsedIter > 0 ? Math.min(parsedIter, 5_000) : 700;
+  try {
+    const routeNames = new Set(semanticIntentRouter.listRoutes().map((route) => route.name));
+    const rows = await intentRouterStatsRepository.read(limit);
+    const labeled = rows
+      .filter((entry) => routeNames.has(entry.finalHandler as IntentRouteName))
+      .map((entry) => ({
+        text: entry.text,
+        finalHandler: entry.finalHandler,
+      }));
+    if (labeled.length < 25) {
+      await ctx.reply(
+        [
+          "No hay suficientes muestras etiquetadas para /intentfit.",
+          `muestras útiles: ${labeled.length} (mínimo recomendado: 25)`,
+          `limit consultado: ${limit}`,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    const fitResult: FitResult = semanticIntentRouter.fitThresholdsFromDataset(labeled, {
+      maxIter,
+    });
+    await semanticIntentRouter.saveToFile(config.intentRouterRoutesFile);
+
+    const changedRoutes = Object.keys(fitResult.afterThresholds)
+      .filter((name) => fitResult.beforeThresholds[name] !== fitResult.afterThresholds[name])
+      .sort((a, b) => a.localeCompare(b));
+    const thresholdLines =
+      changedRoutes.length === 0
+        ? ["thresholds: sin cambios"]
+        : changedRoutes.map(
+            (name) =>
+              `- ${name}: ${fitResult.beforeThresholds[name].toFixed(3)} -> ${fitResult.afterThresholds[name].toFixed(3)}`,
+          );
+
+    await replyLong(
+      ctx,
+      [
+        "Intent router fit completado.",
+        `file: ${toProjectRelativePath(config.intentRouterRoutesFile)}`,
+        `muestras etiquetadas: ${fitResult.totalLabeled}`,
+        `iteraciones: ${maxIter}`,
+        `accuracy before: ${(fitResult.beforeAccuracy * 100).toFixed(2)}%`,
+        `accuracy after: ${(fitResult.afterAccuracy * 100).toFixed(2)}%`,
+        `improved: ${fitResult.improved ? "sí" : "no"}`,
+        ...thresholdLines,
+      ].join("\n"),
+    );
+    await safeAudit({
+      type: "intent.router.fit",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        limit,
+        maxIter,
+        totalLabeled: fitResult.totalLabeled,
+        beforeAccuracy: Number(fitResult.beforeAccuracy.toFixed(4)),
+        afterAccuracy: Number(fitResult.afterAccuracy.toFixed(4)),
+        improved: fitResult.improved,
+        changedRoutes,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude ejecutar intent fit: ${message}`);
   }
 });
 

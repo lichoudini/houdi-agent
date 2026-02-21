@@ -54,8 +54,17 @@ async function main(): Promise<void> {
     process.cwd(),
     process.env.HOUDI_INTENT_ROUTER_DATASET_FILE?.trim() || "./houdi-intent-router-dataset.jsonl",
   );
+  const routesPath = path.resolve(
+    process.cwd(),
+    process.env.HOUDI_INTENT_ROUTER_ROUTES_FILE?.trim() || "./workspace/state/intent-routes.json",
+  );
 
   const router = new IntentSemanticRouter();
+  try {
+    await router.loadFromFile(routesPath);
+  } catch {
+    // fallback to defaults
+  }
   const routes = router.listRouteThresholds().map((item) => item.name);
   const stats = new Map<string, RouteStats>();
   for (const route of routes) {
@@ -85,6 +94,8 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  const globalAcc = router.evaluateDataset(entries.map((item) => ({ text: item.text, finalHandler: item.finalHandler })));
+
   for (const entry of entries) {
     const decision = router.route(entry.text);
     if (!decision) {
@@ -108,6 +119,7 @@ async function main(): Promise<void> {
   lines.push("Intent router benchmark");
   lines.push(`dataset: ${datasetPath}`);
   lines.push(`muestras: ${entries.length}`);
+  lines.push(`accuracy_global: ${(globalAcc * 100).toFixed(2)}%`);
   lines.push("");
 
   for (const route of routes) {

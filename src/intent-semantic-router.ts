@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
 type IntentRouteName =
   | "stoic-smalltalk"
   | "self-maintenance"
@@ -31,7 +34,52 @@ type SemanticRouteDecision = {
 type RouteOptions = {
   allowed?: IntentRouteName[];
   topK?: number;
+  boosts?: Partial<Record<IntentRouteName, number>>;
+  minGap?: number;
 };
+
+type IntentRouterDatasetSample = {
+  text: string;
+  finalHandler?: string;
+};
+
+type FitOptions = {
+  maxIter?: number;
+  searchRange?: number;
+  minThreshold?: number;
+  maxThreshold?: number;
+  minGap?: number;
+};
+
+type FitResult = {
+  totalLabeled: number;
+  beforeAccuracy: number;
+  afterAccuracy: number;
+  improved: boolean;
+  beforeThresholds: Record<string, number>;
+  afterThresholds: Record<string, number>;
+};
+
+type PersistedIntentRouterConfig = {
+  version: number;
+  updatedAt: string;
+  hybridAlpha: number;
+  minScoreGap: number;
+  routes: SemanticRouteConfig[];
+};
+
+const KNOWN_ROUTE_NAMES: IntentRouteName[] = [
+  "stoic-smalltalk",
+  "self-maintenance",
+  "connector",
+  "schedule",
+  "memory",
+  "gmail-recipients",
+  "gmail",
+  "workspace",
+  "document",
+  "web",
+];
 
 const SPANISH_STOPWORDS = new Set([
   "a",
@@ -105,7 +153,7 @@ const SPANISH_STOPWORDS = new Set([
   "ya",
 ]);
 
-const ROUTES: SemanticRouteConfig[] = [
+const DEFAULT_ROUTES: SemanticRouteConfig[] = [
   {
     name: "stoic-smalltalk",
     threshold: 0.2,
@@ -149,7 +197,7 @@ const ROUTES: SemanticRouteConfig[] = [
     name: "schedule",
     threshold: 0.24,
     utterances: [
-      "recordame mañana",
+      "recordame manana",
       "agenda una tarea",
       "programa recordatorio",
       "listar recordatorios",
@@ -232,6 +280,7 @@ const ROUTES: SemanticRouteConfig[] = [
 ];
 
 const DEFAULT_MIN_SCORE_GAP = 0.03;
+const DEFAULT_HYBRID_ALPHA = 0.72;
 
 function normalizeText(input: string): string {
   return input
@@ -260,6 +309,18 @@ function withBigrams(tokens: string[]): string[] {
     terms.push(`${tokens[i]}_${tokens[i + 1]}`);
   }
   return terms;
+}
+
+function withCharTrigrams(input: string): string[] {
+  const compact = normalizeText(input).replace(/\s+/g, "_");
+  if (compact.length < 3) {
+    return compact ? [compact] : [];
+  }
+  const grams: string[] = [];
+  for (let i = 0; i <= compact.length - 3; i += 1) {
+    grams.push(compact.slice(i, i + 3));
+  }
+  return grams;
 }
 
 function cosineSimilarity(a: Map<string, number>, b: Map<string, number>): number {
@@ -299,76 +360,205 @@ function buildTermFrequency(terms: string[]): Map<string, number> {
   return tf;
 }
 
-export class IntentSemanticRouter {
-  private readonly routes: SemanticRouteConfig[];
-  private readonly idfByTerm = new Map<string, number>();
-  private readonly routeVectors = new Map<IntentRouteName, Map<string, number>>();
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
 
-  constructor(routes: SemanticRouteConfig[] = ROUTES) {
-    this.routes = routes;
+function randomInRange(min: number, max: number): number {
+  return min + Math.random() * (max - min);
+}
+
+function round3(value: number): number {
+  return Number(value.toFixed(3));
+}
+
+function safeParsePersistedRoutes(raw: string): PersistedIntentRouterConfig | null {
+  try {
+    const parsed = JSON.parse(raw) as PersistedIntentRouterConfig;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    if (!Array.isArray(parsed.routes) || parsed.routes.length === 0) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export class IntentSemanticRouter {
+  private routes: SemanticRouteConfig[];
+  private hybridAlpha: number;
+  private minScoreGap: number;
+  private readonly idfByWordTerm = new Map<string, number>();
+  private readonly idfByCharTerm = new Map<string, number>();
+  private readonly routeWordVectors = new Map<IntentRouteName, Map<string, number>>();
+  private readonly routeCharVectors = new Map<IntentRouteName, Map<string, number>>();
+
+  constructor(params?: { routes?: SemanticRouteConfig[]; hybridAlpha?: number; minScoreGap?: number }) {
+    this.routes = (params?.routes ?? DEFAULT_ROUTES).map((route) => ({
+      name: route.name,
+      threshold: clamp(route.threshold, 0.01, 0.99),
+      utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
+    }));
+    this.hybridAlpha = clamp(params?.hybridAlpha ?? DEFAULT_HYBRID_ALPHA, 0.05, 0.95);
+    this.minScoreGap = clamp(params?.minScoreGap ?? DEFAULT_MIN_SCORE_GAP, 0.0, 0.5);
     this.train();
   }
 
   private train(): void {
-    const docs: Array<{ name: IntentRouteName; terms: string[] }> = [];
-    const docFreq = new Map<string, number>();
+    this.idfByWordTerm.clear();
+    this.idfByCharTerm.clear();
+    this.routeWordVectors.clear();
+    this.routeCharVectors.clear();
+
+    const wordDocs: Array<{ name: IntentRouteName; terms: string[] }> = [];
+    const charDocs: Array<{ name: IntentRouteName; terms: string[] }> = [];
+    const wordDocFreq = new Map<string, number>();
+    const charDocFreq = new Map<string, number>();
 
     for (const route of this.routes) {
       for (const utterance of route.utterances) {
-        const terms = withBigrams(tokenize(utterance));
-        docs.push({ name: route.name, terms });
-        const unique = new Set(terms);
-        for (const term of unique) {
-          docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+        const wordTerms = withBigrams(tokenize(utterance));
+        const charTerms = withCharTrigrams(utterance);
+        wordDocs.push({ name: route.name, terms: wordTerms });
+        charDocs.push({ name: route.name, terms: charTerms });
+
+        const wordUnique = new Set(wordTerms);
+        for (const term of wordUnique) {
+          wordDocFreq.set(term, (wordDocFreq.get(term) ?? 0) + 1);
+        }
+        const charUnique = new Set(charTerms);
+        for (const term of charUnique) {
+          charDocFreq.set(term, (charDocFreq.get(term) ?? 0) + 1);
         }
       }
     }
 
-    const totalDocs = Math.max(1, docs.length);
-    for (const [term, df] of docFreq.entries()) {
-      const idf = Math.log((1 + totalDocs) / (1 + df)) + 1;
-      this.idfByTerm.set(term, idf);
+    const totalWordDocs = Math.max(1, wordDocs.length);
+    for (const [term, df] of wordDocFreq.entries()) {
+      const idf = Math.log((1 + totalWordDocs) / (1 + df)) + 1;
+      this.idfByWordTerm.set(term, idf);
     }
 
-    const routeBuckets = new Map<IntentRouteName, Array<Map<string, number>>>();
-    for (const doc of docs) {
+    const totalCharDocs = Math.max(1, charDocs.length);
+    for (const [term, df] of charDocFreq.entries()) {
+      const idf = Math.log((1 + totalCharDocs) / (1 + df)) + 1;
+      this.idfByCharTerm.set(term, idf);
+    }
+
+    const wordBuckets = new Map<IntentRouteName, Array<Map<string, number>>>();
+    for (const doc of wordDocs) {
       const tf = buildTermFrequency(doc.terms);
       const vector = new Map<string, number>();
       for (const [term, freq] of tf.entries()) {
-        vector.set(term, freq * (this.idfByTerm.get(term) ?? 1));
+        vector.set(term, freq * (this.idfByWordTerm.get(term) ?? 1));
       }
-      const list = routeBuckets.get(doc.name) ?? [];
+      const list = wordBuckets.get(doc.name) ?? [];
       list.push(vector);
-      routeBuckets.set(doc.name, list);
+      wordBuckets.set(doc.name, list);
+    }
+
+    const charBuckets = new Map<IntentRouteName, Array<Map<string, number>>>();
+    for (const doc of charDocs) {
+      const tf = buildTermFrequency(doc.terms);
+      const vector = new Map<string, number>();
+      for (const [term, freq] of tf.entries()) {
+        vector.set(term, freq * (this.idfByCharTerm.get(term) ?? 1));
+      }
+      const list = charBuckets.get(doc.name) ?? [];
+      list.push(vector);
+      charBuckets.set(doc.name, list);
     }
 
     for (const route of this.routes) {
-      const vectors = routeBuckets.get(route.name) ?? [];
-      const merged = new Map<string, number>();
-      if (vectors.length === 0) {
-        this.routeVectors.set(route.name, merged);
-        continue;
-      }
-      for (const vector of vectors) {
-        for (const [term, value] of vector.entries()) {
-          merged.set(term, (merged.get(term) ?? 0) + value);
-        }
-      }
-      for (const [term, value] of merged.entries()) {
-        merged.set(term, value / vectors.length);
-      }
-      this.routeVectors.set(route.name, merged);
+      this.routeWordVectors.set(route.name, this.averageVectors(wordBuckets.get(route.name) ?? []));
+      this.routeCharVectors.set(route.name, this.averageVectors(charBuckets.get(route.name) ?? []));
     }
   }
 
-  private embedQuery(text: string): Map<string, number> {
+  private averageVectors(vectors: Array<Map<string, number>>): Map<string, number> {
+    const merged = new Map<string, number>();
+    if (vectors.length === 0) {
+      return merged;
+    }
+    for (const vector of vectors) {
+      for (const [term, value] of vector.entries()) {
+        merged.set(term, (merged.get(term) ?? 0) + value);
+      }
+    }
+    for (const [term, value] of merged.entries()) {
+      merged.set(term, value / vectors.length);
+    }
+    return merged;
+  }
+
+  private embedWordQuery(text: string): Map<string, number> {
     const terms = withBigrams(tokenize(text));
     const tf = buildTermFrequency(terms);
     const vector = new Map<string, number>();
     for (const [term, freq] of tf.entries()) {
-      vector.set(term, freq * (this.idfByTerm.get(term) ?? 1));
+      vector.set(term, freq * (this.idfByWordTerm.get(term) ?? 1));
     }
     return vector;
+  }
+
+  private embedCharQuery(text: string): Map<string, number> {
+    const terms = withCharTrigrams(text);
+    const tf = buildTermFrequency(terms);
+    const vector = new Map<string, number>();
+    for (const [term, freq] of tf.entries()) {
+      vector.set(term, freq * (this.idfByCharTerm.get(term) ?? 1));
+    }
+    return vector;
+  }
+
+  private scoreRoutes(
+    text: string,
+    options?: Pick<RouteOptions, "allowed" | "boosts">,
+  ): RouteScore[] {
+    const normalized = normalizeText(text);
+    const allowedSet = new Set<IntentRouteName>(options?.allowed ?? this.routes.map((route) => route.name));
+    const wordVector = this.embedWordQuery(normalized);
+    const charVector = this.embedCharQuery(normalized);
+    const boosts = options?.boosts ?? {};
+
+    const scored: RouteScore[] = [];
+    for (const route of this.routes) {
+      if (!allowedSet.has(route.name)) {
+        continue;
+      }
+      const routeWordVector = this.routeWordVectors.get(route.name) ?? new Map<string, number>();
+      const routeCharVector = this.routeCharVectors.get(route.name) ?? new Map<string, number>();
+      const wordScore = cosineSimilarity(wordVector, routeWordVector);
+      const charScore = cosineSimilarity(charVector, routeCharVector);
+      const boost = boosts[route.name] ?? 0;
+      const hybridScore = clamp(this.hybridAlpha * wordScore + (1 - this.hybridAlpha) * charScore + boost, 0, 1);
+      scored.push({ name: route.name, score: hybridScore });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored;
+  }
+
+  private classifyByThresholds(
+    scored: RouteScore[],
+    thresholds: Record<string, number>,
+    minGap: number,
+  ): IntentRouteName | null {
+    const best = scored[0];
+    if (!best) {
+      return null;
+    }
+    const threshold = thresholds[best.name] ?? 0;
+    if (best.score < threshold) {
+      return null;
+    }
+    const second = scored[1];
+    if (second && best.score - second.score < minGap) {
+      return null;
+    }
+    return best.name;
   }
 
   route(text: string, options?: RouteOptions): SemanticRouteDecision | null {
@@ -377,21 +567,13 @@ export class IntentSemanticRouter {
       return null;
     }
 
-    const allowedSet = new Set<IntentRouteName>(options?.allowed ?? this.routes.map((route) => route.name));
-    const queryVector = this.embedQuery(normalized);
-    const scored: RouteScore[] = [];
-    for (const route of this.routes) {
-      if (!allowedSet.has(route.name)) {
-        continue;
-      }
-      const routeVector = this.routeVectors.get(route.name) ?? new Map<string, number>();
-      const score = cosineSimilarity(queryVector, routeVector);
-      scored.push({ name: route.name, score });
-    }
+    const scored = this.scoreRoutes(normalized, {
+      allowed: options?.allowed,
+      boosts: options?.boosts,
+    });
     if (scored.length === 0) {
       return null;
     }
-    scored.sort((a, b) => b.score - a.score);
 
     const best = scored[0]!;
     const second = scored[1];
@@ -399,20 +581,22 @@ export class IntentSemanticRouter {
     if (!routeConfig) {
       return null;
     }
+
+    const minGap = typeof options?.minGap === "number" ? options.minGap : this.minScoreGap;
     if (best.score < routeConfig.threshold) {
       return null;
     }
-    if (second && best.score - second.score < DEFAULT_MIN_SCORE_GAP) {
+    if (second && best.score - second.score < minGap) {
       return null;
     }
 
-    const topK = Math.max(1, Math.min(5, Math.floor(options?.topK ?? 3)));
+    const topK = Math.max(1, Math.min(10, Math.floor(options?.topK ?? 3)));
     return {
       handler: best.name,
       score: Number(best.score.toFixed(4)),
       reason: second
-        ? `semantic score ${best.score.toFixed(4)} >= threshold ${routeConfig.threshold.toFixed(2)} and gap ${(best.score - second.score).toFixed(4)} >= ${DEFAULT_MIN_SCORE_GAP.toFixed(2)}`
-        : `semantic score ${best.score.toFixed(4)} >= threshold ${routeConfig.threshold.toFixed(2)}`,
+        ? `hybrid score ${best.score.toFixed(4)} >= threshold ${routeConfig.threshold.toFixed(2)} and gap ${(best.score - second.score).toFixed(4)} >= ${minGap.toFixed(2)} (alpha=${this.hybridAlpha.toFixed(2)})`
+        : `hybrid score ${best.score.toFixed(4)} >= threshold ${routeConfig.threshold.toFixed(2)} (alpha=${this.hybridAlpha.toFixed(2)})`,
       alternatives: scored.slice(0, topK).map((item) => ({
         name: item.name,
         score: Number(item.score.toFixed(4)),
@@ -425,12 +609,193 @@ export class IntentSemanticRouter {
     return route ? route.threshold : null;
   }
 
+  setRouteThreshold(name: IntentRouteName, threshold: number): boolean {
+    const route = this.routes.find((item) => item.name === name);
+    if (!route) {
+      return false;
+    }
+    route.threshold = clamp(threshold, 0.01, 0.99);
+    return true;
+  }
+
   listRouteThresholds(): Array<{ name: IntentRouteName; threshold: number }> {
     return this.routes.map((route) => ({
       name: route.name,
       threshold: route.threshold,
     }));
   }
+
+  listRoutes(): SemanticRouteConfig[] {
+    return this.routes.map((route) => ({
+      name: route.name,
+      threshold: route.threshold,
+      utterances: [...route.utterances],
+    }));
+  }
+
+  getHybridAlpha(): number {
+    return this.hybridAlpha;
+  }
+
+  getMinScoreGap(): number {
+    return this.minScoreGap;
+  }
+
+  setHybridAlpha(value: number): void {
+    this.hybridAlpha = clamp(value, 0.05, 0.95);
+  }
+
+  setMinScoreGap(value: number): void {
+    this.minScoreGap = clamp(value, 0, 0.5);
+  }
+
+  async loadFromFile(filePath: string, options?: { createIfMissing?: boolean }): Promise<void> {
+    const resolved = path.resolve(process.cwd(), filePath);
+    try {
+      const raw = await fs.readFile(resolved, "utf8");
+      const parsed = safeParsePersistedRoutes(raw);
+      if (!parsed) {
+        throw new Error("archivo de rutas inválido");
+      }
+      const validRoutes = parsed.routes
+        .filter((route) => KNOWN_ROUTE_NAMES.includes(route.name))
+        .map((route) => ({
+          name: route.name,
+          threshold: clamp(route.threshold, 0.01, 0.99),
+          utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
+        }))
+        .filter((route) => route.utterances.length > 0);
+      if (validRoutes.length === 0) {
+        throw new Error("sin rutas válidas");
+      }
+      this.routes = validRoutes;
+      this.hybridAlpha = clamp(parsed.hybridAlpha ?? this.hybridAlpha, 0.05, 0.95);
+      this.minScoreGap = clamp(parsed.minScoreGap ?? this.minScoreGap, 0, 0.5);
+      this.train();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/enoent/i.test(message) && options?.createIfMissing) {
+        await this.saveToFile(resolved);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async saveToFile(filePath: string): Promise<void> {
+    const resolved = path.resolve(process.cwd(), filePath);
+    const payload: PersistedIntentRouterConfig = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      hybridAlpha: this.hybridAlpha,
+      minScoreGap: this.minScoreGap,
+      routes: this.listRoutes(),
+    };
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
+    await fs.writeFile(resolved, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  }
+
+  evaluateDataset(samples: IntentRouterDatasetSample[], minGapOverride?: number): number {
+    const labeled = samples.filter((item) => typeof item.finalHandler === "string" && item.finalHandler.trim().length > 0);
+    if (labeled.length === 0) {
+      return 0;
+    }
+    const thresholds = Object.fromEntries(this.routes.map((route) => [route.name, route.threshold]));
+    const minGap = typeof minGapOverride === "number" ? minGapOverride : this.minScoreGap;
+    let correct = 0;
+    for (const sample of labeled) {
+      const scored = this.scoreRoutes(sample.text);
+      const predicted = this.classifyByThresholds(scored, thresholds, minGap);
+      if (predicted && predicted === sample.finalHandler) {
+        correct += 1;
+      }
+    }
+    return correct / labeled.length;
+  }
+
+  fitThresholdsFromDataset(samples: IntentRouterDatasetSample[], options?: FitOptions): FitResult {
+    const labeled = samples.filter((item) => typeof item.finalHandler === "string" && item.finalHandler.trim().length > 0);
+    const totalLabeled = labeled.length;
+    const beforeThresholds = Object.fromEntries(this.routes.map((route) => [route.name, round3(route.threshold)]));
+
+    if (totalLabeled < 25) {
+      return {
+        totalLabeled,
+        beforeAccuracy: this.evaluateDataset(labeled),
+        afterAccuracy: this.evaluateDataset(labeled),
+        improved: false,
+        beforeThresholds,
+        afterThresholds: beforeThresholds,
+      };
+    }
+
+    const minThreshold = clamp(options?.minThreshold ?? 0.05, 0.01, 0.95);
+    const maxThreshold = clamp(options?.maxThreshold ?? 0.95, minThreshold + 0.01, 0.99);
+    const maxIter = Math.max(50, Math.min(5000, Math.floor(options?.maxIter ?? 600)));
+    const searchRange = clamp(options?.searchRange ?? 0.09, 0.01, 0.5);
+    const minGap = clamp(options?.minGap ?? this.minScoreGap, 0, 0.5);
+
+    const current = Object.fromEntries(this.routes.map((route) => [route.name, route.threshold]));
+    let best = { ...current };
+    let bestAcc = this.evaluateWithThresholds(labeled, best, minGap);
+
+    for (let i = 0; i < maxIter; i += 1) {
+      const candidate: Record<string, number> = { ...best };
+      for (const route of this.routes) {
+        const base = best[route.name] ?? route.threshold;
+        const jitter = randomInRange(-searchRange, searchRange);
+        const next = clamp(base + jitter, minThreshold, maxThreshold);
+        candidate[route.name] = next;
+      }
+      const acc = this.evaluateWithThresholds(labeled, candidate, minGap);
+      if (acc > bestAcc) {
+        bestAcc = acc;
+        best = candidate;
+      }
+    }
+
+    for (const route of this.routes) {
+      route.threshold = clamp(best[route.name] ?? route.threshold, minThreshold, maxThreshold);
+    }
+
+    const afterThresholds = Object.fromEntries(this.routes.map((route) => [route.name, round3(route.threshold)]));
+    const beforeAccuracy = this.evaluateWithThresholds(labeled, current, minGap);
+    const afterAccuracy = this.evaluateWithThresholds(labeled, best, minGap);
+
+    return {
+      totalLabeled,
+      beforeAccuracy,
+      afterAccuracy,
+      improved: afterAccuracy > beforeAccuracy,
+      beforeThresholds,
+      afterThresholds,
+    };
+  }
+
+  private evaluateWithThresholds(
+    samples: IntentRouterDatasetSample[],
+    thresholds: Record<string, number>,
+    minGap: number,
+  ): number {
+    if (samples.length === 0) {
+      return 0;
+    }
+    let correct = 0;
+    for (const sample of samples) {
+      const scored = this.scoreRoutes(sample.text);
+      const predicted = this.classifyByThresholds(scored, thresholds, minGap);
+      if (predicted && predicted === sample.finalHandler) {
+        correct += 1;
+      }
+    }
+    return correct / samples.length;
+  }
 }
 
-export type { IntentRouteName, SemanticRouteDecision };
+export type {
+  FitResult,
+  IntentRouteName,
+  RouteOptions,
+  SemanticRouteConfig,
+  SemanticRouteDecision,
+};
