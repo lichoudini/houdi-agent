@@ -27,14 +27,25 @@
   - Consultas IA (`/ask`)
   - Planeación de acción shell (`/shell`)
   - Visión sobre imágenes (análisis de fotos/adjuntos)
+  - Soporte de modelo override por llamada (además del default de `.env`)
   - Construcción de prompt estructurado (personalidad, lineamientos, memoria, runtime)
 - `src/gmail-account.ts`
   - Conexión OAuth2 contra Gmail API
   - Listado/lectura/envío y operaciones de etiquetas (read/unread/star/trash)
-- `src/scheduled-tasks.ts`
-  - Persistencia de recordatorios/tareas programadas en JSON
+- `src/scheduled-tasks-sqlite.ts`
+  - Persistencia de recordatorios/tareas programadas en SQLite
   - Listado/edición/eliminación por chat
   - Gestión de retries de entrega
+- `src/email-recipients-sqlite.ts`
+  - Persistencia de destinatarios Gmail por chat en SQLite
+- `src/sqlite-state-store.ts`
+  - Estado operativo auxiliar en SQLite (idempotencia, contexto de listas indexadas, etc.)
+- `src/domains/gmail/*`
+  - Parsing/intents de Gmail y destinatarios
+- `src/domains/workspace/*`
+  - Servicios e intents de operaciones de workspace
+- `src/domains/router/*`
+  - Filtro contextual y utilidades del router semántico/natural
 - `src/selfskill-drafts.ts`
   - Borrador persistente de habilidades en múltiples mensajes por chat
   - Soporte start/add/show/apply/cancel
@@ -93,6 +104,6 @@
 - `reboot` siempre con aprobación.
 
 ## Limitaciones actuales
-- Aprobaciones y estado en memoria (se pierden al reinicio).
+- Aprobaciones de admin siguen en memoria (se pierden al reinicio).
 - Auditoría en archivo local sin rotación automática.
 - Sin pruebas automatizadas en CI.

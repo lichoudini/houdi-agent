@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import path from "node:path";
 import { z } from "zod";
+import { resolveSecurityProfile } from "./security-profile.js";
 
 dotenv.config();
 
@@ -18,6 +19,10 @@ const EnvSchema = z.object({
   HOUDI_SCHEDULE_FILE: z.string().trim().default("./houdi-schedule.json"),
   HOUDI_RECIPIENTS_FILE: z.string().trim().default("./houdi-recipients.json"),
   HOUDI_INTENT_ROUTER_DATASET_FILE: z.string().trim().default("./houdi-intent-router-dataset.jsonl"),
+  HOUDI_STATE_DB_FILE: z.string().trim().default("./workspace/state/houdi-state.sqlite"),
+  HOUDI_IDEMPOTENCY_TTL_MS: z.coerce.number().int().positive().max(7 * 24 * 60 * 60 * 1000).default(86_400_000),
+  HOUDI_SECURITY_PROFILE: z.string().trim().optional(),
+  HOUDI_AGENT_VERSION: z.string().trim().default("1.1"),
   HOUDI_SCHEDULE_POLL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
   HOUDI_SELFSKILL_DRAFTS_FILE: z.string().trim().default("./houdi-selfskill-drafts.json"),
   HOUDI_INTERESTS_FILE: z.string().trim().default("./houdi-interests.json"),
@@ -201,6 +206,7 @@ function normalizeLocalApiHost(raw: string): string {
 }
 
 const env = EnvSchema.parse(process.env);
+const securityProfile = resolveSecurityProfile(env.HOUDI_SECURITY_PROFILE);
 
 export const config = {
   telegramBotToken: env.TELEGRAM_BOT_TOKEN,
@@ -216,6 +222,10 @@ export const config = {
   scheduleFile: env.HOUDI_SCHEDULE_FILE,
   recipientsFile: env.HOUDI_RECIPIENTS_FILE,
   intentRouterDatasetFile: env.HOUDI_INTENT_ROUTER_DATASET_FILE,
+  stateDbFile: env.HOUDI_STATE_DB_FILE,
+  idempotencyTtlMs: env.HOUDI_IDEMPOTENCY_TTL_MS,
+  securityProfile,
+  agentVersion: env.HOUDI_AGENT_VERSION,
   schedulePollMs: env.HOUDI_SCHEDULE_POLL_MS,
   selfSkillDraftsFile: env.HOUDI_SELFSKILL_DRAFTS_FILE,
   interestsFile: env.HOUDI_INTERESTS_FILE,

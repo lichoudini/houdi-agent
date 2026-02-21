@@ -165,6 +165,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 ## Comandos Telegram
 
 - `/status`
+- `/model [show|set <modelo>|reset]`
 - `/agent`
 - `/agent set <nombre>`
 - `/ask <pregunta>`
@@ -212,6 +213,18 @@ También puedes enviar nota de voz/audio: el bot lo transcribe y responde sobre 
 Si envías un archivo por Telegram (document), lo guarda automáticamente en `workspace/files/...`.
 Si envías una imagen/foto, la guarda en `workspace/images/...` y además puede analizarla con OpenAI Vision.
 También puedes pedir en lenguaje natural operaciones sobre `workspace` (listar, crear carpeta, crear archivo simple, mover, renombrar, eliminar y enviar archivos).
+
+## Seleccion de modelo OpenAI por chat
+
+Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo en runtime para un chat especifico:
+
+- `/model` o `/model show`: muestra modelo actual del chat y default global.
+- `/model set <modelo>`: fija override por chat (ej. `gpt-4o-mini`).
+- `/model reset`: vuelve al default de `.env`.
+
+Notas:
+- El override es en memoria (runtime): no modifica `.env`.
+- Aplica a consultas IA de chat, analisis de imagen y planificacion de `/shell`.
 
 ## CLI local
 

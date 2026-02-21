@@ -4,8 +4,17 @@
 El proyecto ya esta en un punto funcional para uso real (onboarding, systemd, runbook, memoria, LIM/Gmail, CLI + Telegram).  
 Para elevar robustez y mantenibilidad a nivel produccion, se priorizan las siguientes mejoras.
 
+## Avances ya aplicados (resumen)
+- Modularizacion inicial por dominios:
+  - `src/domains/gmail/*`
+  - `src/domains/workspace/*`
+  - `src/domains/router/*`
+- Migracion de tareas y destinatarios a SQLite (`scheduled-tasks-sqlite`, `email-recipients-sqlite`).
+- Estado operativo adicional en SQLite (`sqlite-state-store`) para contexto/idempotencia.
+- Comando `/model` para seleccionar modelo OpenAI por chat (override runtime).
+
 ## Prioridad alta
-1. Modularizar `src/index.ts` (actualmente ~16.7k lineas).
+1. Completar modularizacion de `src/index.ts` (todavia centraliza demasiada orquestacion).
 - Riesgo actual: alta probabilidad de regresiones y baja mantenibilidad.
 - Accion: separar por dominios (`intents`, `workspace`, `gmail`, `lim`, `scheduler`, `router`).
 
@@ -46,4 +55,3 @@ Para elevar robustez y mantenibilidad a nivel produccion, se priorizan las sigui
 2. Semana 2: modularizacion de `src/index.ts` sin cambios funcionales.
 3. Semana 3: SQLite para estado critico + idempotencia.
 4. Semana 4: observabilidad + evaluacion automatica de routing.
-

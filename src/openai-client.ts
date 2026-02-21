@@ -190,11 +190,15 @@ export class OpenAiService {
     return this.client !== null;
   }
 
-  getModel(): string {
-    return config.openAiModel;
+  getModel(modelOverride?: string): string {
+    const candidate = modelOverride?.trim();
+    return candidate || config.openAiModel;
   }
 
-  async ask(prompt: string, options?: { context?: PromptContextSnapshot; concise?: boolean; maxOutputTokens?: number }): Promise<string> {
+  async ask(
+    prompt: string,
+    options?: { context?: PromptContextSnapshot; concise?: boolean; maxOutputTokens?: number; model?: string },
+  ): Promise<string> {
     if (!this.client) {
       throw new Error("OPENAI_API_KEY no está configurada en .env");
     }
@@ -205,7 +209,7 @@ export class OpenAiService {
     }
 
     const response = await this.client.responses.create({
-      model: config.openAiModel,
+      model: this.getModel(options?.model),
       max_output_tokens: options?.maxOutputTokens ?? config.openAiMaxOutputTokens,
       input: [
         {
@@ -267,6 +271,7 @@ export class OpenAiService {
     context?: PromptContextSnapshot;
     concise?: boolean;
     maxOutputTokens?: number;
+    model?: string;
   }): Promise<string> {
     if (!this.client) {
       throw new Error("OPENAI_API_KEY no está configurada en .env");
@@ -283,7 +288,7 @@ export class OpenAiService {
     const imageDataUrl = `data:${mimeType};base64,${imageBase64}`;
 
     const response = await this.client.responses.create({
-      model: config.openAiModel,
+      model: this.getModel(params.model),
       max_output_tokens: params.maxOutputTokens ?? config.openAiMaxOutputTokens,
       input: [
         {
@@ -312,6 +317,7 @@ export class OpenAiService {
     allowedCommands: string[];
     cwd: string;
     context?: PromptContextSnapshot;
+    model?: string;
   }): Promise<ShellPlan> {
     if (!this.client) {
       throw new Error("OPENAI_API_KEY no está configurada en .env");
@@ -328,7 +334,7 @@ export class OpenAiService {
     const allowedDisplay = allowed.join(", ");
 
     const response = await this.client.responses.create({
-      model: config.openAiModel,
+      model: this.getModel(params.model),
       max_output_tokens: 500,
       input: [
         {

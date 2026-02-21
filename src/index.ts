@@ -25,7 +25,32 @@ import { formatMemoryHitsNaturalText } from "./memory-presenter.js";
 import { OpenAiService } from "./openai-client.js";
 import { OpenMeteoApiTool } from "./open-meteo-api.js";
 import { RedditApiTool, type RedditPostResult } from "./reddit-api.js";
-import { ScheduledTaskService } from "./scheduled-tasks.js";
+import { type SavedEmailRecipient, EmailRecipientsSqliteService } from "./email-recipients-sqlite.js";
+import { ScheduledTaskSqliteService } from "./scheduled-tasks-sqlite.js";
+import { GmailRecipientsManager, isValidEmailAddress, normalizeRecipientEmail, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
+import {
+  detectGmailNaturalIntent as detectGmailNaturalIntentDomain,
+  detectGmailRecipientNaturalIntent as detectGmailRecipientNaturalIntentDomain,
+} from "./domains/gmail/intents.js";
+import { createGmailTextParsers } from "./domains/gmail/text-parsers.js";
+import { buildIntentRouterContextFilter as buildIntentRouterContextFilterDomain } from "./domains/router/context-filter.js";
+import {
+  type IndexedListReferenceIntent,
+  parseIndexedListReferenceIntent as parseIndexedListReferenceIntentDomain,
+} from "./domains/router/indexed-list-intent.js";
+import {
+  IntentRouterStatsRepository,
+  buildIntentRouterStatsReport as buildIntentRouterStatsReportDomain,
+} from "./domains/router/intent-router-stats.js";
+import { detectWorkspaceNaturalIntent as detectWorkspaceNaturalIntentDomain } from "./domains/workspace/intents.js";
+import {
+  detectSimpleTextExtensionHint as detectSimpleTextExtensionHintDomain,
+  looksLikeWorkspacePathCandidate as looksLikeWorkspacePathCandidateDomain,
+  parseWorkspaceFileIndexReference as parseWorkspaceFileIndexReferenceDomain,
+  pickFirstNonEmpty,
+} from "./domains/workspace/intent-helpers.js";
+import { createWorkspaceTextParsers } from "./domains/workspace/text-parsers.js";
+import { WorkspaceFilesService } from "./domains/workspace/workspace-files-service.js";
 import { SelfSkillDraftService } from "./selfskill-drafts.js";
 import { acquireSingleInstanceLock } from "./single-instance-lock.js";
 import { TaskRunner } from "./task-runner.js";
@@ -33,6 +58,15 @@ import { splitForTelegram } from "./telegram-utils.js";
 import { CoinGeckoApiTool } from "./coingecko-api.js";
 import type { WebSearchResult } from "./web-browser.js";
 import { WebBrowser } from "./web-browser.js";
+import { ObservabilityService } from "./observability.js";
+import { RequestIdempotencyService } from "./request-idempotency.js";
+import { SqliteStateStore } from "./sqlite-state-store.js";
+import {
+  isLocalBridgeAuthorized,
+  parsePositiveInteger,
+  readHttpRequestBody,
+  writeJsonResponse,
+} from "./local-bridge-http.js";
 
 const agentRegistry = new AgentRegistry(config.agentsDir, config.defaultAgent);
 await agentRegistry.load();
@@ -86,10 +120,17 @@ const adminSecurity = new AdminSecurityController({
   approvalTtlMs: config.adminApprovalTtlSeconds * 1000,
 });
 const audit = new AuditLogger(config.auditLogPath);
-const scheduledTasks = new ScheduledTaskService({
-  filePath: config.scheduleFile,
+const scheduledTasks = new ScheduledTaskSqliteService({
+  dbPath: config.stateDbFile,
 });
 await scheduledTasks.load();
+await scheduledTasks.migrateFromJson(config.scheduleFile);
+const emailRecipients = new EmailRecipientsSqliteService({
+  dbPath: config.stateDbFile,
+});
+await emailRecipients.load();
+await emailRecipients.migrateFromJson(config.recipientsFile);
+const gmailRecipients = new GmailRecipientsManager(emailRecipients, normalizeIntentText);
 const selfSkillDrafts = new SelfSkillDraftService({
   filePath: config.selfSkillDraftsFile,
 });
@@ -98,10 +139,15 @@ const interestLearning = new InterestLearningService({
   filePath: config.interestsFile,
 });
 await interestLearning.load();
+const observability = new ObservabilityService();
+const sqliteState = new SqliteStateStore(config.stateDbFile);
+await sqliteState.init();
+const idempotency = new RequestIdempotencyService(sqliteState, config.idempotencyTtlMs);
 
 const activeAgentByChat = new Map<number, string>();
 const aiShellModeByChat = new Map<number, boolean>();
 const ecoModeByChat = new Map<number, boolean>();
+const openAiModelByChat = new Map<number, string>();
 const lastWebResultsByChat = new Map<number, WebSearchResult[]>();
 type LastDocumentSnapshot = {
   path: string;
@@ -130,22 +176,8 @@ type RecentConversationTurn = {
 const lastAssistantReplyByChat = new Map<number, AssistantReplySnapshot>();
 const assistantReplyHistoryByChat = new Map<number, AssistantReplySnapshot[]>();
 const recentConversationByChat = new Map<number, RecentConversationTurn[]>();
-type SavedEmailRecipient = {
-  chatId: number;
-  name: string;
-  nameKey: string;
-  email: string;
-  createdAt: string;
-  updatedAt: string;
-};
-type EmailRecipientsStorage = {
-  recipients: SavedEmailRecipient[];
-};
-const recipientsFilePath = path.resolve(process.cwd(), config.recipientsFile);
 const intentRouterDatasetFilePath = path.resolve(process.cwd(), config.intentRouterDatasetFile);
-const emailRecipientsByChat = new Map<number, SavedEmailRecipient[]>();
-let recipientsPersistQueue: Promise<void> = Promise.resolve();
-let intentRouterDatasetPersistQueue: Promise<void> = Promise.resolve();
+const intentRouterStatsRepository = new IntentRouterStatsRepository(intentRouterDatasetFilePath, (message) => logWarn(message));
 const lastGmailResultsByChat = new Map<number, GmailMessageSummary[]>();
 const lastGmailMessageIdByChat = new Map<number, string>();
 const lastListedFilesByChat = new Map<number, Array<{ relPath: string; size: number; modifiedAt: string }>>();
@@ -198,7 +230,6 @@ type StoicSmalltalkSession = {
   lastReplyText: string;
 };
 const stoicSmalltalkByChat = new Map<number, StoicSmalltalkSession>();
-await loadEmailRecipientsStore();
 const DOCUMENT_SEARCH_MAX_DEPTH = 6;
 const DOCUMENT_SEARCH_MAX_DIRS = 2000;
 const SELF_SKILLS_SECTION_TITLE = "## Dynamic Skills";
@@ -253,6 +284,8 @@ const SIMPLE_TEXT_FILE_EXTENSIONS = new Set([
 const KNOWN_TELEGRAM_COMMANDS = new Set([
   "start",
   "help",
+  "version",
+  "model",
   "status",
   "agent",
   "tasks",
@@ -293,6 +326,48 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "panic",
   "intentstats",
 ]);
+const workspaceFiles = new WorkspaceFilesService(
+  config.workspaceDir,
+  normalizeWorkspaceRelativePath,
+  isSimpleTextFilePath,
+  formatBytes,
+  safePathExists,
+  SIMPLE_TEXT_FILE_EXTENSIONS,
+);
+const workspaceTextParsers = createWorkspaceTextParsers({
+  normalizeIntentText,
+  normalizeWorkspaceRelativePath,
+  cleanWorkspacePathPhrase,
+  extractQuotedSegments,
+});
+const {
+  extractWorkspaceNameSelectorFromSegment,
+  extractWorkspaceDeletePathCandidate,
+  extractWorkspaceDeleteExtensions,
+  extractWorkspaceDeleteContentsPath,
+  decodeEscapedInlineText,
+  extractNaturalWorkspaceWriteContent,
+} = workspaceTextParsers;
+const gmailTextParsers = createGmailTextParsers({
+  normalizeIntentText,
+  extractQuotedSegments,
+  normalizeRecipientName,
+  truncateInline,
+  gmailMaxResults: config.gmailMaxResults,
+});
+const {
+  extractEmailAddresses,
+  extractRecipientNameFromText,
+  parseGmailLabeledFields,
+  detectGmailDraftRequested,
+  extractLiteralBodyRequest,
+  extractNaturalSubjectRequest,
+  detectCreativeEmailCue,
+  buildGmailDraftInstruction,
+  shouldAvoidLiteralBodyFallback,
+  parseNaturalLimit,
+  buildNaturalGmailQuery,
+} = gmailTextParsers;
 
 function getActiveAgent(chatId: number): string {
   return activeAgentByChat.get(chatId) ?? config.defaultAgent;
@@ -318,6 +393,34 @@ function setEcoMode(chatId: number, enabled: boolean): void {
   ecoModeByChat.set(chatId, enabled);
 }
 
+function getOpenAiModelForChat(chatId: number): string {
+  const custom = openAiModelByChat.get(chatId)?.trim();
+  return custom || config.openAiModel;
+}
+
+function setOpenAiModelForChat(chatId: number, model: string): void {
+  const normalized = model.trim();
+  if (!normalized) {
+    throw new Error("Modelo vacío");
+  }
+  if (!/^[A-Za-z0-9._:-]{2,120}$/.test(normalized)) {
+    throw new Error("Modelo inválido. Usa letras, números, punto, guion, underscore o dos puntos.");
+  }
+  openAiModelByChat.set(chatId, normalized);
+}
+
+function resetOpenAiModelForChat(chatId: number): void {
+  openAiModelByChat.delete(chatId);
+}
+
+function isAdminApprovalRequired(chatId: number): boolean {
+  return config.securityProfile.forceApprovalMode || adminSecurity.isAdminModeEnabled(chatId);
+}
+
+function buildAgentVersionText(): string {
+  return `Houdi Agent versión ${config.agentVersion}`;
+}
+
 async function askOpenAiForChat(params: {
   chatId: number;
   prompt: string;
@@ -330,6 +433,7 @@ async function askOpenAiForChat(params: {
     context: params.context,
     concise: params.concise ?? ecoEnabled,
     maxOutputTokens: params.maxOutputTokens ?? (ecoEnabled ? config.openAiEcoMaxOutputTokens : undefined),
+    model: getOpenAiModelForChat(params.chatId),
   });
 }
 
@@ -808,115 +912,77 @@ function rememberIndexedListContext(params: {
     .filter((item) => item.reference.trim().length > 0);
   if (items.length === 0) {
     indexedListByChat.delete(params.chatId);
+    try {
+      sqliteState.deleteIndexedListContext(params.chatId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logWarn(`No pude limpiar indexed list en SQLite: ${message}`);
+    }
     return;
   }
-  indexedListByChat.set(params.chatId, {
+  const context: IndexedListContext = {
     kind: params.kind,
     title: params.title,
     source: params.source,
     items,
     createdAtMs: Date.now(),
-  });
+  };
+  indexedListByChat.set(params.chatId, context);
+  try {
+    sqliteState.upsertIndexedListContext({
+      chatId: params.chatId,
+      kind: context.kind,
+      title: context.title,
+      source: context.source,
+      itemsJson: JSON.stringify(context.items),
+      createdAtMs: context.createdAtMs,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude persistir indexed list en SQLite: ${message}`);
+  }
 }
 
 function getIndexedListContext(chatId: number): IndexedListContext | null {
-  const context = indexedListByChat.get(chatId);
+  let context = indexedListByChat.get(chatId);
+  if (!context) {
+    try {
+      const stored = sqliteState.getIndexedListContext(chatId);
+      if (stored) {
+        const parsed = JSON.parse(stored.itemsJson) as IndexedListItem[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          context = {
+            kind: stored.kind as IndexedListKind,
+            title: stored.title,
+            source: stored.source,
+            items: parsed,
+            createdAtMs: stored.createdAtMs,
+          };
+          indexedListByChat.set(chatId, context);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logWarn(`No pude leer indexed list desde SQLite: ${message}`);
+    }
+  }
   if (!context) {
     return null;
   }
   if (Date.now() - context.createdAtMs > INDEXED_LIST_CONTEXT_TTL_MS) {
     indexedListByChat.delete(chatId);
+    try {
+      sqliteState.deleteIndexedListContext(chatId);
+    } catch {
+      // best effort
+    }
     return null;
   }
   return context;
 }
 
-type IndexedListAction = "open" | "read" | "delete";
-
-type IndexedListReferenceIntent = {
-  shouldHandle: boolean;
-  action?: IndexedListAction;
-  indexes: number[];
-  selectAll?: boolean;
-  selectLast?: boolean;
-  selectPenultimate?: boolean;
-};
-
 function parseIndexedListReferenceIntent(text: string): IndexedListReferenceIntent {
-  const normalized = normalizeIntentText(text);
-  if (!normalized) {
-    return { shouldHandle: false, indexes: [] };
-  }
-
-  const action: IndexedListAction | undefined = /\b(elimina|eliminar|borra|borrar|quita|quitar|suprime|suprimir|remueve|remover|delete|remove)\b/.test(
-    normalized,
-  )
-    ? "delete"
-    : /\b(lee|leer|leyendo|revisa|revisa|analiza|analizar)\b/.test(normalized)
-      ? "read"
-      : /\b(abre|abrir|abri|abr[ií]|mostrar|mostra|ver)\b/.test(normalized)
-        ? "open"
-        : undefined;
-  if (!action) {
-    return { shouldHandle: false, indexes: [] };
-  }
-
-  const indexes = new Set<number>();
-  const addIndex = (value: number) => {
-    if (Number.isFinite(value) && value > 0 && value <= 999) {
-      indexes.add(Math.floor(value));
-    }
-  };
-
-  for (const match of normalized.matchAll(/\b(\d{1,3})\s*(?:al|-|a)\s*(\d{1,3})\b/g)) {
-    const start = Number.parseInt(match[1] ?? "", 10);
-    const end = Number.parseInt(match[2] ?? "", 10);
-    if (!Number.isFinite(start) || !Number.isFinite(end)) {
-      continue;
-    }
-    const min = Math.min(start, end);
-    const max = Math.max(start, end);
-    for (let current = min; current <= max && current - min < 20; current += 1) {
-      addIndex(current);
-    }
-  }
-  for (const match of normalized.matchAll(/\b(\d{1,3})\b/g)) {
-    addIndex(Number.parseInt(match[1] ?? "", 10));
-  }
-  if (/\b(primer[oa]?|primero|primera)\b/.test(normalized)) {
-    addIndex(1);
-  }
-  const ordinalWords: Array<{ regex: RegExp; value: number }> = [
-    { regex: /\b(segund[oa]?|segundo|segunda)\b/, value: 2 },
-    { regex: /\b(tercer[oa]?|tercero|tercera)\b/, value: 3 },
-    { regex: /\b(cuart[oa]?|cuarto|cuarta)\b/, value: 4 },
-    { regex: /\b(quint[oa]?|quinto|quinta)\b/, value: 5 },
-    { regex: /\b(sext[oa]?|sexto|sexta)\b/, value: 6 },
-    { regex: /\b(septim[oa]?|septimo|septima|s[eé]ptim[oa]?|s[eé]ptimo|s[eé]ptima)\b/, value: 7 },
-    { regex: /\b(octav[oa]?|octavo|octava)\b/, value: 8 },
-    { regex: /\b(noven[oa]?|noveno|novena)\b/, value: 9 },
-    { regex: /\b(decim[oa]?|decimo|decima|d[eé]cim[oa]?|d[eé]cimo|d[eé]cima)\b/, value: 10 },
-  ];
-  for (const ordinal of ordinalWords) {
-    if (ordinal.regex.test(normalized)) {
-      addIndex(ordinal.value);
-    }
-  }
-
-  const selectLast = /\b(ultim[oa]?|ultimo|ultima|el ultimo|la ultima)\b/.test(normalized);
-  const selectPenultimate = /\b(penultim[oa]?|penultimo|penultima|anteultim[oa]?|anteultimo|anteultima)\b/.test(
-    normalized,
-  );
-  const selectAll = /\b(todos?|todas?)\b/.test(normalized);
-
-  return {
-    shouldHandle: indexes.size > 0 || selectAll || selectLast || selectPenultimate,
-    action,
-    indexes: Array.from(indexes).sort((a, b) => a - b),
-    selectAll,
-    selectLast,
-    selectPenultimate,
-  };
+  return parseIndexedListReferenceIntentDomain(text, normalizeIntentText);
 }
 
 function rememberWorkspaceListContext(params: {
@@ -1078,208 +1144,34 @@ async function summarizeMemoryRecallNatural(chatId: number, query: string, hits:
 }
 
 function normalizeRecipientNameKey(raw: string): string {
-  return normalizeIntentText(raw).replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-}
-
-function normalizeRecipientName(raw: string): string {
-  return raw.trim().replace(/\s+/g, " ").replace(/^["'`]+|["'`]+$/g, "").trim();
-}
-
-function normalizeRecipientEmail(raw: string): string {
-  return raw.trim().toLowerCase();
-}
-
-function isValidEmailAddress(raw: string): boolean {
-  return /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(raw.trim());
+  return gmailRecipients.normalizeRecipientNameKey(raw);
 }
 
 function listEmailRecipients(chatId: number): SavedEmailRecipient[] {
-  return [...(emailRecipientsByChat.get(chatId) ?? [])].sort((a, b) => a.name.localeCompare(b.name, "es"));
-}
-
-function queuePersistEmailRecipients(): Promise<void> {
-  recipientsPersistQueue = recipientsPersistQueue.then(async () => {
-    const payload: EmailRecipientsStorage = {
-      recipients: [...emailRecipientsByChat.values()].flat(),
-    };
-    await fs.mkdir(path.dirname(recipientsFilePath), { recursive: true });
-    await fs.writeFile(recipientsFilePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  });
-  return recipientsPersistQueue;
-}
-
-async function loadEmailRecipientsStore(): Promise<void> {
-  await fs.mkdir(path.dirname(recipientsFilePath), { recursive: true });
-  let raw = "";
-  try {
-    raw = await fs.readFile(recipientsFilePath, "utf8");
-  } catch {
-    const empty: EmailRecipientsStorage = { recipients: [] };
-    await fs.writeFile(recipientsFilePath, `${JSON.stringify(empty, null, 2)}\n`, "utf8");
-    return;
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = { recipients: [] };
-  }
-  const listRaw = Array.isArray((parsed as { recipients?: unknown })?.recipients)
-    ? ((parsed as { recipients: unknown[] }).recipients ?? [])
-    : [];
-  emailRecipientsByChat.clear();
-  for (const item of listRaw) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-    const obj = item as Record<string, unknown>;
-    const chatId = Number.parseInt(String(obj.chatId ?? ""), 10);
-    const name = normalizeRecipientName(String(obj.name ?? ""));
-    const email = normalizeRecipientEmail(String(obj.email ?? ""));
-    const createdAt = typeof obj.createdAt === "string" ? obj.createdAt : new Date().toISOString();
-    const updatedAt = typeof obj.updatedAt === "string" ? obj.updatedAt : createdAt;
-    if (!Number.isFinite(chatId) || chatId <= 0 || !name || !isValidEmailAddress(email)) {
-      continue;
-    }
-    const row: SavedEmailRecipient = {
-      chatId,
-      name,
-      nameKey: normalizeRecipientNameKey(name),
-      email,
-      createdAt,
-      updatedAt,
-    };
-    const current = emailRecipientsByChat.get(chatId) ?? [];
-    current.push(row);
-    emailRecipientsByChat.set(chatId, current);
-  }
+  return gmailRecipients.list(chatId);
 }
 
 async function upsertEmailRecipient(params: { chatId: number; name: string; email: string }): Promise<{ created: boolean; row: SavedEmailRecipient }> {
-  const chatId = Math.floor(params.chatId);
-  const name = normalizeRecipientName(params.name);
-  const email = normalizeRecipientEmail(params.email);
-  if (!name) {
-    throw new Error("Nombre de destinatario vacío.");
-  }
-  if (!isValidEmailAddress(email)) {
-    throw new Error("Email inválido.");
-  }
-  const nameKey = normalizeRecipientNameKey(name);
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  const now = new Date().toISOString();
-  const index = list.findIndex((item) => item.nameKey === nameKey);
-  if (index >= 0) {
-    const updated: SavedEmailRecipient = {
-      ...list[index]!,
-      name,
-      email,
-      updatedAt: now,
-    };
-    list[index] = updated;
-    emailRecipientsByChat.set(chatId, list);
-    await queuePersistEmailRecipients();
-    return { created: false, row: updated };
-  }
-  const createdRow: SavedEmailRecipient = {
-    chatId,
-    name,
-    nameKey,
-    email,
-    createdAt: now,
-    updatedAt: now,
-  };
-  list.push(createdRow);
-  emailRecipientsByChat.set(chatId, list);
-  await queuePersistEmailRecipients();
-  return { created: true, row: createdRow };
+  return gmailRecipients.upsert(params);
 }
 
 async function deleteEmailRecipient(chatIdInput: number, nameInput: string): Promise<SavedEmailRecipient | null> {
-  const chatId = Math.floor(chatIdInput);
-  const nameKey = normalizeRecipientNameKey(nameInput);
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  const index = list.findIndex((item) => item.nameKey === nameKey);
-  if (index < 0) {
-    return null;
-  }
-  const [removed] = list.splice(index, 1);
-  emailRecipientsByChat.set(chatId, list);
-  await queuePersistEmailRecipients();
-  return removed ?? null;
+  return gmailRecipients.deleteByName(chatIdInput, nameInput);
 }
 
 function resolveEmailRecipientSelector(
   chatIdInput: number,
   selectorInput: string,
-): { row: SavedEmailRecipient; index: number } | null {
-  const chatId = Math.floor(chatIdInput);
-  const selector = selectorInput.trim();
-  if (!selector) {
-    return null;
-  }
-
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  if (list.length === 0) {
-    return null;
-  }
-
-  if (/^\d+$/.test(selector)) {
-    const sorted = listEmailRecipients(chatId);
-    const position = Number.parseInt(selector, 10);
-    if (!Number.isFinite(position) || position < 1 || position > sorted.length) {
-      return null;
-    }
-    const picked = sorted[position - 1];
-    if (!picked) {
-      return null;
-    }
-    const index = list.findIndex((item) => item.nameKey === picked.nameKey);
-    if (index < 0) {
-      return null;
-    }
-    return { row: list[index]!, index };
-  }
-
-  const nameKey = normalizeRecipientNameKey(selector);
-  if (!nameKey) {
-    return null;
-  }
-  const exactIndex = list.findIndex((item) => item.nameKey === nameKey);
-  if (exactIndex >= 0) {
-    return { row: list[exactIndex]!, index: exactIndex };
-  }
-  const startsWith = list
-    .map((item, index) => ({ item, index }))
-    .filter((entry) => entry.item.nameKey.startsWith(nameKey));
-  if (startsWith.length === 1) {
-    const only = startsWith[0]!;
-    return { row: only.item, index: only.index };
-  }
-  return null;
+): SavedEmailRecipient | null {
+  return gmailRecipients.resolveSelector(chatIdInput, selectorInput);
 }
 
 async function deleteEmailRecipientBySelector(chatIdInput: number, selectorInput: string): Promise<SavedEmailRecipient | null> {
-  const chatId = Math.floor(chatIdInput);
-  const resolved = resolveEmailRecipientSelector(chatId, selectorInput);
-  if (!resolved) {
-    return null;
-  }
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  const [removed] = list.splice(resolved.index, 1);
-  emailRecipientsByChat.set(chatId, list);
-  await queuePersistEmailRecipients();
-  return removed ?? null;
+  return gmailRecipients.deleteBySelector(chatIdInput, selectorInput);
 }
 
 async function clearEmailRecipients(chatIdInput: number): Promise<number> {
-  const chatId = Math.floor(chatIdInput);
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  const removedCount = list.length;
-  emailRecipientsByChat.set(chatId, []);
-  await queuePersistEmailRecipients();
-  return removedCount;
+  return gmailRecipients.clear(chatIdInput);
 }
 
 async function updateEmailRecipientBySelector(params: {
@@ -1288,44 +1180,11 @@ async function updateEmailRecipientBySelector(params: {
   nextName?: string;
   nextEmail?: string;
 }): Promise<{ previous: SavedEmailRecipient; row: SavedEmailRecipient } | null> {
-  const chatId = Math.floor(params.chatId);
-  const resolved = resolveEmailRecipientSelector(chatId, params.selector);
-  if (!resolved) {
-    return null;
-  }
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  const previous = resolved.row;
-  const nextName = params.nextName ? normalizeRecipientName(params.nextName) : previous.name;
-  const nextEmail = params.nextEmail ? normalizeRecipientEmail(params.nextEmail) : previous.email;
-  if (!nextName) {
-    throw new Error("Nombre de destinatario vacío.");
-  }
-  if (!isValidEmailAddress(nextEmail)) {
-    throw new Error("Email inválido.");
-  }
-  const nextNameKey = normalizeRecipientNameKey(nextName);
-  const duplicateIndex = list.findIndex((item, index) => item.nameKey === nextNameKey && index !== resolved.index);
-  if (duplicateIndex >= 0) {
-    throw new Error(`Ya existe un destinatario con nombre "${nextName}".`);
-  }
-  const updated: SavedEmailRecipient = {
-    ...previous,
-    name: nextName,
-    nameKey: nextNameKey,
-    email: nextEmail,
-    updatedAt: new Date().toISOString(),
-  };
-  list[resolved.index] = updated;
-  emailRecipientsByChat.set(chatId, list);
-  await queuePersistEmailRecipients();
-  return {
-    previous,
-    row: updated,
-  };
+  return gmailRecipients.updateBySelector(params);
 }
 
 function resolveEmailRecipient(chatIdInput: number, nameInput: string): SavedEmailRecipient | null {
-  return resolveEmailRecipientSelector(chatIdInput, nameInput)?.row ?? null;
+  return resolveEmailRecipientSelector(chatIdInput, nameInput);
 }
 
 function cleanDurableFactValue(raw: string): string {
@@ -1552,94 +1411,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function normalizeWorkspaceSelectorValue(raw: string): string {
-  return raw
-    .trim()
-    .replace(/^["'`]+|["'`]+$/g, "")
-    .replace(/^[\s:.,;!?¿¡-]+|[\s:.,;!?¿¡-]+$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractWorkspaceNameSelectorFromSegment(params: {
-  segment: string;
-  defaultScopePath?: string;
-  rawQuotedSegments?: string[];
-}): WorkspaceNameSelector | undefined {
-  const segment = params.segment.trim();
-  if (!segment) {
-    return undefined;
-  }
-  const normalized = normalizeIntentText(segment);
-  const hasEntryContext = /\b(archivo|archivos|file|files|documento|documentos|carpeta|carpetas|directorio|directorios|folder|folders)\b/.test(
-    normalized,
-  );
-  const defaultScope = normalizeWorkspaceRelativePath(params.defaultScopePath ?? "");
-
-  const fromMatch = (
-    regex: RegExp,
-    mode: WorkspaceNameSelectorMode,
-  ): WorkspaceNameSelector | undefined => {
-    const rawValue = segment.match(regex)?.[1] ?? "";
-    const value = normalizeWorkspaceSelectorValue(rawValue);
-    if (!value) {
-      return undefined;
-    }
-    return {
-      mode,
-      value,
-      ...(defaultScope ? { scopePath: defaultScope } : {}),
-    };
-  };
-
-  const starts =
-    fromMatch(/\b(?:que\s+)?(?:empiez\w*|arranqu\w*|inici\w*)\s+con\s+(.+)$/iu, "startsWith") ??
-    fromMatch(/\b(?:prefijo)\s+(.+)$/iu, "startsWith");
-  if (starts && (hasEntryContext || /\bque\s+/.test(normalized))) {
-    return starts;
-  }
-
-  const contains =
-    fromMatch(/\b(?:que\s+)?(?:conteng\w*|incluy\w*|teng\w*)\s+(.+)$/iu, "contains") ??
-    fromMatch(/\b(?:contiene(?:n)?|incluye(?:n)?)\s+(.+)$/iu, "contains");
-  if (contains && (hasEntryContext || /\bque\s+/.test(normalized))) {
-    return contains;
-  }
-
-  const exact =
-    fromMatch(/\b(?:que\s+)?(?:se\s+)?llam\w*\s+(.+)$/iu, "exact") ??
-    fromMatch(/\bnombre\s+(?:es|sea|igual\s+a)\s+(.+)$/iu, "exact");
-  if (exact && (hasEntryContext || /\bque\s+/.test(normalized) || /\bnombre\b/.test(normalized))) {
-    return exact;
-  }
-
-  const quoted = (params.rawQuotedSegments ?? []).map((item) => normalizeWorkspaceSelectorValue(item)).filter(Boolean);
-  if (quoted.length === 0 || !hasEntryContext) {
-    return undefined;
-  }
-  if (/\b(empiez\w*|arranqu\w*|inici\w*)\b/.test(normalized)) {
-    return {
-      mode: "startsWith",
-      value: quoted[0]!,
-      ...(defaultScope ? { scopePath: defaultScope } : {}),
-    };
-  }
-  if (/\b(conteng\w*|incluy\w*|contiene(?:n)?|incluye(?:n)?)\b/.test(normalized)) {
-    return {
-      mode: "contains",
-      value: quoted[0]!,
-      ...(defaultScope ? { scopePath: defaultScope } : {}),
-    };
-  }
-  if (/\b(llam\w*|nombre)\b/.test(normalized)) {
-    return {
-      mode: "exact",
-      value: quoted[0]!,
-      ...(defaultScope ? { scopePath: defaultScope } : {}),
-    };
-  }
-  return undefined;
-}
 
 function formatWorkspaceSelector(selector: WorkspaceNameSelector): string {
   const head =
@@ -2303,129 +2074,8 @@ function cleanWorkspacePathPhrase(raw: string): string {
   return normalizeWorkspaceRelativePath(normalized);
 }
 
-function isWorkspacePathPlaceholder(candidatePath: string): boolean {
-  const normalized = normalizeIntentText(candidatePath)
-    .replace(/[^\p{L}\p{N}\s/._-]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!normalized) {
-    return true;
-  }
-  return [
-    "archivo",
-    "archivos",
-    "carpeta",
-    "carpetas",
-    "directorio",
-    "directorios",
-    "folder",
-    "folders",
-    "ruta",
-    "path",
-    "workspace",
-  ].includes(normalized);
-}
-
-function extractWorkspaceDeletePathCandidate(text: string): string {
-  const original = text.trim();
-  if (!original) {
-    return "";
-  }
-  const normalizedOriginal = normalizeIntentText(original);
-  if (
-    /\b(?:que\s+)?(?:conteng\w*|incluy\w*|empiez\w*|arranqu\w*|inici\w*)\b/.test(normalizedOriginal) ||
-    /\b(?:se\s+)?llam\w*\b/.test(normalizedOriginal)
-  ) {
-    return "";
-  }
-
-  const quoted = extractQuotedSegments(original)
-    .map((item) => normalizeWorkspaceRelativePath(item))
-    .filter(Boolean);
-  if (quoted.length > 0) {
-    const candidate = quoted[0]!;
-    return isWorkspacePathPlaceholder(candidate) ? "" : candidate;
-  }
-
-  const explicitWorkspacePath = normalizeWorkspaceRelativePath(
-    original.match(/\bworkspace\/([^\s"'`]+)/i)?.[1] ?? "",
-  );
-  if (explicitWorkspacePath && !isWorkspacePathPlaceholder(explicitWorkspacePath)) {
-    return explicitWorkspacePath;
-  }
-
-  const rawLooksLikeDirectPath =
-    !/\s/.test(original) || /^\.{0,2}\//.test(original) || /^workspace\//i.test(original);
-  const normalizedRawPath = rawLooksLikeDirectPath ? normalizeWorkspaceRelativePath(original) : "";
-  if (normalizedRawPath && !isWorkspacePathPlaceholder(normalizedRawPath)) {
-    return normalizedRawPath;
-  }
-
-  const candidate = cleanWorkspacePathPhrase(original);
-  if (!candidate || isWorkspacePathPlaceholder(candidate)) {
-    return "";
-  }
-  if (!candidate.includes("/") && /\s/.test(candidate)) {
-    return "";
-  }
-  return candidate;
-}
-
-function extractWorkspaceDeleteExtensions(text: string): string[] {
-  const matched = text.match(/\.[a-z0-9]{1,12}\b/gi) ?? [];
-  return Array.from(
-    new Set(
-      matched
-        .map((item) => item.trim().toLowerCase())
-        .map((item) => item.replace(/[^.a-z0-9]/g, ""))
-        .filter((item) => /^\.[a-z0-9]{1,12}$/.test(item)),
-    ),
-  );
-}
-
-function extractWorkspaceDeleteContentsPath(text: string): string {
-  const original = text.trim();
-  if (!original) {
-    return "";
-  }
-  const candidate =
-    original.match(
-      /\b(?:todo(?:s)?(?:\s+el)?\s+contenido|todo\s+lo\s+que\s+hay|todo(?:s)?\s+los?\s+archivos)\s+(?:de|en)\s+(?:la\s+|el\s+)?(?:carpeta|directorio|folder)\s+(.+)$/i,
-    )?.[1] ??
-    "";
-  if (!candidate) {
-    return "";
-  }
-  return cleanWorkspacePathPhrase(candidate);
-}
-
-function pickFirstNonEmpty(...values: Array<string | undefined | null>): string {
-  for (const value of values) {
-    if (typeof value !== "string") {
-      continue;
-    }
-    const trimmed = value.trim();
-    if (trimmed) {
-      return trimmed;
-    }
-  }
-  return "";
-}
-
 function parseWorkspaceFileIndexReference(text: string): number | null {
-  const normalized = normalizeIntentText(text);
-  const indexRaw =
-    normalized.match(/\b(?:archivo|file|documento|doc|imagen|foto)\s*(?:numero|nro|#)\s*(\d{1,3})\b/)?.[1] ??
-    normalized.match(/\b(?:archivo|file|documento|doc|imagen|foto)\s+(\d{1,3})\b/)?.[1] ??
-    normalized.match(/\b(?:numero|nro|#)\s*(\d{1,3})\b/)?.[1];
-  if (!indexRaw) {
-    return null;
-  }
-  const parsed = Number.parseInt(indexRaw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return null;
-  }
-  return parsed;
+  return parseWorkspaceFileIndexReferenceDomain(text, normalizeIntentText);
 }
 
 function isSimpleTextFilePath(relativeInput: string): boolean {
@@ -2438,50 +2088,7 @@ function isSimpleTextFilePath(relativeInput: string): boolean {
 }
 
 function detectSimpleTextExtensionHint(text: string): string | undefined {
-  const normalized = normalizeIntentText(text);
-  if (/\bjsonl\b/.test(normalized)) {
-    return ".jsonl";
-  }
-  if (/\bcsv\b/.test(normalized)) {
-    return ".csv";
-  }
-  if (/\btsv\b/.test(normalized)) {
-    return ".tsv";
-  }
-  if (/\bjson\b/.test(normalized)) {
-    return ".json";
-  }
-  if (/\btxt\b/.test(normalized)) {
-    return ".txt";
-  }
-  if (/\bmarkdown\b|\bmd\b/.test(normalized)) {
-    return ".md";
-  }
-  if (/\byaml\b|\byml\b/.test(normalized)) {
-    return ".yml";
-  }
-  if (/\bxml\b/.test(normalized)) {
-    return ".xml";
-  }
-  if (/\bhtml\b/.test(normalized)) {
-    return ".html";
-  }
-  if (/\bhtm\b/.test(normalized)) {
-    return ".htm";
-  }
-  if (/\bcss\b/.test(normalized)) {
-    return ".css";
-  }
-  if (/\bjavascript\b|\bjs\b/.test(normalized)) {
-    return ".js";
-  }
-  if (/\bini\b/.test(normalized)) {
-    return ".ini";
-  }
-  if (/\blog\b/.test(normalized)) {
-    return ".log";
-  }
-  return undefined;
+  return detectSimpleTextExtensionHintDomain(text, normalizeIntentText);
 }
 
 function resolveWorkspaceWritePathWithHint(rawPath: string, extensionHint?: string): string {
@@ -2587,35 +2194,6 @@ function generateRandomInt(minInclusive: number, maxInclusive: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-function decodeEscapedInlineText(raw: string): string {
-  return raw
-    .replace(/\\r\\n/g, "\n")
-    .replace(/\\n/g, "\n")
-    .replace(/\\t/g, "\t");
-}
-
-function formatNaturalInlineBulletList(raw: string): string {
-  const decoded = decodeEscapedInlineText(raw).trim();
-  if (!decoded) {
-    return decoded;
-  }
-
-  // If user writes "-item1 -item2 -item3" in one line, normalize to multi-line bullets.
-  if (!decoded.includes("\n")) {
-    const bulletMatches = decoded.match(/(^|\s)-\s*\S/g) ?? [];
-    if (bulletMatches.length >= 2 || decoded.startsWith("-")) {
-      const normalized = decoded
-        .replace(/\s+-\s*/g, "\n- ")
-        .replace(/^\s*-\s*/, "- ")
-        .replace(/\n{2,}/g, "\n")
-        .trim();
-      return normalized.endsWith("\n") ? normalized : `${normalized}\n`;
-    }
-  }
-
-  return decoded;
-}
-
 function extractSimpleFilePathCandidate(text: string): string {
   const pattern =
     /(?:^|[\s"'`(])(?:workspace\/)?([^\s"'`()]+(?:\.[a-z0-9]{2,8}))(?:$|[\s"'`),.;!?])/gi;
@@ -2637,169 +2215,26 @@ function extractSimpleFilePathCandidate(text: string): string {
 }
 
 function looksLikeWorkspacePathCandidate(raw: string): boolean {
-  const normalized = normalizeWorkspaceRelativePath(raw);
-  if (!normalized) {
-    return false;
-  }
-  return normalized.includes("/") || /\.[a-z0-9]{2,8}$/i.test(normalized);
-}
-
-function extractNaturalWorkspaceWriteContent(params: {
-  text: string;
-  rawQuotedSegments: string[];
-  selectedPath?: string;
-}): string | undefined {
-  const text = params.text.trim();
-  if (!text) {
-    return undefined;
-  }
-
-  const selectedPath = normalizeWorkspaceRelativePath(params.selectedPath ?? "");
-  const quoted = params.rawQuotedSegments.map((item) => item.trim()).filter(Boolean);
-  if (quoted.length >= 2) {
-    const firstAsPath = normalizeWorkspaceRelativePath(quoted[0] ?? "");
-    if (selectedPath && firstAsPath === selectedPath) {
-      return decodeEscapedInlineText(quoted[1] ?? "");
-    }
-    return decodeEscapedInlineText(quoted.slice(1).join(" "));
-  }
-
-  if (quoted.length === 1) {
-    const firstAsPath = normalizeWorkspaceRelativePath(quoted[0] ?? "");
-    if (!selectedPath || firstAsPath !== selectedPath) {
-      return decodeEscapedInlineText(quoted[0] ?? "");
-    }
-  }
-
-  const contentMatch = text.match(
-    /\b(?:con(?:tenido)?|contenido|texto|body|data|datos)\s*(?::|=)\s*([\s\S]+)$/i,
-  );
-  if (contentMatch?.[1]) {
-    return formatNaturalInlineBulletList(contentMatch[1].trim());
-  }
-
-  const containMatch = text.match(/\b(?:que\s+contenga|que\s+tenga|contenga|contener)\s+([\s\S]+)$/i);
-  if (containMatch?.[1]) {
-    return formatNaturalInlineBulletList(containMatch[1].trim());
-  }
-
-  const withMatch = text.match(/\bcon\s+([\s\S]+)$/i);
-  if (withMatch?.[1]) {
-    const candidate = withMatch[1]
-      .replace(/^(?:el|la|los|las)\s+/i, "")
-      .replace(/^(?:n[uú]mero|numero)\s+/i, "")
-      .trim();
-    if (candidate) {
-      return formatNaturalInlineBulletList(candidate);
-    }
-  }
-
-  const drawMatch = text.match(
-    /\b(?:dibuj\w*|traz\w*)\s+([\s\S]+?)(?:\s+(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?(?:archivo|documento|file)\b[\s\S]*)?$/i,
-  );
-  if (drawMatch?.[1]) {
-    const candidate = drawMatch[1].trim();
-    if (candidate) {
-      return formatNaturalInlineBulletList(candidate);
-    }
-  }
-
-  const jsonStart = text.indexOf("{");
-  const jsonEnd = text.lastIndexOf("}");
-  if (jsonStart >= 0 && jsonEnd > jsonStart) {
-    return text.slice(jsonStart, jsonEnd + 1).trim();
-  }
-
-  return undefined;
+  return looksLikeWorkspacePathCandidateDomain(raw, normalizeWorkspaceRelativePath);
 }
 
 function resolveWorkspacePath(relativeInput?: string): { fullPath: string; relPath: string } {
-  const base = path.resolve(config.workspaceDir);
-  const normalized = normalizeWorkspaceRelativePath(relativeInput ?? "");
-  const fullPath = path.resolve(base, normalized);
-  if (fullPath !== base && !fullPath.startsWith(`${base}${path.sep}`)) {
-    throw new Error("Ruta fuera de workspace");
-  }
-  const relInside = path.relative(base, fullPath).replace(/\\/g, "/");
-  const relPath = relInside ? `workspace/${relInside}` : "workspace";
-  return { fullPath, relPath };
+  return workspaceFiles.resolveWorkspacePath(relativeInput);
 }
 
 async function listWorkspaceDirectory(relativeInput?: string): Promise<{
   relPath: string;
   entries: Array<{ name: string; kind: "dir" | "file" | "link" | "other"; size?: number }>;
 }> {
-  const resolved = resolveWorkspacePath(relativeInput);
-  const stat = await fs.stat(resolved.fullPath);
-  if (!stat.isDirectory()) {
-    throw new Error(`No es una carpeta: ${resolved.relPath}`);
-  }
-
-  const dirents = await fs.readdir(resolved.fullPath, { withFileTypes: true });
-  const sorted = [...dirents].sort((a, b) => {
-    if (a.isDirectory() && !b.isDirectory()) {
-      return -1;
-    }
-    if (!a.isDirectory() && b.isDirectory()) {
-      return 1;
-    }
-    return a.name.localeCompare(b.name, "es");
-  });
-
-  const entries: Array<{ name: string; kind: "dir" | "file" | "link" | "other"; size?: number }> = [];
-  for (const entry of sorted.slice(0, 200)) {
-    const full = path.join(resolved.fullPath, entry.name);
-    if (entry.isDirectory()) {
-      entries.push({ name: entry.name, kind: "dir" });
-      continue;
-    }
-    if (entry.isSymbolicLink()) {
-      entries.push({ name: entry.name, kind: "link" });
-      continue;
-    }
-    if (entry.isFile()) {
-      let size: number | undefined;
-      try {
-        const fileStat = await fs.stat(full);
-        size = fileStat.size;
-      } catch {
-        size = undefined;
-      }
-      entries.push({ name: entry.name, kind: "file", ...(typeof size === "number" ? { size } : {}) });
-      continue;
-    }
-    entries.push({ name: entry.name, kind: "other" });
-  }
-
-  return {
-    relPath: resolved.relPath,
-    entries,
-  };
+  return workspaceFiles.listWorkspaceDirectory(relativeInput);
 }
 
 function formatWorkspaceEntries(entries: Array<{ name: string; kind: "dir" | "file" | "link" | "other"; size?: number }>): string[] {
-  return entries.map((entry, index) => {
-    if (entry.kind === "dir") {
-      return `${index + 1}. [DIR] ${entry.name}/`;
-    }
-    if (entry.kind === "link") {
-      return `${index + 1}. [LINK] ${entry.name}`;
-    }
-    if (entry.kind === "file") {
-      return `${index + 1}. [FILE] ${entry.name}${typeof entry.size === "number" ? ` (${formatBytes(entry.size)})` : ""}`;
-    }
-    return `${index + 1}. [OTHER] ${entry.name}`;
-  });
+  return workspaceFiles.formatWorkspaceEntries(entries);
 }
 
 async function createWorkspaceDirectory(relativeInput: string): Promise<{ relPath: string }> {
-  const normalized = normalizeWorkspaceRelativePath(relativeInput);
-  if (!normalized) {
-    throw new Error("Falta ruta de carpeta");
-  }
-  const resolved = resolveWorkspacePath(normalized);
-  await fs.mkdir(resolved.fullPath, { recursive: true });
-  return { relPath: resolved.relPath };
+  return workspaceFiles.createWorkspaceDirectory(relativeInput);
 }
 
 async function writeWorkspaceTextFile(params: {
@@ -2808,375 +2243,35 @@ async function writeWorkspaceTextFile(params: {
   overwrite?: boolean;
   append?: boolean;
 }): Promise<{ relPath: string; size: number; created: boolean }> {
-  const normalized = normalizeWorkspaceRelativePath(params.relativePath);
-  if (!normalized) {
-    throw new Error("Indica una ruta de archivo dentro de workspace");
-  }
-  if (!isSimpleTextFilePath(normalized)) {
-    throw new Error(
-      `Formato no permitido. Usa uno de: ${[...SIMPLE_TEXT_FILE_EXTENSIONS].join(", ")}`,
-    );
-  }
-
-  const resolved = resolveWorkspacePath(normalized);
-  const append = Boolean(params.append);
-  const overwrite = append ? true : Boolean(params.overwrite);
-  const defaultExt = path.extname(normalized).toLowerCase();
-  const defaultContent = defaultExt === ".json" ? "{}\n" : "";
-  const content = typeof params.content === "string" ? params.content : defaultContent;
-
-  let existed = false;
-  try {
-    const stat = await fs.stat(resolved.fullPath);
-    existed = stat.isFile();
-    if (stat.isDirectory()) {
-      throw new Error(`Ya existe una carpeta en esa ruta: ${resolved.relPath}`);
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  if (existed && !overwrite) {
-    throw new Error(`El archivo ya existe: ${resolved.relPath}. Usa /workspace write para sobrescribir.`);
-  }
-
-  await fs.mkdir(path.dirname(resolved.fullPath), { recursive: true });
-  await fs.writeFile(resolved.fullPath, content, {
-    encoding: "utf8",
-    flag: append ? "a" : overwrite ? "w" : "wx",
-  });
-  const stat = await fs.stat(resolved.fullPath);
-  return {
-    relPath: resolved.relPath,
-    size: stat.size,
-    created: !existed,
-  };
+  return workspaceFiles.writeWorkspaceTextFile(params);
 }
 
 async function moveWorkspacePath(sourceInput: string, targetInput: string): Promise<{ from: string; to: string }> {
-  const sourceNormalized = normalizeWorkspaceRelativePath(sourceInput);
-  const targetNormalized = normalizeWorkspaceRelativePath(targetInput);
-  if (!sourceNormalized || !targetNormalized) {
-    throw new Error("Faltan ruta origen o destino");
-  }
-
-  const source = resolveWorkspacePath(sourceNormalized);
-  const target = resolveWorkspacePath(targetNormalized);
-  if (source.fullPath === target.fullPath) {
-    throw new Error("Origen y destino son iguales");
-  }
-
-  let sourceStat;
-  try {
-    sourceStat = await fs.stat(source.fullPath);
-  } catch {
-    throw new Error(`No existe origen: ${source.relPath}`);
-  }
-
-  if (sourceStat.isDirectory() && target.fullPath.startsWith(`${source.fullPath}${path.sep}`)) {
-    throw new Error("No puedes mover una carpeta dentro de sí misma");
-  }
-
-  if (await safePathExists(target.fullPath)) {
-    throw new Error(`El destino ya existe: ${target.relPath}`);
-  }
-
-  await fs.mkdir(path.dirname(target.fullPath), { recursive: true });
-  await fs.rename(source.fullPath, target.fullPath);
-  const targetExists = await safePathExists(target.fullPath);
-  const sourceStillExists = await safePathExists(source.fullPath);
-  if (!targetExists || sourceStillExists) {
-    throw new Error(
-      `Movimiento no verificado: origen=${source.relPath} (${sourceStillExists ? "aun existe" : "ok"}) destino=${target.relPath} (${targetExists ? "ok" : "faltante"})`,
-    );
-  }
-  return {
-    from: source.relPath,
-    to: target.relPath,
-  };
+  return workspaceFiles.moveWorkspacePath(sourceInput, targetInput);
 }
 
 async function deleteWorkspacePath(relativeInput: string): Promise<{ relPath: string; kind: "dir" | "file" | "other" }> {
-  const normalized = normalizeWorkspaceRelativePath(relativeInput);
-  if (!normalized) {
-    throw new Error("Indica una ruta dentro de workspace");
-  }
-  const resolved = resolveWorkspacePath(normalized);
-  if (resolved.relPath === "workspace") {
-    throw new Error("No se permite eliminar la carpeta raíz workspace");
-  }
-
-  let stat: Awaited<ReturnType<typeof fs.stat>>;
-  try {
-    stat = await fs.stat(resolved.fullPath);
-  } catch {
-    throw new Error(`No existe: ${resolved.relPath}`);
-  }
-
-  const kind: "dir" | "file" | "other" = stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
-  await fs.rm(resolved.fullPath, { recursive: true, force: false });
-  if (await safePathExists(resolved.fullPath)) {
-    throw new Error(`Eliminación no confirmada: ${resolved.relPath} sigue existiendo`);
-  }
-  return { relPath: resolved.relPath, kind };
+  return workspaceFiles.deleteWorkspacePath(relativeInput);
 }
 
 function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
-  const original = text.trim();
-  if (!original) {
-    return { shouldHandle: false };
-  }
-  const normalized = normalizeIntentText(original);
-  const hasWorkspaceWord = /\bworkspace\b/.test(normalized);
-  const hasFileWord = /\b(archivo|archivos|documento|documentos|carpeta|carpetas|directorio|directorios|folder|folders)\b/.test(
-    normalized,
-  );
-  const rawQuotedSegments = extractQuotedSegments(original);
-  const quoted = rawQuotedSegments.map((item) => normalizeWorkspaceRelativePath(item)).filter(Boolean);
-  const explicitWorkspacePath = normalizeWorkspaceRelativePath(original.match(/\bworkspace\/([^\s"'`]+)/i)?.[1] ?? "");
-  const fromFolderPhrase = cleanWorkspacePathPhrase(
-    original.match(/\b(?:carpeta|directorio|folder)\s+(.+)$/i)?.[1] ??
-      original.match(/\b(?:en|dentro(?:\s+de)?|de)\s+(.+)$/i)?.[1] ??
-      "",
-  );
-  const fromFilePhrase = cleanWorkspacePathPhrase(
-    original.match(
-      /\b(?:archivo|archivos|documento|documentos|file|files|txt|csv|json|jsonl|md|yaml|yml|xml|html|htm|css|js|ini|log)\s+(?:llamado|de nombre)?\s*(.+)$/i,
-    )?.[1] ?? "",
-  );
-  const explicitNamedPath = cleanWorkspacePathPhrase(
-    original.match(/\b(?:llamado|llamada|de nombre|nombre|(?:se\s+)?llam(?:e|ado|ada)?)\s+([^\s"'`]+)\b/i)?.[1] ?? "",
-  );
-  const fileLikePath = extractSimpleFilePathCandidate(original);
-  const hasCreateVerb =
-    /\b(crea|crear|creame|creame|nuevo|nueva|nuevos|nuevas|genera|generar|generame|arma|armar|haz|hace|hacer)\b/.test(
-      normalized,
-    );
-  const hasWriteVerb = /\b(escrib\w*|guard\w*|redact\w*|arm\w*)\b/.test(normalized);
-  const hasEditVerb = /\b(edit\w*|modific\w*|actualiz\w*|complet\w*|agreg\w*|anex\w*|append|insert\w*)\b/.test(
-    normalized,
-  );
-  const hasDrawVerb = /\b(dibuj\w*|traz\w*|ascii|ascci)\b/.test(normalized);
-  const hasCopyMessageToFileCue =
-    /\b(copia|copiar|copiame|copiá|copia)\b/.test(normalized) &&
-    /\b(mensaje|correo|mail|email)\b/.test(normalized) &&
-    /\b(archivo|txt|csv|json|md|log)\b/.test(normalized);
-  const hasCopyVerb = /\b(copi[\p{L}\d_]*|duplic[\p{L}\d_]*|clon[\p{L}\d_]*)\b/iu.test(normalized);
-  const hasPasteVerb = /\b(peg[\p{L}\d_]*|paste)\b/iu.test(normalized);
-  const hasSimpleFileKeyword = /\b(txt|csv|json|jsonl|md|yaml|yml|xml|html|htm|css|js|ini|log)\b/.test(normalized);
-  const hasFolderWord = /\b(carpeta|directorio|folder)\b/.test(normalized);
-  const hasDeleteVerb = /\b(elimin[\p{L}\d_]*|borr[\p{L}\d_]*|quit[\p{L}\d_]*|suprim[\p{L}\d_]*|remove|delete)\b/iu.test(
-    normalized,
-  );
-  const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
-  const hasSendVerb = /\b(envi[\p{L}\d_]*|mand[\p{L}\d_]*|pas[\p{L}\d_]*|compart[\p{L}\d_]*|adjunt[\p{L}\d_]*|sub[\p{L}\d_]*)\b/iu.test(
-    normalized,
-  );
-  const hasSendNoun = /\b(archivo|archivos|documento|documentos|file|files|pdf|imagen|imagenes|foto|fotos)\b/.test(
-    normalized,
-  );
-  const hasFileLikeToken = /\b[\w./\\-]+\.[a-z0-9]{2,8}\b/i.test(original);
-  const defaultSelectorScope = pickFirstNonEmpty(explicitWorkspacePath, fromFolderPhrase);
-  const hasWorkspaceFileContext =
-    hasWorkspaceWord || hasFileWord || hasFileLikeToken || quoted.length > 0 || Boolean(explicitWorkspacePath);
-  const deletePhraseMatch = original.match(
-    /\b(?:elimin[\p{L}\d_]*|borr[\p{L}\d_]*|quit[\p{L}\d_]*|suprim[\p{L}\d_]*|delete|remove)\s+(.+)$/iu,
-  );
-  const deletePhrase = deletePhraseMatch?.[1] ?? "";
-  const deletePathCandidate = extractWorkspaceDeletePathCandidate(deletePhrase);
-  const deleteExtensions = extractWorkspaceDeleteExtensions(deletePhrase || original);
-  const deleteContentsOfPath = extractWorkspaceDeleteContentsPath(deletePhrase || original);
-
-  if (
-    hasDeleteVerb &&
-    (hasWorkspaceWord ||
-      hasFileWord ||
-      hasFileLikeToken ||
-      Boolean(fileLikePath) ||
-      Boolean(explicitWorkspacePath) ||
-      quoted.length > 0 ||
-      /\bl[oa]s?\b/.test(normalized) ||
-      Boolean(deletePathCandidate))
-  ) {
-    if (deleteContentsOfPath) {
-      return {
-        shouldHandle: true,
-        action: "delete",
-        deleteContentsOfPath,
-      };
-    }
-
-    if (deleteExtensions.length > 0) {
-      return {
-        shouldHandle: true,
-        action: "delete",
-        deleteExtensions,
-        ...(defaultSelectorScope ? { path: defaultSelectorScope } : {}),
-      };
-    }
-
-    const selector = extractWorkspaceNameSelectorFromSegment({
-      segment: deletePhrase || original,
-      defaultScopePath: defaultSelectorScope,
-      rawQuotedSegments,
-    });
-    const targetPath = pickFirstNonEmpty(quoted[0], explicitWorkspacePath, deletePathCandidate);
-    return {
-      shouldHandle: true,
-      action: "delete",
-      ...(targetPath ? { path: targetPath } : {}),
-      ...(selector ? { selector } : {}),
-    };
-  }
-
-  const renameIntent =
-    /\b(renombr\w*|rename)\b/.test(normalized) ||
-    (/\b(cambi\w*)\b/.test(normalized) && /\b(nombre)\b/.test(normalized)) ||
-    /\b(cambi\w*)\s+([^\s"'`]+)\s+(?:a|por|como)\s+([^\s"'`]+)/.test(normalized);
-  if (renameIntent) {
-    const phraseMatch =
-      original.match(/\b(?:renombr\w*|rename|cambi\w*\s+nombre(?:\s+de)?|cambi\w*)\s+(.+?)\s+(?:a|por|como)\s+(.+)$/i) ??
-      null;
-    const sourcePath = quoted[0] ?? cleanWorkspacePathPhrase(phraseMatch?.[1] ?? "");
-    const targetPath = quoted[1] ?? cleanWorkspacePathPhrase(phraseMatch?.[2] ?? "");
-    return {
-      shouldHandle: true,
-      action: "rename",
-      ...(sourcePath ? { sourcePath } : {}),
-      ...(targetPath ? { targetPath } : {}),
-    };
-  }
-
-  const moveIntent = /\b(mov\w*|traslad\w*|move)\b/.test(normalized);
-  if (moveIntent) {
-    const phraseMatch = original.match(/\b(?:mov\w*|traslad\w*|move)\s+(.+?)\s+(?:a|hacia)\s+(.+)$/i);
-    const sourceSegment = phraseMatch?.[1] ?? "";
-    const selector = extractWorkspaceNameSelectorFromSegment({
-      segment: sourceSegment || original,
-      defaultScopePath: defaultSelectorScope,
-      rawQuotedSegments,
-    });
-    const sourcePath = quoted[0] ?? cleanWorkspacePathPhrase(sourceSegment);
-    const targetPath = quoted[1] ?? cleanWorkspacePathPhrase(phraseMatch?.[2] ?? "");
-    return {
-      shouldHandle: true,
-      action: "move",
-      ...(sourcePath ? { sourcePath } : {}),
-      ...(targetPath ? { targetPath } : {}),
-      ...(selector ? { selector } : {}),
-    };
-  }
-
-  const hasRenameOrMoveVerb = renameIntent || moveIntent;
-  const writeIntent =
-    ((hasCreateVerb || hasWriteVerb || hasEditVerb || hasDrawVerb) &&
-      !hasFolderWord &&
-      !hasRenameOrMoveVerb &&
-      (hasFileWord || hasSimpleFileKeyword || Boolean(fileLikePath))) ||
-    ((hasCreateVerb || hasEditVerb || hasDrawVerb) && Boolean(fileLikePath)) ||
-    (hasCopyMessageToFileCue && Boolean(fileLikePath));
-  if (writeIntent) {
-    const formatHint = detectSimpleTextExtensionHint(original);
-    const rawTargetPath = pickFirstNonEmpty(quoted[0], explicitWorkspacePath, explicitNamedPath, fileLikePath, fromFilePhrase);
-    const targetPath = resolveWorkspaceWritePathWithHint(rawTargetPath, formatHint);
-    const content = extractNaturalWorkspaceWriteContent({
-      text: original,
-      rawQuotedSegments,
-      selectedPath: targetPath,
-    });
-    const append =
-      /\b(al\s+final|append|anex\w*|agreg\w*)\b/.test(normalized) &&
-      !/\b(reemplaz\w*|sobrescrib\w*)\b/.test(normalized);
-    return {
-      shouldHandle: true,
-      action: "write",
-      ...(targetPath ? { path: targetPath } : {}),
-      ...(typeof content === "string" ? { content } : {}),
-      ...(append ? { append: true } : {}),
-      ...(formatHint ? { formatHint } : {}),
-    };
-  }
-
-  const listVerb =
-    /\b(lista\w*|mostr\w*|ver|revis\w*|explor\w*)\b/.test(normalized) ||
-    /\bcontenido\s+de\b/.test(normalized) ||
-    /\bver\s+contenido\b/.test(normalized) ||
-    /\bmostrar\s+contenido\b/.test(normalized) ||
-    normalized.includes("que hay") ||
-    normalized.includes("que tengo");
-  if (listVerb && (hasWorkspaceWord || hasFileWord)) {
-    const inferredPath = quoted[0] || explicitWorkspacePath || fromFolderPhrase;
-    return {
-      shouldHandle: true,
-      action: "list",
-      ...(inferredPath ? { path: inferredPath } : {}),
-    };
-  }
-
-  const mkdirIntent = hasCreateVerb && hasFolderWord;
-  if (mkdirIntent) {
-    const fromPhrase = original.match(/\b(?:carpeta|directorio|folder)\s+(?:llamada|de nombre)?\s*(.+)$/i)?.[1] ?? "";
-    const dirPath = quoted[0] ?? cleanWorkspacePathPhrase(fromPhrase);
-    return {
-      shouldHandle: true,
-      action: "mkdir",
-      ...(dirPath ? { path: dirPath } : {}),
-    };
-  }
-
-  if (hasCopyVerb) {
-    const phraseMatch = original.match(/\b(?:copi[\p{L}\d_]*|duplic[\p{L}\d_]*|clon[\p{L}\d_]*)\s+(.+?)(?:\s+(?:a|hacia)\s+(.+))?$/iu);
-    const sourceSegment = phraseMatch?.[1] ?? original;
-    const selector = extractWorkspaceNameSelectorFromSegment({
-      segment: sourceSegment,
-      defaultScopePath: defaultSelectorScope,
-      rawQuotedSegments,
-    });
-    const sourcePath = quoted[0] ?? cleanWorkspacePathPhrase(sourceSegment);
-    const targetPath = quoted[1] ?? cleanWorkspacePathPhrase(phraseMatch?.[2] ?? "");
-    const hasPathHints = looksLikeWorkspacePathCandidate(sourcePath) || looksLikeWorkspacePathCandidate(targetPath);
-    if (selector || hasWorkspaceFileContext || hasPathHints) {
-      return {
-        shouldHandle: true,
-        action: "copy",
-        ...(sourcePath ? { sourcePath } : {}),
-        ...(targetPath ? { targetPath } : {}),
-        ...(selector ? { selector } : {}),
-      };
-    }
-  }
-
-  if (hasPasteVerb && (hasWorkspaceFileContext || /\b(portapapeles|clipboard)\b/.test(normalized))) {
-    const phraseMatch = original.match(/\b(?:peg[\p{L}\d_]*|paste)\s+(?:en|a|hacia)?\s*(.+)$/iu);
-    const targetPath = quoted[0] ?? explicitWorkspacePath ?? cleanWorkspacePathPhrase(phraseMatch?.[1] ?? "");
-    return {
-      shouldHandle: true,
-      action: "paste",
-      ...(targetPath ? { targetPath } : {}),
-    };
-  }
-
-  if (
-    hasSendVerb &&
-    !hasMailContext &&
-    (hasSendNoun || hasFileLikeToken || hasWorkspaceWord || quoted.length > 0 || Boolean(explicitWorkspacePath))
-  ) {
-    const phraseMatch = original.match(
-      /\b(?:envi[\p{L}\d_]*|mand[\p{L}\d_]*|pas[\p{L}\d_]*|compart[\p{L}\d_]*|adjunt[\p{L}\d_]*|sub[\p{L}\d_]*)\s+(.+)$/iu,
-    );
-    const fileIndex = parseWorkspaceFileIndexReference(original) ?? undefined;
-    const targetPath = pickFirstNonEmpty(quoted[0], explicitWorkspacePath, cleanWorkspacePathPhrase(phraseMatch?.[1] ?? ""));
-    return {
-      shouldHandle: true,
-      action: "send",
-      ...(targetPath ? { path: targetPath } : {}),
-      ...(fileIndex ? { fileIndex } : {}),
-    };
-  }
-
-  return { shouldHandle: false };
+  return detectWorkspaceNaturalIntentDomain(text, {
+    normalizeIntentText,
+    extractQuotedSegments,
+    normalizeWorkspaceRelativePath,
+    cleanWorkspacePathPhrase,
+    extractSimpleFilePathCandidate,
+    extractWorkspaceDeletePathCandidate,
+    extractWorkspaceDeleteExtensions,
+    extractWorkspaceDeleteContentsPath,
+    extractWorkspaceNameSelectorFromSegment,
+    pickFirstNonEmpty,
+    detectSimpleTextExtensionHint,
+    resolveWorkspaceWritePathWithHint,
+    extractNaturalWorkspaceWriteContent,
+    looksLikeWorkspacePathCandidate,
+    parseWorkspaceFileIndexReference,
+  });
 }
 
 function extractFirstHttpUrl(text: string): string | null {
@@ -4658,6 +3753,21 @@ function stripScheduleTemporalPhrases(text: string): string {
     .trim();
 }
 
+function detectAgentVersionIntent(text: string): boolean {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) {
+    return false;
+  }
+  if (
+    /\b(que version|cual es tu version|decime tu version|dime tu version|version del agente|version de houdi|tu version)\b/.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  return /\b(version)\b/.test(normalized) && /\b(houdi|agente|bot|asistente)\b/.test(normalized);
+}
+
 function sanitizeScheduleTitle(raw: string): string {
   const cleaned = raw
     .replace(/^["'`]+|["'`]+$/g, "")
@@ -4993,204 +4103,46 @@ function extractQuotedSegments(text: string): string[] {
   return values;
 }
 
-function extractEmailAddresses(text: string): string[] {
-  const matches = text.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi) ?? [];
-  const deduped = new Set<string>();
-  for (const match of matches) {
-    deduped.add(match.trim().toLowerCase());
-  }
-  return [...deduped];
-}
-
-function extractRecipientNameFromText(text: string): string {
-  const quoted = extractQuotedSegments(text).map((item) => normalizeRecipientName(item)).filter(Boolean);
-  if (quoted.length > 0) {
-    const candidate = quoted[0] ?? "";
-    if (!candidate.includes("@")) {
-      return candidate;
-    }
-  }
-
-  const direct =
-    text.match(/\b(?:destinatari[oa]|contacto)\s+(?:llamad[oa]|de nombre)?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ .-]{0,40})/i)?.[1] ??
-    text.match(/\b(?:a|para)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ.-]{1,40})\b/i)?.[1] ??
-    "";
-
-  const cleaned = normalizeRecipientName(direct)
-    .replace(/[,:;.!?]+$/g, "")
-    .replace(/\b(correo|mail|email|gmail)\b/gi, "")
-    .trim();
-  const lower = normalizeIntentText(cleaned);
-  if (!cleaned || ["mi", "mí", "yo", "vos", "tu", "tú"].includes(lower)) {
-    return "";
-  }
-  return cleaned;
-}
-
 function detectGmailRecipientNaturalIntent(text: string): GmailRecipientNaturalIntent {
-  const original = text.trim();
-  if (!original) {
-    return { shouldHandle: false };
-  }
-  const normalized = normalizeIntentText(original);
-  const hasRecipientNoun = /\b(destinatari[oa]s?|contactos?|agenda\s+de\s+correo|agenda\s+de\s+email)\b/.test(normalized);
-  if (!hasRecipientNoun) {
-    return { shouldHandle: false };
-  }
-
-  const email = extractEmailAddresses(original)[0] ?? "";
-  const name = extractRecipientNameFromText(original);
-
-  if (/\b(lista|listar|mostra|mostrar|ver)\b/.test(normalized)) {
-    return { shouldHandle: true, action: "list" };
-  }
-  if (/\b(elimina|eliminar|borra|borrar|quita|quitar)\b/.test(normalized)) {
-    return { shouldHandle: true, action: "delete", ...(name ? { name } : {}) };
-  }
-  if (/\b(actualiza|actualizar|edita|editar|modifica|modificar|cambia|cambiar)\b/.test(normalized)) {
-    return {
-      shouldHandle: true,
-      action: "update",
-      ...(name ? { name } : {}),
-      ...(email ? { email } : {}),
-    };
-  }
-  if (/\b(agrega|agregar|anade|añade|crea|crear|guarda|guardar|registra|registrar)\b/.test(normalized)) {
-    return {
-      shouldHandle: true,
-      action: "add",
-      ...(name ? { name } : {}),
-      ...(email ? { email } : {}),
-    };
-  }
-
-  if (email && name) {
-    return { shouldHandle: true, action: "add", name, email };
-  }
-  return { shouldHandle: false };
-}
-
-function parseGmailLabeledFields(text: string): {
-  subject: string;
-  body: string;
-  cc: string;
-  bcc: string;
-  hasSubjectLabel: boolean;
-  hasBodyLabel: boolean;
-} {
-  const pattern = /\b(asunto|subject|titulo|title|cuerpo|mensaje|texto|body|cc|bcc)\s*[:=-]\s*/gi;
-  const entries: Array<{ key: string; value: string }> = [];
-  const matches: Array<{ key: string; labelIndex: number; valueStart: number }> = [];
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    const key = (match[1] ?? "").toLowerCase();
-    const valueStart = match.index + match[0].length;
-    matches.push({ key, labelIndex: match.index, valueStart });
-  }
-
-  for (let index = 0; index < matches.length; index += 1) {
-    const current = matches[index];
-    const next = matches[index + 1];
-    const valueEnd = next ? next.labelIndex : text.length;
-    const rawValue = text.slice(current.valueStart, Math.max(current.valueStart, valueEnd));
-    const value = rawValue.replace(/^[\s"'`-]+|[\s"'`]+$/g, "").trim();
-    if (!value) {
-      continue;
-    }
-    entries.push({ key: current.key, value });
-  }
-
-  const subjectValues = entries
-    .filter((entry) => ["asunto", "subject", "titulo", "title"].includes(entry.key))
-    .map((entry) => entry.value);
-  const bodyValues = entries
-    .filter((entry) => ["cuerpo", "mensaje", "texto", "body"].includes(entry.key))
-    .map((entry) => entry.value);
-  const ccValues = entries.filter((entry) => entry.key === "cc").map((entry) => entry.value);
-  const bccValues = entries.filter((entry) => entry.key === "bcc").map((entry) => entry.value);
-
-  return {
-    subject: subjectValues.join(" ").trim(),
-    body: bodyValues.join("\n\n").trim(),
-    cc: ccValues.join(", ").trim(),
-    bcc: bccValues.join(", ").trim(),
-    hasSubjectLabel: subjectValues.length > 0,
-    hasBodyLabel: bodyValues.length > 0,
-  };
-}
-
-function detectGmailDraftRequested(textNormalized: string, hasBodyLabel: boolean): boolean {
-  if (hasBodyLabel) {
-    return false;
-  }
-
-  if (
-    /\b(redacta|redactar|escribe|escribir|arma|armar|genera|generar|pensa|pensar|inventa|crear)\b/.test(
-      textNormalized,
-    ) &&
-    /\b(correo|mail|email|mensaje|asunto|cuerpo|texto)\b/.test(textNormalized)
-  ) {
-    return true;
-  }
-
-  if (
-    /\b(que\s+(?:lo\s+)?(?:piense|redacte|escriba|arme|genere)\s+(?:el\s+)?(?:agente|bot|houdi))\b/.test(
-      textNormalized,
-    ) ||
-    /\b(redactalo|armalo|escribilo)\s+vos\b/.test(textNormalized) ||
-    /\b(que\s+sea\s+tu\s+mensaje|a\s+tu\s+criterio)\b/.test(textNormalized)
-  ) {
-    return true;
-  }
-
-  return /\b(asunto\s+vinculado|listado\s+de\s+las?\s+ultimas?\s+noticias)\b/.test(textNormalized);
-}
-
-function extractLiteralBodyRequest(text: string): string {
-  const candidate =
-    text.match(/\bque\s+diga\s*(?::|=)?\s*(.+)$/i)?.[1]?.trim() ??
-    text.match(/\b(?:texto|mensaje|cuerpo)\s+(?:exacto|literal)\s*(?::|=)?\s*(.+)$/i)?.[1]?.trim() ??
-    "";
-  if (!candidate) {
-    return "";
-  }
-  const unquoted = candidate.replace(/^["'`]+|["'`]+$/g, "").trim();
-  return truncateInline(unquoted, 10_000);
-}
-
-function extractNaturalSubjectRequest(text: string): string {
-  const candidate =
-    text.match(/\b(?:el\s+)?(?:asunto|subject)\s*(?:ser[aá]|es|ser[ií]a)\s*[:=-]\s*(.+)$/i)?.[1]?.trim() ??
-    text.match(/\b(?:el\s+)?(?:asunto|subject)\s*(?:ser[aá]|es|ser[ií]a)\s+(.+)$/i)?.[1]?.trim() ??
-    "";
-  if (!candidate) {
-    return "";
-  }
-  const cleaned = candidate
-    .replace(/\b(?:cuerpo|mensaje|texto|body)\s*[:=-].*$/i, "")
-    .replace(/^["'`]+|["'`]+$/g, "")
-    .replace(/[.?!\s]+$/g, "")
-    .trim();
-  return truncateInline(cleaned, 200);
-}
-
-function detectCreativeEmailCue(textNormalized: string): boolean {
-  const creativeWord =
-    /\b(improvis\w*|alegre|creativ\w*|original|invent\w*|bonito|lindo|inspirador|poetico|poético)\b/.test(
-      textNormalized,
-    );
-  const askToWrite =
-    /\b(arma\w*|redact\w*|escrib\w*|genera\w*|crea\w*|que\s+contenga|a\s+tu\s+criterio|como\s+quieras)\b/.test(
-      textNormalized,
-    );
-  const songOrPoemRequest =
-    /\b(cancion|canción|poema|verso|letra)\b/.test(textNormalized) &&
-    /\b(sobre|de|con)\b/.test(textNormalized);
-  return (creativeWord && askToWrite) || songOrPoemRequest;
+  return detectGmailRecipientNaturalIntentDomain(text, {
+    normalizeIntentText,
+    extractQuotedSegments,
+    extractEmailAddresses,
+    extractRecipientNameFromText,
+    inferDefaultSelfEmailRecipient,
+    detectGmailAutoContentKind,
+    parseGmailLabeledFields,
+    extractLiteralBodyRequest,
+    extractNaturalSubjectRequest,
+    detectCreativeEmailCue,
+    detectGmailDraftRequested,
+    buildGmailDraftInstruction,
+    shouldAvoidLiteralBodyFallback,
+    parseNaturalLimit,
+    buildNaturalGmailQuery,
+    gmailAccountEmail: config.gmailAccountEmail,
+  });
 }
 
 function getRecentConversationContext(chatId: number, currentUserText: string, limit: number): string[] {
-  const turns = recentConversationByChat.get(chatId) ?? [];
+  let turns = recentConversationByChat.get(chatId) ?? [];
+  if (turns.length === 0) {
+    try {
+      const stored = sqliteState.listRecentConversationTurns(chatId, Math.max(limit + 6, 20));
+      if (stored.length > 0) {
+        turns = stored.map((turn) => ({
+          role: turn.role,
+          text: turn.text,
+          source: turn.source,
+          atMs: turn.atMs,
+        }));
+        recentConversationByChat.set(chatId, turns.slice(-RECENT_CONVERSATION_TURN_LIMIT));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logWarn(`No pude leer conversación reciente desde SQLite: ${message}`);
+    }
+  }
   if (turns.length === 0) {
     return [];
   }
@@ -5232,263 +4184,47 @@ function buildIntentRouterContextFilter(params: {
   hasMailContext: boolean;
   hasMemoryRecallCue: boolean;
 }): IntentRouterFilterDecision | null {
-  const normalized = normalizeIntentText(params.text);
-  if (!normalized) {
-    return null;
-  }
-
-  const reasons: string[] = [];
-  let allowed = uniqueRouteCandidates(params.candidates);
-  const now = Date.now();
-
-  const pendingDelete = pendingWorkspaceDeleteByChat.get(params.chatId);
-  if (pendingDelete && pendingDelete.expiresAtMs > now) {
-    allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
-    reasons.push("pending-workspace-delete");
-  }
-  const pendingDeletePath = pendingWorkspaceDeletePathByChat.get(params.chatId);
-  if (pendingDeletePath && pendingDeletePath.expiresAtMs > now) {
-    allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
-    reasons.push("pending-workspace-delete-path");
-  }
-
-  const indexedListIntent = parseIndexedListReferenceIntent(params.text);
-  const listContext = getIndexedListContext(params.chatId);
-  const ordinalReference =
-    /\b(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta|ultimo|ultima|penultimo|penultima|anterior)\b/.test(
-      normalized,
-    ) || /\b\d{1,3}\b/.test(normalized);
-  const likelyListReference = indexedListIntent.shouldHandle || ordinalReference;
-  if (listContext && likelyListReference) {
-    if (listContext.kind === "gmail-list") {
-      allowed = narrowRouteCandidates(allowed, ["gmail", "gmail-recipients"]);
-      reasons.push("indexed-list:gmail");
-    } else if (listContext.kind === "web-results") {
-      allowed = narrowRouteCandidates(allowed, ["web"]);
-      reasons.push("indexed-list:web");
-    } else if (listContext.kind === "workspace-list" || listContext.kind === "stored-files") {
-      allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
-      reasons.push("indexed-list:workspace");
-    }
-  }
-
-  const isShortFollowUp = normalized.length <= 120;
-  const followUpPronouns = /\b(ese|esa|eso|este|esta|esto|lo|la|el|ultimo|ultima|anterior)\b/.test(normalized);
-  if (isShortFollowUp && followUpPronouns) {
-    if ((lastGmailResultsByChat.get(params.chatId)?.length ?? 0) > 0 && !/\b(archivo|carpeta|workspace|pdf|documento)\b/.test(normalized)) {
-      allowed = narrowRouteCandidates(allowed, ["gmail", "gmail-recipients"]);
-      reasons.push("recent-gmail-followup");
-    }
-    if ((lastListedFilesByChat.get(params.chatId)?.length ?? 0) > 0 && /\b(archivo|carpeta|workspace|documento|pdf|txt|csv|json|md|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized)) {
-      allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
-      reasons.push("recent-workspace-followup");
-    }
-  }
-
-  const hasRecentConnectorContext = (lastConnectorContextByChat.get(params.chatId) ?? 0) + CONNECTOR_CONTEXT_TTL_MS > now;
-  const connectorControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
-    normalized,
+  const decision = buildIntentRouterContextFilterDomain(
+    {
+      ...params,
+      candidates: params.candidates,
+    },
+    {
+      normalizeIntentText,
+      parseIndexedListReferenceIntent,
+      getIndexedListContext,
+      getPendingWorkspaceDelete: (chatId) => pendingWorkspaceDeleteByChat.get(chatId) ?? null,
+      getPendingWorkspaceDeletePath: (chatId) => pendingWorkspaceDeletePathByChat.get(chatId) ?? null,
+      getLastGmailResultsCount: (chatId) => lastGmailResultsByChat.get(chatId)?.length ?? 0,
+      getLastListedFilesCount: (chatId) => lastListedFilesByChat.get(chatId)?.length ?? 0,
+      getLastConnectorContextAt: (chatId) => lastConnectorContextByChat.get(chatId) ?? 0,
+      connectorContextTtlMs: CONNECTOR_CONTEXT_TTL_MS,
+    },
   );
-  const explicitLimCue = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
-  const mentionsOtherDomain = /\b(gmail|correo|email|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(normalized);
-  if (hasRecentConnectorContext && explicitLimCue && connectorControlVerb && !mentionsOtherDomain) {
-    allowed = narrowRouteCandidates(allowed, ["connector"]);
-    reasons.push("recent-connector-context");
-  }
-
-  if (params.hasMailContext && !params.hasMemoryRecallCue) {
-    allowed = narrowRouteCandidates(allowed, ["gmail", "gmail-recipients"]);
-    reasons.push("mail-lexical-cue");
-  } else if (params.hasMemoryRecallCue) {
-    allowed = narrowRouteCandidates(allowed, ["memory", "stoic-smalltalk"]);
-    reasons.push("memory-recall-cue");
-  }
-
-  const base = uniqueRouteCandidates(params.candidates);
-  const changed = allowed.length !== base.length || allowed.some((item, index) => item !== base[index]);
-  if (!changed) {
+  if (!decision) {
     return null;
   }
   return {
-    allowed,
-    reason: reasons.join(", "),
+    allowed: decision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
+    reason: decision.reason,
   };
 }
 
-function quantile(values: number[], q: number): number {
-  if (values.length === 0) {
-    return 0;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const pos = Math.max(0, Math.min(sorted.length - 1, (sorted.length - 1) * q));
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  const left = sorted[base] ?? sorted[0]!;
-  const right = sorted[Math.min(sorted.length - 1, base + 1)] ?? left;
-  return left + (right - left) * rest;
-}
-
-function suggestIntentThreshold(params: {
-  current: number;
-  truePositiveScores: number[];
-  falsePositiveScores: number[];
-}): number | null {
-  if (params.truePositiveScores.length < 8) {
-    return null;
-  }
-  const lowTruePositive = quantile(params.truePositiveScores, 0.2);
-  if (params.falsePositiveScores.length < 5) {
-    const conservative = Math.max(params.current, lowTruePositive - 0.01);
-    const rounded = Number(Math.max(0.05, Math.min(0.95, conservative)).toFixed(3));
-    return Math.abs(rounded - params.current) >= 0.01 ? rounded : null;
-  }
-
-  const highFalsePositive = quantile(params.falsePositiveScores, 0.8);
-  const candidate =
-    highFalsePositive < lowTruePositive
-      ? (highFalsePositive + lowTruePositive) / 2
-      : lowTruePositive - 0.01;
-  const rounded = Number(Math.max(0.05, Math.min(0.95, candidate)).toFixed(3));
-  return Math.abs(rounded - params.current) >= 0.01 ? rounded : null;
-}
-
 async function appendIntentRouterDatasetEntry(entry: IntentRouterDatasetEntry): Promise<void> {
-  const line = `${JSON.stringify(entry)}\n`;
-  intentRouterDatasetPersistQueue = intentRouterDatasetPersistQueue
-    .then(async () => {
-      await fs.mkdir(path.dirname(intentRouterDatasetFilePath), { recursive: true });
-      await fs.appendFile(intentRouterDatasetFilePath, line, "utf8");
-    })
-    .catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      logWarn(`No pude persistir dataset de intent router: ${message}`);
-    });
-  await intentRouterDatasetPersistQueue;
-}
-
-async function readIntentRouterDatasetEntries(limit: number): Promise<IntentRouterDatasetEntry[]> {
-  try {
-    const raw = await fs.readFile(intentRouterDatasetFilePath, "utf8");
-    const lines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const selected = lines.slice(-Math.max(1, Math.min(20_000, limit)));
-    const entries: IntentRouterDatasetEntry[] = [];
-    for (const line of selected) {
-      try {
-        const parsed = JSON.parse(line) as IntentRouterDatasetEntry;
-        if (parsed && typeof parsed === "object" && typeof parsed.chatId === "number" && typeof parsed.text === "string") {
-          entries.push(parsed);
-        }
-      } catch {
-        continue;
-      }
-    }
-    return entries;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/enoent/i.test(message)) {
-      return [];
-    }
-    throw error;
-  }
+  await intentRouterStatsRepository.append(entry);
 }
 
 async function buildIntentRouterStatsReport(limit: number): Promise<string> {
-  const entries = await readIntentRouterDatasetEntries(limit);
-  if (entries.length === 0) {
-    return [
-      "Intent router stats",
-      `dataset: ${toProjectRelativePath(intentRouterDatasetFilePath)}`,
-      "No hay muestras todavía.",
-    ].join("\n");
-  }
-
-  const routeNames = semanticIntentRouter.listRouteThresholds().map((item) => item.name);
-  const lines: string[] = [
-    "Intent router stats",
-    `dataset: ${toProjectRelativePath(intentRouterDatasetFilePath)}`,
-    `muestras: ${entries.length}`,
-  ];
-
-  const byRoute = new Map<
-    Exclude<NaturalIntentHandlerName, "none">,
-    {
-      selected: number;
-      hit: number;
-      falsePositive: number;
-      avgScoreNumerator: number;
-      tpScores: number[];
-      fpScores: number[];
-    }
-  >();
-
-  for (const routeName of routeNames) {
-    byRoute.set(routeName, {
-      selected: 0,
-      hit: 0,
-      falsePositive: 0,
-      avgScoreNumerator: 0,
-      tpScores: [],
-      fpScores: [],
-    });
-  }
-
-  let filteredCount = 0;
-  for (const entry of entries) {
-    if ((entry.routeFilterAllowed?.length ?? 0) > 0 && (entry.routeFilterAllowed?.length ?? 0) < entry.routeCandidates.length) {
-      filteredCount += 1;
-    }
-    if (!entry.semantic) {
-      continue;
-    }
-    const routeStats = byRoute.get(entry.semantic.handler);
-    if (!routeStats) {
-      continue;
-    }
-    routeStats.selected += 1;
-    routeStats.avgScoreNumerator += entry.semantic.score;
-    if (entry.finalHandler === entry.semantic.handler) {
-      routeStats.hit += 1;
-      routeStats.tpScores.push(entry.semantic.score);
-    } else {
-      routeStats.falsePositive += 1;
-      routeStats.fpScores.push(entry.semantic.score);
-    }
-  }
-
-  lines.push(`route_filter aplicado: ${filteredCount}/${entries.length}`);
-  lines.push("");
-  lines.push("Por ruta:");
-  for (const routeName of routeNames) {
-    const stats = byRoute.get(routeName);
-    if (!stats) {
-      continue;
-    }
-    const currentThreshold = semanticIntentRouter.getRouteThreshold(routeName) ?? 0;
-    const avgScore = stats.selected > 0 ? stats.avgScoreNumerator / stats.selected : 0;
-    const precision = stats.selected > 0 ? stats.hit / stats.selected : 0;
-    const suggested = suggestIntentThreshold({
-      current: currentThreshold,
-      truePositiveScores: stats.tpScores,
-      falsePositiveScores: stats.fpScores,
-    });
-    lines.push(
-      [
-        `- ${routeName}`,
-        `selected=${stats.selected}`,
-        `hit=${stats.hit}`,
-        `fp=${stats.falsePositive}`,
-        `precision=${(precision * 100).toFixed(1)}%`,
-        `avg_score=${avgScore.toFixed(3)}`,
-        `threshold=${currentThreshold.toFixed(3)}`,
-        `suggested=${suggested === null ? "sin cambio" : suggested.toFixed(3)}`,
-      ].join(" | "),
-    );
-  }
-
-  return lines.join("\n");
+  return await buildIntentRouterStatsReportDomain({
+    limit,
+    repository: intentRouterStatsRepository,
+    toProjectRelativePath,
+    datasetFilePath: intentRouterDatasetFilePath,
+    routeThresholds: semanticIntentRouter.listRouteThresholds().map((item) => ({
+      name: item.name,
+      threshold: item.threshold,
+    })),
+  });
 }
 
 function tryParseNaturalRouteDecision(raw: string): {
@@ -5783,26 +4519,6 @@ async function classifyMissingSubjectEmailModeWithAi(params: {
     return fallbackLiteral ? { mode: "literal", literalBody: fallbackLiteral } : { mode: "improvise" };
   }
   return parsed;
-}
-
-function buildGmailDraftInstruction(text: string): string {
-  return text
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
-    .replace(/\bcc\s*[:=-]\s*[^\n]+/gi, " ")
-    .replace(/\bbcc\s*[:=-]\s*[^\n]+/gi, " ")
-    .replace(
-      /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme|mandale|escribe|escribir|redacta|redactar|responde|responder|correo|correos|mail|mails|email|emails|gmail|a|para)\b/gi,
-      " ",
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function shouldAvoidLiteralBodyFallback(textNormalized: string): boolean {
-  return (
-    /\b(reflexion|estoic|poema|poesia|noticias?|resumen|recordatorios?)\b/.test(textNormalized) &&
-    /\b(correo|mail|email|gmail)\b/.test(textNormalized)
-  );
 }
 
 function tryParseGmailDraftJson(raw: string): { subject: string; body: string } | null {
@@ -6118,269 +4834,25 @@ async function buildGmailAutoContent(params: {
   };
 }
 
-function parseNaturalLimit(textNormalized: string): number | undefined {
-  const byCountWord =
-    textNormalized.match(/\b(?:ultimos|ultimas|primeros|primeras|top|hasta|muestra|mostra|trae)\s+(\d{1,2})\b/) ??
-    textNormalized.match(/\b(\d{1,2})\s+(?:correos|mails|emails|mensajes)\b/);
-  const valueRaw = byCountWord?.[1];
-  if (!valueRaw) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(valueRaw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return undefined;
-  }
-  const maxAllowed = Math.max(1, Math.min(100, config.gmailMaxResults));
-  return Math.min(maxAllowed, parsed);
-}
-
-function buildNaturalGmailQuery(text: string, textNormalized: string): string {
-  const explicitTokens = text.match(
-    /\b(?:is|from|to|subject|after|before|newer_than|older_than|label|category|has):[^\s]+/gi,
-  );
-  if (explicitTokens && explicitTokens.length > 0) {
-    return explicitTokens.join(" ");
-  }
-
-  const queryTokens: string[] = [];
-  if (/\b(no leidos?|sin leer|unread)\b/.test(textNormalized)) {
-    queryTokens.push("is:unread");
-  }
-  if (/\b(destacados?|con estrella|starred)\b/.test(textNormalized)) {
-    queryTokens.push("is:starred");
-  }
-  if (/\b(hoy|today)\b/.test(textNormalized)) {
-    queryTokens.push("newer_than:1d");
-  }
-
-  const fromEmail = text.match(/\bde\s+([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i)?.[1];
-  if (fromEmail) {
-    queryTokens.push(`from:${fromEmail.toLowerCase()}`);
-  }
-
-  const subjectText = text.match(/\basunto\s*(?:de|que contenga|contiene)?\s*[:=-]?\s*(.+)$/i)?.[1]?.trim();
-  if (subjectText) {
-    const cleaned = subjectText.replace(/"/g, "").trim();
-    if (cleaned) {
-      queryTokens.push(`subject:${cleaned}`);
-    }
-  }
-
-  return queryTokens.join(" ").trim();
-}
-
 function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
-  const original = text.trim();
-  if (!original) {
-    return { shouldHandle: false };
-  }
-
-  const normalized = normalizeIntentText(original);
-  const emailCandidates = extractEmailAddresses(original);
-  const quotedSegments = extractQuotedSegments(original);
-
-  const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
-  const sendVerb = /\b(envi\w*|mand\w*|escrib\w*|redact\w*|respond\w*)\b/.test(
-    normalized,
-  );
-  const implicitSelfMailRequest =
-    ((/\b(enviame|enviarme|mandame|mandarme|enviarlo|enviarla|mandarlo|mandarla)\b/.test(normalized) &&
-      /\b(correo|mail|email|gmail)\b/.test(normalized)) ||
-      /\b(enviame|enviarme|mandame|mandarme)\b/.test(normalized)) &&
-    /\b(poema|poesia|noticias?|news|recordatorios?|tareas?\s+pendientes?|correo|mail|email|gmail)\b/.test(
-      normalized,
-    );
-  const readVerb = /\b(lee|leer|abre|abrir|mostra|mostrar|detalle|contenido|revisa|revisar)\b/.test(normalized);
-  const listVerb = /\b(lista|listar|mostra|mostrar|dame|trae|consulta|consultar|ver|revisa|revisar)\b/.test(normalized);
-  const statusVerb = /\b(estado|status|configurad|configuracion|habilitad|enabled|disabled|deshabilitad)\b/.test(
-    normalized,
-  );
-  const profileVerb =
-    /\b(perfil|profile)\b/.test(normalized) ||
-    /\b(que cuenta|qué cuenta|cuenta conectada|correo conectado|email conectado|mail conectado|cuenta actual)\b/.test(
-      normalized,
-    );
-
-  const markReadVerb = /\b(marca|marcar|pone|poner)\b.*\b(leido|leida|read)\b/.test(normalized);
-  const markUnreadVerb = /\b(marca|marcar|pone|poner)\b.*\b(no leido|no leida|unread)\b/.test(normalized);
-  const trashVerb = /\b(borra|borrar|elimina|eliminar|papelera|trash)\b/.test(normalized);
-  const untrashVerb = /\b(restaura|recupera|saca)\b.*\b(papelera|trash)\b|\buntrash\b/.test(normalized);
-  const starVerb = /\b(destaca|destacar|estrella|star)\b/.test(normalized);
-  const unstarVerb = /\b(quita|quitar|saca|sacar)\b.*\b(estrella|star)\b|\bunstar\b/.test(normalized);
-
-  const directMessageId = original.match(/\b[0-9a-f]{12,}\b/i)?.[0];
-  const indexedRef =
-    normalized.match(/\b(?:correo|mail|email|mensaje|resultado)\s*(?:numero|nro|#)?\s*(\d{1,2})\b/)?.[1] ??
-    normalized.match(/\b(?:nro|numero|#)\s*(\d{1,2})\b/)?.[1];
-  const ordinalMap: Record<string, number> = {
-    primero: 1,
-    primera: 1,
-    segundo: 2,
-    segunda: 2,
-    tercero: 3,
-    tercera: 3,
-    cuarto: 4,
-    cuarta: 4,
-    quinto: 5,
-    quinta: 5,
-  };
-  const ordinalEntry = Object.entries(ordinalMap).find(([word]) => normalized.includes(word));
-  const ordinalIndex = ordinalEntry?.[1];
-  const wantsLast = /\b(ultimo|ultima|reciente|ese|ese correo|ese mail|el ultimo)\b/.test(normalized);
-  const explicitLatestMailPhrase = /\b(?:el\s+)?ultim[oa]\s+(?:correo|mail|email|mensaje)\b/.test(normalized);
-  const messageIndex = indexedRef
-    ? Number.parseInt(indexedRef, 10)
-    : ordinalIndex
-      ? ordinalIndex
-      : wantsLast
-        ? -1
-        : undefined;
-  const inboxCheckVerb = /\b(revisa|revisar|chequea|chequear|checkea|checkear|mira|mirar|verifica|verificar)\b/.test(
-    normalized,
-  );
-
-  if (hasMailContext && statusVerb) {
-    return { shouldHandle: true, action: "status" };
-  }
-  if (hasMailContext && profileVerb) {
-    return { shouldHandle: true, action: "profile" };
-  }
-
-  if (sendVerb && (hasMailContext || emailCandidates.length > 0 || implicitSelfMailRequest)) {
-    const inferredSelfTo = inferDefaultSelfEmailRecipient(original);
-    const autoContentKind = detectGmailAutoContentKind(normalized);
-    const recipientName = extractRecipientNameFromText(original);
-    const to =
-      emailCandidates[0] ||
-      inferredSelfTo ||
-      (autoContentKind ? config.gmailAccountEmail?.trim().toLowerCase() ?? "" : "");
-
-    let subject = "";
-    let body = "";
-    let cc = "";
-    let bcc = "";
-    let draftInstruction = "";
-    const explicitLiteralBody = extractLiteralBodyRequest(original);
-    const explicitNaturalSubject = extractNaturalSubjectRequest(original);
-    const creativeCue = detectCreativeEmailCue(normalized);
-
-    if (quotedSegments.length >= 2) {
-      subject = quotedSegments[0] ?? "";
-      body = quotedSegments.slice(1).join("\n\n").trim();
-    } else {
-      const labeled = parseGmailLabeledFields(original);
-      subject = labeled.subject;
-      body = labeled.body;
-      cc = labeled.cc;
-      bcc = labeled.bcc;
-      if (!body && explicitLiteralBody) {
-        body = explicitLiteralBody;
-      }
-
-      const draftRequested = !explicitLiteralBody && (creativeCue || detectGmailDraftRequested(normalized, labeled.hasBodyLabel));
-      if (draftRequested) {
-        draftInstruction = buildGmailDraftInstruction(original);
-      }
-      if (!body && !draftRequested && !explicitLiteralBody && !shouldAvoidLiteralBodyFallback(normalized)) {
-        body = buildGmailDraftInstruction(original);
-      }
-    }
-
-    if (!draftInstruction && !body && !explicitLiteralBody && quotedSegments.length < 2 && (creativeCue || detectGmailDraftRequested(normalized, false))) {
-      draftInstruction = buildGmailDraftInstruction(original);
-    }
-    if (!subject && explicitNaturalSubject) {
-      subject = explicitNaturalSubject;
-    }
-    const subjectWasExplicit = Boolean(subject.trim());
-    const forceAiDraftByMissingSubject = !subjectWasExplicit;
-    if (forceAiDraftByMissingSubject) {
-      draftInstruction = buildGmailDraftInstruction(original) || original.trim();
-      body = "";
-    }
-    const draftRequested = Boolean(draftInstruction);
-    if (!subject) {
-      subject = "Mensaje desde Houdi Agent";
-    }
-    if (!body) {
-      body = "Mensaje enviado desde Houdi Agent.";
-    }
-
-    if (!cc) {
-      cc = original.match(/\bcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim() ?? "";
-    }
-    if (!bcc) {
-      bcc = original.match(/\bbcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim() ?? "";
-    }
-
-    return {
-      shouldHandle: true,
-      action: "send",
-      to,
-      subject,
-      body,
-      ...(cc ? { cc } : {}),
-      ...(bcc ? { bcc } : {}),
-      draftRequested,
-      ...(draftInstruction ? { draftInstruction } : {}),
-      ...(forceAiDraftByMissingSubject ? { forceAiByMissingSubject: true } : {}),
-      ...(autoContentKind ? { autoContentKind } : {}),
-      ...(!emailCandidates[0] && recipientName ? { recipientName } : {}),
-    };
-  }
-
-  // Si pide "revisar correo" sin identificar mensaje, se interpreta como listar inbox.
-  if (hasMailContext && inboxCheckVerb && !directMessageId && typeof messageIndex !== "number") {
-    return {
-      shouldHandle: true,
-      action: "list",
-      query: buildNaturalGmailQuery(original, normalized),
-      limit: parseNaturalLimit(normalized),
-    };
-  }
-
-  if (markUnreadVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "markunread", messageId: directMessageId, messageIndex };
-  }
-  if (markReadVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "markread", messageId: directMessageId, messageIndex };
-  }
-  if (untrashVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "untrash", messageId: directMessageId, messageIndex };
-  }
-  if (trashVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "trash", messageId: directMessageId, messageIndex };
-  }
-  if (unstarVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "unstar", messageId: directMessageId, messageIndex };
-  }
-  if (starVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "star", messageId: directMessageId, messageIndex };
-  }
-  if (readVerb && (hasMailContext || directMessageId || messageIndex)) {
-    return { shouldHandle: true, action: "read", messageId: directMessageId, messageIndex };
-  }
-  if (hasMailContext && explicitLatestMailPhrase) {
-    return { shouldHandle: true, action: "read", messageId: directMessageId, messageIndex: -1 };
-  }
-  if (listVerb && hasMailContext) {
-    return {
-      shouldHandle: true,
-      action: "list",
-      query: buildNaturalGmailQuery(original, normalized),
-      limit: parseNaturalLimit(normalized),
-    };
-  }
-  if (hasMailContext && /\b(no leidos?|sin leer|inbox|bandeja|ultimos|ultimas|recientes)\b/.test(normalized)) {
-    return {
-      shouldHandle: true,
-      action: "list",
-      query: buildNaturalGmailQuery(original, normalized),
-      limit: parseNaturalLimit(normalized),
-    };
-  }
-
-  return { shouldHandle: false };
+  return detectGmailNaturalIntentDomain(text, {
+    normalizeIntentText,
+    extractQuotedSegments,
+    extractEmailAddresses,
+    extractRecipientNameFromText,
+    inferDefaultSelfEmailRecipient,
+    detectGmailAutoContentKind,
+    parseGmailLabeledFields,
+    extractLiteralBodyRequest,
+    extractNaturalSubjectRequest,
+    detectCreativeEmailCue,
+    detectGmailDraftRequested,
+    buildGmailDraftInstruction,
+    shouldAvoidLiteralBodyFallback,
+    parseNaturalLimit,
+    buildNaturalGmailQuery,
+    gmailAccountEmail: config.gmailAccountEmail,
+  });
 }
 
 function rememberGmailListResults(chatId: number, messages: GmailMessageSummary[]): void {
@@ -7128,91 +5600,6 @@ function getActor(ctx: ChatReplyContext): { chatId: number; userId: number } {
   };
 }
 
-function parseLocalApiPositiveInteger(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
-    return value;
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!/^\d+$/.test(trimmed)) {
-      return undefined;
-    }
-    const parsed = Number.parseInt(trimmed, 10);
-    if (Number.isInteger(parsed) && parsed > 0) {
-      return parsed;
-    }
-  }
-  return undefined;
-}
-
-function writeJsonResponse(res: ServerResponse, statusCode: number, payload: Record<string, unknown>): void {
-  const body = JSON.stringify(payload);
-  res.writeHead(statusCode, {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-    "content-length": Buffer.byteLength(body, "utf8").toString(),
-  });
-  res.end(body);
-}
-
-function isLocalBridgeAuthorized(req: IncomingMessage): boolean {
-  const token = config.localApiToken?.trim();
-  if (!token) {
-    return true;
-  }
-  const header = req.headers.authorization;
-  if (!header) {
-    return false;
-  }
-  const [scheme, value] = header.split(/\s+/, 2);
-  if (scheme?.toLowerCase() !== "bearer") {
-    return false;
-  }
-  return (value ?? "").trim() === token;
-}
-
-function readHttpRequestBody(req: IncomingMessage, maxBytes: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let settled = false;
-
-    const fail = (error: Error): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      reject(error);
-    };
-
-    req.on("data", (chunk: Buffer | string) => {
-      if (settled) {
-        return;
-      }
-      const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      total += bufferChunk.length;
-      if (total > maxBytes) {
-        req.destroy();
-        fail(new Error(`request body excede ${maxBytes} bytes`));
-        return;
-      }
-      chunks.push(bufferChunk);
-    });
-
-    req.on("end", () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-
-    req.on("error", (error) => {
-      fail(error instanceof Error ? error : new Error(String(error)));
-    });
-  });
-}
-
 function approvalRemainingSeconds(approval: PendingApproval): number {
   return Math.max(0, Math.round((approval.expiresAt - Date.now()) / 1000));
 }
@@ -7262,6 +5649,7 @@ async function appendConversationTurn(params: {
   source: string;
   userId?: number;
 }) {
+  const startedAt = Date.now();
   const text = params.text.trim();
   if (!text) {
     return;
@@ -7279,6 +5667,19 @@ async function appendConversationTurn(params: {
       },
     ].slice(-RECENT_CONVERSATION_TURN_LIMIT),
   );
+  try {
+    sqliteState.appendConversationTurn({
+      chatId: params.chatId,
+      role: params.role,
+      text: truncateInline(text, 4_000),
+      source: params.source,
+      atMs: Date.now(),
+      userId: params.userId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude persistir turno en SQLite: ${message}`);
+  }
   try {
     await contextMemory.appendConversationTurn({
       chatId: params.chatId,
@@ -7345,6 +5746,8 @@ async function appendConversationTurn(params: {
       logWarn(`No pude actualizar aprendizaje de intereses: ${message}`);
     }
   }
+  observability.increment("conversation.turn.appended", 1, { role: params.role, source: params.source });
+  observability.timing("conversation.turn.append.latency_ms", Date.now() - startedAt);
 }
 
 async function replyLong(ctx: { reply: (text: string) => Promise<unknown> }, text: string) {
@@ -8472,7 +6875,7 @@ async function requestAgentServiceRestart(params: {
     return;
   }
 
-  if (adminSecurity.isAdminModeEnabled(params.ctx.chat.id) && !params.skipAdminApproval) {
+  if (isAdminApprovalRequired(params.ctx.chat.id) && !params.skipAdminApproval) {
     await queueApproval({
       ctx: params.ctx,
       profile,
@@ -8696,7 +7099,7 @@ async function requestAgentSelfUpdate(params: {
   }
 
   const checkOnly = Boolean(params.checkOnly);
-  if (!checkOnly && adminSecurity.isAdminModeEnabled(params.ctx.chat.id)) {
+  if (!checkOnly && isAdminApprovalRequired(params.ctx.chat.id)) {
     await queueApproval({
       ctx: params.ctx,
       profile,
@@ -8737,6 +7140,7 @@ async function executeAiShellInstruction(ctx: ChatReplyContext, instruction: str
     allowedCommands: profile.allowCommands,
     cwd: profile.cwd,
     context: promptContext,
+    model: getOpenAiModelForChat(ctx.chat.id),
   });
 
   if (plan.action === "reply") {
@@ -8764,7 +7168,7 @@ async function executeAiShellInstruction(ctx: ChatReplyContext, instruction: str
     return;
   }
 
-  if (adminSecurity.isAdminModeEnabled(ctx.chat.id)) {
+  if (isAdminApprovalRequired(ctx.chat.id)) {
     await queueApproval({
       ctx,
       profile,
@@ -9091,6 +7495,16 @@ if (config.suggestionsEnabled) {
     suggestionsPollHandle.unref();
   }
   void processSpontaneousSuggestions();
+}
+
+const idempotencyPruneHandle = setInterval(() => {
+  const pruned = idempotency.pruneExpired();
+  if (pruned > 0) {
+    observability.increment("bridge.http.idempotency.pruned", pruned);
+  }
+}, Math.max(60_000, Math.floor(config.idempotencyTtlMs / 4)));
+if (typeof idempotencyPruneHandle.unref === "function") {
+  idempotencyPruneHandle.unref();
 }
 
 async function downloadTelegramFile(
@@ -9663,7 +8077,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     }
 
     const commandLine = `systemctl --user ${intent.action} ${units.join(" ")}`;
-    if (adminSecurity.isAdminModeEnabled(chatId)) {
+    if (isAdminApprovalRequired(chatId)) {
       await queueApproval({
         ctx: params.ctx,
         profile,
@@ -12970,15 +11384,17 @@ bot.command("start", async (ctx) => {
   const active = getActiveAgent(chatId);
   const shellMode = isAiShellModeEnabled(chatId) ? "on" : "off";
   const ecoMode = isEcoModeEnabled(chatId) ? "on" : "off";
-  const adminMode = adminSecurity.isAdminModeEnabled(chatId) ? "on" : "off";
+  const adminMode = isAdminApprovalRequired(chatId) ? "on" : "off";
   const panicMode = adminSecurity.isPanicModeEnabled() ? "on" : "off";
   await ctx.reply(
     [
+      buildAgentVersionText(),
       "Houdi Agent activo.",
       `Agente actual: ${active}`,
       `Shell IA: ${shellMode}`,
       `ECO mode: ${ecoMode}`,
       `Admin mode: ${adminMode}`,
+      `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${panicMode}`,
       "Usa /help para ver comandos.",
     ].join("\n"),
@@ -12989,6 +11405,8 @@ bot.command("help", async (ctx) => {
   await ctx.reply(
     [
       "Comandos:",
+      "/version - Ver versión del agente",
+      "/model [show|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
       "/status - Estado del host y tareas en ejecución",
       "/agent - Ver agente activo y lista",
       "/agent set <nombre> - Cambiar agente activo para este chat",
@@ -13056,6 +11474,56 @@ bot.command("help", async (ctx) => {
   );
 });
 
+bot.command("version", async (ctx) => {
+  await ctx.reply(buildAgentVersionText());
+});
+
+bot.command("model", async (ctx) => {
+  const input = String(ctx.match ?? "").trim();
+  const [subRaw, ...rest] = input.split(/\s+/).filter(Boolean);
+  const sub = (subRaw ?? "show").toLowerCase();
+  const value = rest.join(" ").trim();
+
+  if (!input || ["show", "status"].includes(sub)) {
+    const current = getOpenAiModelForChat(ctx.chat.id);
+    const isDefault = !openAiModelByChat.has(ctx.chat.id);
+    await ctx.reply(
+      [
+        `Modelo OpenAI actual (chat): ${current}`,
+        `Modelo OpenAI default (.env): ${config.openAiModel}`,
+        `Origen: ${isDefault ? "default" : "override por chat"}`,
+        "Uso: /model set <modelo> | /model reset",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (["set", "use"].includes(sub)) {
+    if (!value) {
+      await ctx.reply("Uso: /model set <modelo>\nEjemplo: /model set gpt-4o-mini");
+      return;
+    }
+    try {
+      setOpenAiModelForChat(ctx.chat.id, value);
+      await ctx.reply(
+        `Modelo OpenAI actualizado para este chat: ${getOpenAiModelForChat(ctx.chat.id)}\n(override runtime, no modifica .env)`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.reply(`No pude actualizar el modelo: ${message}`);
+    }
+    return;
+  }
+
+  if (["reset", "clear", "default"].includes(sub)) {
+    resetOpenAiModelForChat(ctx.chat.id);
+    await ctx.reply(`Modelo OpenAI reseteado al default: ${config.openAiModel}`);
+    return;
+  }
+
+  await ctx.reply("Uso: /model [show|set <modelo>|reset]");
+});
+
 bot.command("status", async (ctx) => {
   const runningCount = taskRunner.listRunning().length;
   const usedMemMb = Math.round((os.totalmem() - os.freemem()) / (1024 * 1024));
@@ -13100,6 +11568,7 @@ bot.command("status", async (ctx) => {
 
   await ctx.reply(
     [
+      `Version: ${config.agentVersion}`,
       `Host: ${os.hostname()}`,
       `OS: ${os.platform()} ${os.release()}`,
       `Uptime: ${Math.round(os.uptime() / 60)} min`,
@@ -13109,11 +11578,12 @@ bot.command("status", async (ctx) => {
       `Agente actual: ${getActiveAgent(ctx.chat.id)}`,
       `Shell IA: ${isAiShellModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `ECO mode: ${isEcoModeEnabled(ctx.chat.id) ? `on (max ${config.openAiEcoMaxOutputTokens} tok)` : "off"}`,
-      `Admin mode: ${adminSecurity.isAdminModeEnabled(ctx.chat.id) ? "on" : "off"}`,
+      `Admin mode: ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
+      `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"} (${rebootAllowedInAgent ? "permitido en agente actual" : "no permitido en agente actual"})`,
       `Aprobaciones pendientes (chat): ${pendingCount}`,
-      `OpenAI: ${openAi.isConfigured() ? `configurado (${openAi.getModel()})` : "no configurado"}`,
+      `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
       `Lector docs: maxFile=${Math.round(config.docMaxFileBytes / (1024 * 1024))}MB | maxText=${config.docMaxTextChars} chars`,
       `Web browse: ${config.enableWebBrowse ? `on (max results ${config.webSearchMaxResults})` : "off"}`,
@@ -13122,6 +11592,7 @@ bot.command("status", async (ctx) => {
       `Archivos inbound: maxFile=${Math.round(config.fileMaxFileBytes / (1024 * 1024))}MB | store=${toProjectRelativePath(path.join(config.workspaceDir, "files", `chat-${ctx.chat.id}`))}`,
       `Imagenes: maxFile=${Math.round(config.imageMaxFileBytes / (1024 * 1024))}MB | store=${imageStorePath}`,
       `Agenda: pending=${scheduledPendingCount} | poll=${config.schedulePollMs}ms | file=${config.scheduleFile}`,
+      `State DB: ${toProjectRelativePath(config.stateDbFile)} | idempotencyTTL=${config.idempotencyTtlMs}ms`,
       `Selfskill draft: ${selfSkillDraft ? `activo (${selfSkillDraft.lines.length} lineas)` : "off"} | file=${config.selfSkillDraftsFile}`,
       `${suggestionStatusLine} | enabled=${config.suggestionsEnabled ? "on" : "off"} | poll=${config.suggestionsPollMs}ms`,
       `Workspace: ${config.workspaceDir}`,
@@ -13398,7 +11869,7 @@ bot.command("exec", async (ctx) => {
 
   const profile = agentRegistry.require(getActiveAgent(ctx.chat.id));
 
-  if (adminSecurity.isAdminModeEnabled(ctx.chat.id)) {
+  if (isAdminApprovalRequired(ctx.chat.id)) {
     await queueApproval({
       ctx,
       profile,
@@ -13425,7 +11896,8 @@ bot.command("reboot", async (ctx) => {
       [
         `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"}`,
         `Comando configurado: ${config.rebootCommand}`,
-        `Admin mode (chat): ${adminSecurity.isAdminModeEnabled(ctx.chat.id) ? "on" : "off"}`,
+        `Admin mode (chat): ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
+        `Perfil seguridad: ${config.securityProfile.name}`,
         `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       ].join("\n"),
     );
@@ -13435,6 +11907,12 @@ bot.command("reboot", async (ctx) => {
   if (!config.enableRebootCommand) {
     await ctx.reply(
       "La opción de reinicio está deshabilitada. Activa ENABLE_REBOOT_COMMAND=true en .env y reinicia el bot.",
+    );
+    return;
+  }
+  if (!config.securityProfile.allowReboot) {
+    await ctx.reply(
+      `El perfil de seguridad actual (${config.securityProfile.name}) bloquea reboot. Usa HOUDI_SECURITY_PROFILE=full-control para habilitarlo.`,
     );
     return;
   }
@@ -13500,7 +11978,7 @@ bot.command("ask", async (ctx) => {
     return;
   }
 
-  await replyProgress(ctx, `Consultando OpenAI (${openAi.getModel()})...`);
+  await replyProgress(ctx, `Consultando OpenAI (${getOpenAiModelForChat(ctx.chat.id)})...`);
 
   try {
     await appendConversationTurn({
@@ -14145,7 +12623,7 @@ bot.command("askfile", async (ctx) => {
     `Pregunta del usuario: ${question}`,
   ].join("\n");
 
-  await replyProgress(ctx, `Consultando OpenAI (${openAi.getModel()})...`);
+  await replyProgress(ctx, `Consultando OpenAI (${getOpenAiModelForChat(ctx.chat.id)})...`);
 
   try {
     await appendConversationTurn({
@@ -15845,6 +14323,12 @@ bot.command("shellmode", async (ctx) => {
 });
 
 bot.command("shell", async (ctx) => {
+  if (!config.securityProfile.allowAiShell) {
+    await ctx.reply(
+      `El perfil de seguridad actual (${config.securityProfile.name}) bloquea /shell. Usa HOUDI_SECURITY_PROFILE=full-control para habilitarlo.`,
+    );
+    return;
+  }
   const instruction = String(ctx.match ?? "").trim();
   if (!instruction) {
     await ctx.reply("Uso: /shell <instrucción>");
@@ -15863,7 +14347,9 @@ bot.command("adminmode", async (ctx) => {
   const raw = String(ctx.match ?? "").trim().toLowerCase();
 
   if (!raw || raw === "status") {
-    await ctx.reply(`Admin mode está ${adminSecurity.isAdminModeEnabled(ctx.chat.id) ? "on" : "off"}.`);
+    await ctx.reply(
+      `Admin mode está ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"} (perfil: ${config.securityProfile.name}).`,
+    );
     return;
   }
 
@@ -16151,6 +14637,7 @@ bot.on(["message:photo", "message:document"], async (ctx, next) => {
       context: promptContext,
       concise: ecoEnabled,
       maxOutputTokens: ecoEnabled ? Math.min(config.openAiEcoMaxOutputTokens, 180) : undefined,
+      model: getOpenAiModelForChat(ctx.chat.id),
     });
     const analysis = ecoEnabled ? truncateInline(analysisRaw, 700) : analysisRaw;
 
@@ -16451,6 +14938,28 @@ async function handleIncomingTextMessage(params: {
     return;
   }
 
+  if (detectAgentVersionIntent(text)) {
+    const versionReply = buildAgentVersionText();
+    if (persistUserTurn) {
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId,
+        role: "user",
+        text: textWithReplyReference,
+        source,
+      });
+    }
+    await params.ctx.reply(versionReply);
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId,
+      role: "assistant",
+      text: versionReply,
+      source: `${source}:version-intent`,
+    });
+    return;
+  }
+
   const handledAsNaturalIntent = await maybeHandleNaturalIntentPipeline({
     ctx: params.ctx,
     text,
@@ -16520,15 +15029,25 @@ async function handleIncomingTextMessage(params: {
 }
 
 async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const requestStartedAt = Date.now();
   const method = (req.method ?? "GET").toUpperCase();
   const pathname = (req.url?.split("?", 1)[0] ?? "/").trim() || "/";
+  observability.increment("bridge.http.request", 1, { method, pathname });
 
   if (method === "GET" && pathname === LOCAL_BRIDGE_HEALTH_PATH) {
+    const metrics = observability.snapshot();
     writeJsonResponse(res, 200, {
       ok: true,
       service: "houdi-local-bridge",
+      version: config.agentVersion,
       messagePath: LOCAL_BRIDGE_MESSAGE_PATH,
+      securityProfile: config.securityProfile.name,
+      metrics: {
+        counters: metrics.counters.slice(-40),
+        timings: metrics.timings,
+      },
     });
+    observability.timing("bridge.http.request.latency_ms", Date.now() - requestStartedAt);
     return;
   }
 
@@ -16540,7 +15059,7 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
     return;
   }
 
-  if (!isLocalBridgeAuthorized(req)) {
+  if (!isLocalBridgeAuthorized(req, config.localApiToken)) {
     writeJsonResponse(res, 401, {
       ok: false,
       error: "unauthorized",
@@ -16590,9 +15109,33 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
     return;
   }
 
-  const chatId = parseLocalApiPositiveInteger(record.chatId) ?? 1;
+  const chatId = parsePositiveInteger(record.chatId) ?? 1;
+  const requestId = idempotency.normalizeRequestId(record.requestId);
+  if (requestId) {
+    const cached = idempotency.read(chatId, requestId);
+    if (cached) {
+      writeJsonResponse(res, cached.statusCode, {
+        ...cached.body,
+        idempotent: true,
+        requestId,
+      });
+      observability.increment("bridge.http.idempotency.hit");
+      observability.timing("bridge.http.request.latency_ms", Date.now() - requestStartedAt);
+      return;
+    }
+    if (!idempotency.tryAcquire(chatId, requestId)) {
+      writeJsonResponse(res, 409, {
+        ok: false,
+        error: "duplicate_in_flight",
+        requestId,
+      });
+      observability.increment("bridge.http.idempotency.in_flight_reject");
+      observability.timing("bridge.http.request.latency_ms", Date.now() - requestStartedAt);
+      return;
+    }
+  }
   const defaultAllowedUserId = config.allowedUserIds.values().next().value as number | undefined;
-  const userId = parseLocalApiPositiveInteger(record.userId) ?? defaultAllowedUserId;
+  const userId = parsePositiveInteger(record.userId) ?? defaultAllowedUserId;
 
   if (typeof userId !== "number" || !config.allowedUserIds.has(userId)) {
     writeJsonResponse(res, 403, {
@@ -16637,14 +15180,42 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
       chatId,
       userId,
       replies,
+      ...(requestId ? { requestId } : {}),
     });
+    observability.increment("bridge.http.message.ok");
+    if (requestId) {
+      idempotency.save(chatId, requestId, {
+        statusCode: 200,
+        body: {
+          ok: true,
+          chatId,
+          userId,
+          replies,
+          requestId,
+        },
+      });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logWarn(`Local bridge error: ${message}`);
-    writeJsonResponse(res, 500, {
+    const payloadError = {
       ok: false,
       error: message,
-    });
+      ...(requestId ? { requestId } : {}),
+    };
+    writeJsonResponse(res, 500, payloadError);
+    observability.increment("bridge.http.message.error");
+    if (requestId) {
+      idempotency.save(chatId, requestId, {
+        statusCode: 500,
+        body: payloadError,
+      });
+    }
+  } finally {
+    if (requestId) {
+      idempotency.release(chatId, requestId);
+    }
+    observability.timing("bridge.http.request.latency_ms", Date.now() - requestStartedAt);
   }
 }
 

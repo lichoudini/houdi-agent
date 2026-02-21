@@ -3,7 +3,6 @@ import path from "node:path";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
-import XLSX from "xlsx";
 
 export type DocumentReadResult = {
   path: string;
@@ -42,7 +41,7 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 const DOCX_EXTENSIONS = new Set([".docx"]);
-const SPREADSHEET_EXTENSIONS = new Set([".xls", ".xlsx", ".ods"]);
+const SPREADSHEET_EXTENSIONS = new Set([".xlsx", ".ods"]);
 const PRESENTATION_EXTENSIONS = new Set([".pptx", ".odp"]);
 const OPEN_DOCUMENT_TEXT_EXTENSIONS = new Set([".odt"]);
 const RTF_EXTENSIONS = new Set([".rtf"]);
@@ -126,6 +125,92 @@ function sanitizeCellValue(value: unknown): string {
   return String(value).replace(/\s+/g, " ").trim();
 }
 
+function parseXlsxCellRef(ref: string): { col: number; row: number } | null {
+  const match = ref.trim().toUpperCase().match(/^([A-Z]+)(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  const colRaw = match[1] ?? "";
+  const rowRaw = match[2] ?? "";
+  let col = 0;
+  for (let i = 0; i < colRaw.length; i += 1) {
+    col = col * 26 + (colRaw.charCodeAt(i) - 64);
+  }
+  const row = Number.parseInt(rowRaw, 10);
+  if (!Number.isFinite(row) || row <= 0 || col <= 0) {
+    return null;
+  }
+  return { col, row };
+}
+
+function decodeXlsxInlineValue(type: string, value: string, sharedStrings: string[]): string {
+  const raw = value.trim();
+  if (!raw) {
+    return "";
+  }
+  if (type === "s") {
+    const idx = Number.parseInt(raw, 10);
+    if (Number.isFinite(idx) && idx >= 0 && idx < sharedStrings.length) {
+      return sharedStrings[idx] ?? "";
+    }
+  }
+  return decodeXmlEntities(raw);
+}
+
+function extractXlsxSharedStrings(xml: string): string[] {
+  const values: string[] = [];
+  const shared = Array.from(xml.matchAll(/<si[^>]*>([\s\S]*?)<\/si>/gi));
+  for (const node of shared) {
+    const raw = node[1] ?? "";
+    const textNodes = Array.from(raw.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/gi)).map((part) => decodeXmlEntities(part[1] ?? ""));
+    const joined = textNodes.join(" ").replace(/\s+/g, " ").trim();
+    values.push(joined);
+  }
+  return values;
+}
+
+function renderXlsxWorksheetRows(xml: string, sharedStrings: string[]): string[] {
+  const byRow = new Map<number, Map<number, string>>();
+  const cellMatches = Array.from(xml.matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/gi));
+  for (const cellMatch of cellMatches) {
+    const attrs = cellMatch[1] ?? "";
+    const body = cellMatch[2] ?? "";
+    const ref = attrs.match(/\br=\"([A-Z]+\d+)\"/i)?.[1] ?? "";
+    const type = attrs.match(/\bt=\"([a-z]+)\"/i)?.[1]?.toLowerCase() ?? "";
+    const valueRaw = body.match(/<v[^>]*>([\s\S]*?)<\/v>/i)?.[1] ?? body.match(/<t[^>]*>([\s\S]*?)<\/t>/i)?.[1] ?? "";
+    const value = sanitizeCellValue(decodeXlsxInlineValue(type, valueRaw, sharedStrings));
+    if (!ref) {
+      continue;
+    }
+    const cellRef = parseXlsxCellRef(ref);
+    if (!cellRef || !value) {
+      continue;
+    }
+    const rowCells = byRow.get(cellRef.row) ?? new Map<number, string>();
+    rowCells.set(cellRef.col, value);
+    byRow.set(cellRef.row, rowCells);
+  }
+
+  const rowNumbers = [...byRow.keys()].sort((a, b) => a - b);
+  const lines: string[] = [];
+  for (const rowNumber of rowNumbers) {
+    const cells = byRow.get(rowNumber);
+    if (!cells) {
+      continue;
+    }
+    const maxCol = Math.max(...cells.keys());
+    const values: string[] = [];
+    for (let col = 1; col <= maxCol; col += 1) {
+      values.push(cells.get(col) ?? "");
+    }
+    const line = values.join("\t").trimEnd();
+    if (line) {
+      lines.push(line);
+    }
+  }
+  return lines;
+}
+
 function extractRtfText(raw: string): string {
   const withBreaks = raw.replace(/\\par[d]?/gi, "\n");
   const hexDecoded = withBreaks.replace(/\\'([0-9a-fA-F]{2})/g, (_, hex: string) =>
@@ -190,7 +275,7 @@ export class DocumentReader {
     } else if (SPREADSHEET_EXTENSIONS.has(ext)) {
       rawText = await this.extractSpreadsheetText(resolved.fullPath);
       format = `office:${ext.slice(1)}`;
-      extractor = "xlsx";
+      extractor = "zip-xml";
     } else if (PRESENTATION_EXTENSIONS.has(ext)) {
       rawText = await this.extractPresentationText(resolved.fullPath, ext);
       format = `office:${ext.slice(1)}`;
@@ -277,35 +362,53 @@ export class DocumentReader {
 
   private async extractSpreadsheetText(filePath: string): Promise<string> {
     const buffer = await fs.readFile(filePath);
-    const workbook = XLSX.read(buffer, { type: "buffer", raw: false });
-    const chunks: string[] = [];
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension === ".ods") {
+      const zip = await JSZip.loadAsync(buffer);
+      const contentXml = await extractZipEntryText(zip, "content.xml");
+      return extractTaggedXmlText(contentXml, {
+        paragraphEndTags: ["text:p", "text:h", "table:table-row"],
+        lineBreakTags: ["text:line-break"],
+      });
+    }
 
-    for (const sheetName of workbook.SheetNames) {
-      const sheet = workbook.Sheets[sheetName];
-      if (!sheet) {
+    const zip = await JSZip.loadAsync(buffer);
+    const workbookXml = await extractZipEntryText(zip, "xl/workbook.xml");
+    const workbookRelsXml = await extractZipEntryText(zip, "xl/_rels/workbook.xml.rels");
+    const sharedStringsXml = await extractZipEntryText(zip, "xl/sharedStrings.xml");
+    const sharedStrings = sharedStringsXml ? extractXlsxSharedStrings(sharedStringsXml) : [];
+    const relTargetById = new Map<string, string>();
+    for (const relMatch of workbookRelsXml.matchAll(/<Relationship\b([^>]*)\/?>/gi)) {
+      const attrs = relMatch[1] ?? "";
+      const id = attrs.match(/\bId=\"([^\"]+)\"/i)?.[1] ?? "";
+      const target = attrs.match(/\bTarget=\"([^\"]+)\"/i)?.[1] ?? "";
+      if (id && target) {
+        relTargetById.set(id, target.replace(/^\/+/, ""));
+      }
+    }
+    const sheetDefs = Array.from(workbookXml.matchAll(/<sheet\b([^>]*)\/?>/gi));
+    const chunks: string[] = [];
+    for (const sheetDef of sheetDefs) {
+      const attrs = sheetDef[1] ?? "";
+      const sheetName = decodeXmlEntities(attrs.match(/\bname=\"([^\"]+)\"/i)?.[1] ?? "").trim() || "Sheet";
+      const relId = attrs.match(/\br:id=\"([^\"]+)\"/i)?.[1] ?? "";
+      const relTarget = relId ? relTargetById.get(relId) : undefined;
+      if (!relTarget) {
         continue;
       }
-
-      const rowsRaw = XLSX.utils.sheet_to_json(sheet, {
-        header: 1,
-        raw: false,
-        blankrows: false,
-      }) as unknown[];
-
-      const rows = rowsRaw.filter(Array.isArray) as unknown[][];
-      const lines = rows
-        .map((row) => row.map((cell) => sanitizeCellValue(cell)).join("\t").trimEnd())
-        .filter((line) => line.length > 0);
-
+      const normalizedTarget = relTarget.replace(/^\.?\//, "");
+      const sheetXml = await extractZipEntryText(zip, `xl/${normalizedTarget}`);
+      if (!sheetXml) {
+        continue;
+      }
+      const lines = renderXlsxWorksheetRows(sheetXml, sharedStrings);
       if (lines.length === 0) {
         continue;
       }
-
       chunks.push(`## Sheet: ${sheetName}`);
       chunks.push(...lines);
       chunks.push("");
     }
-
     return chunks.join("\n");
   }
 
