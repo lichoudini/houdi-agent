@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import os from "node:os";
 import path from "node:path";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
-import { AgentContextMemory, type PromptMemoryHit } from "./agent-context-memory.js";
+import { AgentContextMemory, type PromptContextSnapshot, type PromptMemoryHit } from "./agent-context-memory.js";
 import type { AgentProfile } from "./agents.js";
 import { AgentRegistry } from "./agents.js";
 import { AdminSecurityController, type PendingApproval } from "./admin-security.js";
@@ -15,14 +15,23 @@ import { DocumentReader } from "./document-reader.js";
 import type { GmailMessageSummary } from "./gmail-account.js";
 import { GmailAccountService } from "./gmail-account.js";
 import { InterestLearningService } from "./interest-learning.js";
+import {
+  IntentSemanticRouter,
+  type IntentRouteName,
+  type SemanticRouteDecision,
+} from "./intent-semantic-router.js";
 import { logError, logInfo, logWarn } from "./logger.js";
 import { formatMemoryHitsNaturalText } from "./memory-presenter.js";
+import { NewsApiTool, type NewsArticleResult } from "./news-api.js";
 import { OpenAiService } from "./openai-client.js";
+import { OpenMeteoApiTool } from "./open-meteo-api.js";
+import { RedditApiTool, type RedditPostResult } from "./reddit-api.js";
 import { ScheduledTaskService } from "./scheduled-tasks.js";
 import { SelfSkillDraftService } from "./selfskill-drafts.js";
 import { acquireSingleInstanceLock } from "./single-instance-lock.js";
 import { TaskRunner } from "./task-runner.js";
 import { splitForTelegram } from "./telegram-utils.js";
+import { CoinGeckoApiTool } from "./coingecko-api.js";
 import type { WebSearchResult } from "./web-browser.js";
 import { WebBrowser } from "./web-browser.js";
 
@@ -51,6 +60,20 @@ const webBrowser = new WebBrowser({
   maxTextChars: config.webContentMaxChars,
   defaultSearchResults: config.webSearchMaxResults,
 });
+const redditApi = new RedditApiTool({
+  timeoutMs: config.webFetchTimeoutMs,
+});
+const newsApi = new NewsApiTool({
+  timeoutMs: config.webFetchTimeoutMs,
+  gnewsApiKey: config.gnewsApiKey,
+  newsApiKey: config.newsApiKey,
+});
+const coinGeckoApi = new CoinGeckoApiTool({
+  timeoutMs: config.webFetchTimeoutMs,
+});
+const openMeteoApi = new OpenMeteoApiTool({
+  timeoutMs: config.webFetchTimeoutMs,
+});
 const gmailAccount = new GmailAccountService({
   enabled: config.enableGmailAccount,
   clientId: config.gmailClientId,
@@ -64,6 +87,7 @@ acquireSingleInstanceLock();
 
 const taskRunner = new TaskRunner(config.execTimeoutMs, config.maxStdioChars);
 const openAi = new OpenAiService();
+const semanticIntentRouter = new IntentSemanticRouter();
 const adminSecurity = new AdminSecurityController({
   approvalTtlMs: config.adminApprovalTtlSeconds * 1000,
 });
@@ -83,6 +107,7 @@ await interestLearning.load();
 
 const activeAgentByChat = new Map<number, string>();
 const aiShellModeByChat = new Map<number, boolean>();
+const ecoModeByChat = new Map<number, boolean>();
 const lastWebResultsByChat = new Map<number, WebSearchResult[]>();
 type LastDocumentSnapshot = {
   path: string;
@@ -123,8 +148,10 @@ type EmailRecipientsStorage = {
   recipients: SavedEmailRecipient[];
 };
 const recipientsFilePath = path.resolve(process.cwd(), config.recipientsFile);
+const intentRouterDatasetFilePath = path.resolve(process.cwd(), config.intentRouterDatasetFile);
 const emailRecipientsByChat = new Map<number, SavedEmailRecipient[]>();
 let recipientsPersistQueue: Promise<void> = Promise.resolve();
+let intentRouterDatasetPersistQueue: Promise<void> = Promise.resolve();
 const lastGmailResultsByChat = new Map<number, GmailMessageSummary[]>();
 const lastGmailMessageIdByChat = new Map<number, string>();
 const lastListedFilesByChat = new Map<number, Array<{ relPath: string; size: number; modifiedAt: string }>>();
@@ -184,6 +211,8 @@ const SELF_SKILLS_SECTION_TITLE = "## Dynamic Skills";
 const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
 const SELF_UPDATE_APPROVAL_COMMAND = "__selfupdate__";
 const NEWS_MAX_REDDIT_RESULTS = 2;
+const NEWS_MAX_AGE_DAYS = 7;
+const NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES = 8;
 const CONNECTOR_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const RECENT_EMAIL_ROUTER_CONTEXT_TURNS = 3;
 const RECENT_INTENT_ROUTER_CONTEXT_TURNS = 3;
@@ -246,6 +275,11 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "images",
   "getfile",
   "web",
+  "lim",
+  "news",
+  "crypto",
+  "weather",
+  "reddit",
   "webopen",
   "webask",
   "gmail",
@@ -256,6 +290,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "selfskill",
   "selfrestart",
   "selfupdate",
+  "eco",
   "shellmode",
   "shell",
   "adminmode",
@@ -263,6 +298,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "approve",
   "deny",
   "panic",
+  "intentstats",
 ]);
 
 function getActiveAgent(chatId: number): string {
@@ -279,6 +315,29 @@ function isAiShellModeEnabled(chatId: number): boolean {
 
 function setAiShellMode(chatId: number, enabled: boolean): void {
   aiShellModeByChat.set(chatId, enabled);
+}
+
+function isEcoModeEnabled(chatId: number): boolean {
+  return ecoModeByChat.get(chatId) ?? config.ecoModeDefault;
+}
+
+function setEcoMode(chatId: number, enabled: boolean): void {
+  ecoModeByChat.set(chatId, enabled);
+}
+
+async function askOpenAiForChat(params: {
+  chatId: number;
+  prompt: string;
+  context?: PromptContextSnapshot;
+  concise?: boolean;
+  maxOutputTokens?: number;
+}): Promise<string> {
+  const ecoEnabled = isEcoModeEnabled(params.chatId);
+  return openAi.ask(params.prompt, {
+    context: params.context,
+    concise: params.concise ?? ecoEnabled,
+    maxOutputTokens: params.maxOutputTokens ?? (ecoEnabled ? config.openAiEcoMaxOutputTokens : undefined),
+  });
 }
 
 function sanitizeSelfSkillText(text: string): string {
@@ -553,6 +612,22 @@ type WebIntent = {
   newsRequested: boolean;
 };
 
+type NewsVertical =
+  | "football"
+  | "finance"
+  | "technology"
+  | "science"
+  | "robotics"
+  | "automation"
+  | "ai"
+  | "marketing"
+  | "general";
+
+type CuratedNewsDomains = {
+  es: string[];
+  en: string[];
+};
+
 type SelfMaintenanceIntent = {
   shouldHandle: boolean;
   action?: "add-skill" | "delete-skill" | "list-skills" | "restart-service" | "update-service";
@@ -560,12 +635,16 @@ type SelfMaintenanceIntent = {
   skillIndex?: number;
 };
 
-type ConnectorNaturalAction = "status" | "start" | "stop" | "restart";
+type ConnectorNaturalAction = "status" | "start" | "stop" | "restart" | "query";
 
 type ConnectorNaturalIntent = {
   shouldHandle: boolean;
   action?: ConnectorNaturalAction;
   includeTunnel?: boolean;
+  firstName?: string;
+  lastName?: string;
+  sourceName?: string;
+  count?: number;
 };
 
 type ScheduleNaturalAction = "create" | "list" | "delete" | "edit";
@@ -667,6 +746,36 @@ type NaturalIntentHandlerName =
   | "document"
   | "web"
   | "none";
+
+type IntentRouterFilterDecision = {
+  allowed: Exclude<NaturalIntentHandlerName, "none">[];
+  reason: string;
+};
+
+type IntentRouterDatasetEntry = {
+  ts: string;
+  chatId: number;
+  userId?: number;
+  source: string;
+  text: string;
+  hasMailContext: boolean;
+  hasMemoryRecallCue: boolean;
+  routeCandidates: Exclude<NaturalIntentHandlerName, "none">[];
+  routeFilterReason?: string;
+  routeFilterAllowed?: Exclude<NaturalIntentHandlerName, "none">[];
+  semantic?: {
+    handler: Exclude<NaturalIntentHandlerName, "none">;
+    score: number;
+    reason: string;
+    alternatives: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }>;
+  };
+  ai?: {
+    handler: NaturalIntentHandlerName;
+    reason?: string;
+  };
+  finalHandler: Exclude<NaturalIntentHandlerName, "none"> | "indexed-list-reference" | "none";
+  handled: boolean;
+};
 
 type AiSequencePlanStep = {
   instruction: string;
@@ -930,7 +1039,7 @@ function buildMemoryRecallSummaryFallback(query: string, hits: PromptMemoryHit[]
   return `${paragraphOne}\n\n${paragraphTwo}`;
 }
 
-async function summarizeMemoryRecallNatural(query: string, hits: PromptMemoryHit[]): Promise<string> {
+async function summarizeMemoryRecallNatural(chatId: number, query: string, hits: PromptMemoryHit[]): Promise<string> {
   if (!openAi.isConfigured()) {
     return buildMemoryRecallSummaryFallback(query, hits);
   }
@@ -959,7 +1068,7 @@ async function summarizeMemoryRecallNatural(query: string, hits: PromptMemoryHit
   ].join("\n");
 
   try {
-    const summary = (await openAi.ask(prompt)).trim();
+    const summary = (await askOpenAiForChat({ chatId, prompt })).trim();
     if (!summary) {
       return buildMemoryRecallSummaryFallback(query, hits);
     }
@@ -3113,6 +3222,130 @@ function normalizeSearchSnippet(raw: string, maxChars = 220): string {
   return truncateInline(cleaned, maxChars);
 }
 
+const CURATED_NEWS_DOMAINS: Record<NewsVertical, CuratedNewsDomains> = {
+  football: {
+    es: ["ole.com.ar", "tycsports.com", "espn.com.ar", "as.com", "marca.com"],
+    en: ["espn.com", "bbc.com", "goal.com", "theathletic.com"],
+  },
+  finance: {
+    es: ["ambito.com", "cronista.com", "expansion.com", "infobae.com", "eleconomista.es"],
+    en: ["reuters.com", "bloomberg.com", "cnbc.com", "ft.com", "wsj.com", "marketwatch.com"],
+  },
+  technology: {
+    es: ["xataka.com", "genbeta.com", "hipertextual.com", "wwwhatsnew.com"],
+    en: ["techcrunch.com", "theverge.com", "wired.com", "arstechnica.com", "venturebeat.com"],
+  },
+  science: {
+    es: ["muyinteresante.com", "nationalgeographic.com.es", "agenciasinc.es"],
+    en: ["nature.com", "science.org", "sciencenews.org", "space.com", "nasa.gov"],
+  },
+  robotics: {
+    es: ["xataka.com", "elconfidencial.com"],
+    en: ["therobotreport.com", "ieee.org", "spectrum.ieee.org", "roboticsbusinessreview.com"],
+  },
+  automation: {
+    es: ["xataka.com", "genbeta.com"],
+    en: ["automationworld.com", "iiot-world.com", "theautomationdaily.com"],
+  },
+  ai: {
+    es: ["xataka.com", "genbeta.com", "hipertextual.com"],
+    en: ["openai.com", "deepmind.google", "venturebeat.com", "techcrunch.com", "theverge.com"],
+  },
+  marketing: {
+    es: ["puromarketing.com", "marketingdirecto.com", "reasonwhy.es"],
+    en: ["adweek.com", "marketingweek.com", "hubspot.com", "socialmediatoday.com"],
+  },
+  general: {
+    es: ["elpais.com", "bbc.com/mundo", "dw.com/es", "infobae.com"],
+    en: ["reuters.com", "apnews.com", "bbc.com", "nytimes.com"],
+  },
+};
+
+function matchesDomain(hostname: string, domain: string): boolean {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+function detectNewsVertical(rawQuery: string): NewsVertical {
+  const normalized = normalizeIntentText(rawQuery);
+  if (!normalized) {
+    return "general";
+  }
+  if (/\b(futbol|futbolero|futbolera|football|soccer|boca|river|champions|premier league|liga)\b/.test(normalized)) {
+    return "football";
+  }
+  if (/\b(finanzas?|economia|economica|economic|negocios?|mercados?|bolsa|acciones?|stocks?|crypto|cripto|bitcoin|ethereum)\b/.test(normalized)) {
+    return "finance";
+  }
+  if (/\b(astronomia|astronomy|espacio|space|nasa|galaxia|telescopio|cosmos|astrofisica)\b/.test(normalized)) {
+    return "science";
+  }
+  if (/\b(robotica|robotics?|robot)\b/.test(normalized)) {
+    return "robotics";
+  }
+  if (/\b(automatizacion|automacion|automation|rpa|workflow)\b/.test(normalized)) {
+    return "automation";
+  }
+  if (/\b(marketing|growth|seo|sem|publicidad|ads|branding)\b/.test(normalized)) {
+    return "marketing";
+  }
+  if (/\b(ia|ai|inteligencia artificial|llm|machine learning|aprendizaje automatico|generative)\b/.test(normalized)) {
+    return "ai";
+  }
+  if (/\b(tecnologia|tecnologias|technology|tech|software|hardware|startup|startups)\b/.test(normalized)) {
+    return "technology";
+  }
+  if (/\b(ciencia|science|cientific)\b/.test(normalized)) {
+    return "science";
+  }
+  return "general";
+}
+
+function buildCuratedNewsDomains(rawQuery: string): { vertical: NewsVertical; domains: string[] } {
+  const vertical = detectNewsVertical(rawQuery);
+  const verticalCatalog = CURATED_NEWS_DOMAINS[vertical];
+  const generalCatalog = CURATED_NEWS_DOMAINS.general;
+  const preferred = [
+    ...verticalCatalog.es.slice(0, 3),
+    ...verticalCatalog.en.slice(0, 3),
+    ...generalCatalog.es.slice(0, 2),
+    ...generalCatalog.en.slice(0, 2),
+  ];
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const domainRaw of preferred) {
+    const domain = domainRaw.trim().toLowerCase();
+    if (!domain || seen.has(domain)) {
+      continue;
+    }
+    seen.add(domain);
+    deduped.push(domain);
+  }
+  return { vertical, domains: deduped };
+}
+
+function computeNewsSourceAuthorityScore(hit: WebSearchResult): number {
+  if (isRedditUrl(hit.url)) {
+    return 3;
+  }
+  const domain = resolveWebResultDomain(hit.url);
+  if (domain === "sitio desconocido") {
+    return -2;
+  }
+  let best = 0;
+  for (const catalog of Object.values(CURATED_NEWS_DOMAINS)) {
+    for (const curated of [...catalog.es, ...catalog.en]) {
+      const normalized = curated.trim().toLowerCase();
+      if (!normalized) {
+        continue;
+      }
+      if (matchesDomain(domain, normalized)) {
+        best = Math.max(best, 8);
+      }
+    }
+  }
+  return best;
+}
+
 function buildValidUtcDate(year: number, month: number, day: number): Date | null {
   if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
     return null;
@@ -3357,11 +3590,12 @@ function computeNewsRecencyScore(date: Date | null, now: Date = new Date()): num
 function buildNewsPriorityScore(hit: WebSearchResult, index: number, now: Date = new Date()): number {
   const date = extractDetectedNewsDate(hit, now);
   const recencyScore = computeNewsRecencyScore(date, now);
+  const sourceAuthority = computeNewsSourceAuthorityScore(hit);
   const snippet = normalizeSearchSnippet(hit.snippet, 240);
   const snippetQuality = snippet ? Math.min(4, snippet.length / 80) : -1.2;
   const titleQuality = hit.title.trim().length >= 14 ? 1.5 : 0;
   const orderBias = Math.max(0, 7 - index * 0.7);
-  return recencyScore + snippetQuality + titleQuality + orderBias;
+  return recencyScore + sourceAuthority + snippetQuality + titleQuality + orderBias;
 }
 
 function formatNewsDetectedDate(date: Date | null): string {
@@ -3429,7 +3663,7 @@ function isLikelyNewsQuery(text: string): boolean {
   const newsNoun = /\b(noticias?|novedades?|titulares?|actualidad|news)\b/.test(normalized);
   const recencyCue = /\b(hoy|ayer|ultim[oa]s?|reciente|actual(?:es)?|semana|mes)\b/.test(normalized);
   const topicCue =
-    /\b(cripto|crypto|bitcoin|ethereum|blockchain|negocios|economia|economía|mercados?|finanzas?|ia|ai|inteligencia artificial|politica|política|argentina|futbol|fútbol|deportes?)\b/.test(
+    /\b(cripto|crypto|bitcoin|ethereum|blockchain|negocios|economia|economía|mercados?|finanzas?|ia|ai|inteligencia artificial|politica|política|argentina|futbol|fútbol|deportes?|tecnologia|tecnología|science|ciencia|astronomia|astronomía|robotica|robótica|automatizacion|automatización|marketing)\b/.test(
       normalized,
     );
   return newsNoun || (topicCue && recencyCue);
@@ -3475,14 +3709,24 @@ function prioritizeNewsResultsWithRedditCap(params: {
       reddit: isRedditUrl(hit.url),
     };
   });
-  const recentEnough = ranked.filter((item) => {
-    if (!item.detectedDate) {
-      return true;
-    }
-    const ageDays = (now.getTime() - item.detectedDate.getTime()) / (24 * 60 * 60 * 1000);
-    return ageDays <= 365;
-  });
-  const pool = recentEnough.length >= params.limit ? recentEnough : ranked;
+  const isWithinFreshWindow = (date: Date): boolean => {
+    const ageDays = (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000);
+    return ageDays >= -1 && ageDays <= NEWS_MAX_AGE_DAYS;
+  };
+  const freshDated = ranked.filter((item) => item.detectedDate && isWithinFreshWindow(item.detectedDate));
+  const undated = ranked.filter((item) => !item.detectedDate);
+  const stale = ranked.filter((item) => item.detectedDate && !isWithinFreshWindow(item.detectedDate));
+  let pool: typeof ranked = [];
+  if (freshDated.length > 0) {
+    pool = [...freshDated, ...undated];
+  } else if (undated.length > 0) {
+    pool = undated;
+  } else {
+    pool = stale;
+  }
+  if (pool.length < params.limit) {
+    pool = [...pool, ...ranked.filter((item) => !pool.some((entry) => entry.hit.url === item.hit.url))];
+  }
   const byScore = (a: (typeof pool)[number], b: (typeof pool)[number]): number => {
     if (b.score !== a.score) {
       return b.score - a.score;
@@ -3541,6 +3785,71 @@ function buildFreshNewsSearchQuery(rawQuery: string): string {
   return `${base} ultimas noticias hoy ultimas horas ${month} ${year}`.replace(/\s+/g, " ").trim();
 }
 
+function formatRedditPostDate(createdUtc: number): string {
+  if (!Number.isFinite(createdUtc) || createdUtc <= 0) {
+    return "fecha-desconocida";
+  }
+  try {
+    return new Date(createdUtc * 1000).toISOString().slice(0, 10);
+  } catch {
+    return "fecha-desconocida";
+  }
+}
+
+function formatIsoDateCompact(isoRaw: string): string {
+  const raw = isoRaw.trim();
+  if (!raw) {
+    return "fecha desconocida";
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return raw.slice(0, 19);
+  }
+  return parsed.toISOString().slice(0, 16).replace("T", " ");
+}
+
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "n/d";
+  }
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: value >= 100 ? 2 : 6,
+  }).format(value);
+}
+
+function formatSignedPercent(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "n/d";
+  }
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
+function redditPostsToWebSearchResults(posts: RedditPostResult[]): WebSearchResult[] {
+  return posts.map((post) => {
+    const datePart = formatRedditPostDate(post.createdUtc);
+    const metrics = `r/${post.subreddit} | ${datePart} | score ${post.score} | comentarios ${post.numComments}`;
+    const textPart = normalizeSearchSnippet(post.selfText, 170);
+    return {
+      title: post.title,
+      url: post.url || post.permalink,
+      snippet: textPart ? `${metrics} | ${textPart}` : metrics,
+    };
+  });
+}
+
+function newsArticlesToWebSearchResults(articles: NewsArticleResult[]): WebSearchResult[] {
+  return articles.map((item) => ({
+    title: item.title,
+    url: item.url,
+    snippet: [item.source, formatIsoDateCompact(item.publishedAt), normalizeSearchSnippet(item.description, 180)]
+      .filter(Boolean)
+      .join(" | "),
+  }));
+}
+
 function detectWebIntent(text: string): WebIntent {
   const original = text.trim();
   if (!original) {
@@ -3567,7 +3876,7 @@ function detectWebIntent(text: string): WebIntent {
   );
   const newsNoun = /\b(noticias?|novedades?|titulares?|actualidad)\b/.test(normalized);
   const topicNoun =
-    /\b(cripto|crypto|bitcoin|ethereum|blockchain|negocios|economia|economía|mercados?|finanzas?|ia|ai|inteligencia artificial|politica|política|argentina|futbol|fútbol|deportes?)\b/.test(
+    /\b(cripto|crypto|bitcoin|ethereum|blockchain|negocios|economia|economía|mercados?|finanzas?|ia|ai|inteligencia artificial|politica|política|argentina|futbol|fútbol|deportes?|tecnologia|tecnología|science|ciencia|astronomia|astronomía|robotica|robótica|automatizacion|automatización|marketing)\b/.test(
       normalized,
     );
   const newsRequested = newsNoun || (topicNoun && /\b(ultim[oa]s?|actual(?:es)?|hoy|reciente)\b/.test(normalized));
@@ -3623,12 +3932,54 @@ async function runWebSearchQuery(params: {
       10,
       Math.max(config.webSearchMaxResults + NEWS_MAX_REDDIT_RESULTS, config.webSearchMaxResults * 2),
     );
-    const [redditHits, recentGeneralHits, generalHits] = await Promise.all([
-      webBrowser.search(`${queryText} site:reddit.com hoy ultimas horas`, expandedLimit),
+    const curated = buildCuratedNewsDomains(rawQuery || queryText);
+    const perDomainLimit = Math.max(2, Math.min(4, Math.ceil(expandedLimit / 3)));
+    const domainSearchTasks = curated.domains
+      .slice(0, NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES)
+      .map((domain) =>
+        webBrowser.search(`${queryText} site:${domain} ultimos 7 dias last 7 days`, perDomainLimit),
+      );
+
+    const to = new Date();
+    const from = new Date(to.getTime() - NEWS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000);
+    const [redditPosts, apiNewsEs, apiNewsEn, recentGeneralHits, generalHits, specializedResults] = await Promise.all([
+      redditApi.searchPosts({
+        query: queryText,
+        limit: Math.max(NEWS_MAX_REDDIT_RESULTS * 2, expandedLimit),
+        sort: "new",
+        time: "week",
+      }),
+      newsApi.isConfigured()
+        ? newsApi.searchLatest({
+            query: queryText,
+            limit: Math.max(3, Math.min(10, expandedLimit)),
+            language: "es",
+            from,
+            to,
+          })
+        : Promise.resolve([]),
+      newsApi.isConfigured()
+        ? newsApi.searchLatest({
+            query: queryText,
+            limit: Math.max(2, Math.min(6, Math.floor(expandedLimit / 2))),
+            language: "en",
+            from,
+            to,
+          })
+        : Promise.resolve([]),
       webBrowser.search(`${queryText} hoy ultimas horas`, expandedLimit),
       webBrowser.search(queryText, expandedLimit),
+      Promise.allSettled(domainSearchTasks),
     ]);
-    const mergedGeneral = mergeWebSearchResults([...recentGeneralHits, ...generalHits], expandedLimit * 2);
+    const redditHits = redditPostsToWebSearchResults(redditPosts);
+    const specializedHits = specializedResults.flatMap((entry) =>
+      entry.status === "fulfilled" ? entry.value : [],
+    );
+    const apiNewsHits = newsArticlesToWebSearchResults([...apiNewsEs, ...apiNewsEn]);
+    const mergedGeneral = mergeWebSearchResults(
+      [...apiNewsHits, ...specializedHits, ...recentGeneralHits, ...generalHits],
+      expandedLimit * 3,
+    );
     return prioritizeNewsResultsWithRedditCap({
       redditHits,
       generalHits: mergedGeneral,
@@ -3750,6 +4101,38 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     ) || /\bapi de (?:lim|connector)\b/.test(normalized);
   const mentionsCloudflared = /\b(cloudflared|tunel|tunnel|cloudflare)\b/.test(normalized);
   const explicitContext = mentionsConnector || mentionsCloudflared;
+
+  const firstNameMatch = original.match(/\bfirst[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i);
+  const lastNameMatch = original.match(/\blast[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i);
+  const sourceMatch = original.match(/\b(fuente|source)\s*[:=]\s*([^\n,;|]+)/i);
+  const countMatch = original.match(/\bcount\s*[:=]\s*(\d{1,2})\b/i);
+  const queryVerb = /\b(consulta|consultar|busca|buscar|trae|traer|lee|leer|mensaje|mensajes)\b/.test(normalized);
+  const hasLimParams = Boolean(firstNameMatch && lastNameMatch && sourceMatch);
+  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && hasLimParams) {
+    const parsedCount = Number.parseInt(countMatch?.[1] ?? "", 10);
+    return {
+      shouldHandle: true,
+      action: "query",
+      firstName: (firstNameMatch?.[1] ?? "").trim(),
+      lastName: (lastNameMatch?.[1] ?? "").trim(),
+      sourceName: (sourceMatch?.[2] ?? "").trim(),
+      ...(Number.isFinite(parsedCount) ? { count: Math.max(1, Math.min(10, parsedCount)) } : {}),
+    };
+  }
+  const fullNameMatch = original.match(
+    /\b(?:de|para)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\b/i,
+  );
+  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && sourceMatch && fullNameMatch) {
+    const parsedCount = Number.parseInt(countMatch?.[1] ?? "", 10);
+    return {
+      shouldHandle: true,
+      action: "query",
+      firstName: (fullNameMatch?.[1] ?? "").trim(),
+      lastName: (fullNameMatch?.[2] ?? "").trim(),
+      sourceName: (sourceMatch?.[2] ?? "").trim(),
+      ...(Number.isFinite(parsedCount) ? { count: Math.max(1, Math.min(10, parsedCount)) } : {}),
+    };
+  }
 
   const restartRequested = /\b(reinicia|reiniciar|reiniciala|reinicialo|restart|rearranca|rearrancar)\b/.test(
     normalized,
@@ -4673,6 +5056,284 @@ function getRecentEmailRouterContext(chatId: number, currentUserText: string): s
   return getRecentConversationContext(chatId, currentUserText, RECENT_EMAIL_ROUTER_CONTEXT_TURNS);
 }
 
+function uniqueRouteCandidates(candidates: Exclude<NaturalIntentHandlerName, "none">[]): Exclude<NaturalIntentHandlerName, "none">[] {
+  return Array.from(new Set(candidates));
+}
+
+function narrowRouteCandidates(
+  base: Exclude<NaturalIntentHandlerName, "none">[],
+  subset: Exclude<NaturalIntentHandlerName, "none">[],
+): Exclude<NaturalIntentHandlerName, "none">[] {
+  const allowedSet = new Set(subset);
+  const next = base.filter((candidate) => allowedSet.has(candidate));
+  return next.length > 0 ? next : base;
+}
+
+function buildIntentRouterContextFilter(params: {
+  chatId: number;
+  text: string;
+  candidates: Exclude<NaturalIntentHandlerName, "none">[];
+  hasMailContext: boolean;
+  hasMemoryRecallCue: boolean;
+}): IntentRouterFilterDecision | null {
+  const normalized = normalizeIntentText(params.text);
+  if (!normalized) {
+    return null;
+  }
+
+  const reasons: string[] = [];
+  let allowed = uniqueRouteCandidates(params.candidates);
+  const now = Date.now();
+
+  const pendingDelete = pendingWorkspaceDeleteByChat.get(params.chatId);
+  if (pendingDelete && pendingDelete.expiresAtMs > now) {
+    allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
+    reasons.push("pending-workspace-delete");
+  }
+  const pendingDeletePath = pendingWorkspaceDeletePathByChat.get(params.chatId);
+  if (pendingDeletePath && pendingDeletePath.expiresAtMs > now) {
+    allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
+    reasons.push("pending-workspace-delete-path");
+  }
+
+  const indexedListIntent = parseIndexedListReferenceIntent(params.text);
+  const listContext = getIndexedListContext(params.chatId);
+  const ordinalReference =
+    /\b(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta|ultimo|ultima|penultimo|penultima|anterior)\b/.test(
+      normalized,
+    ) || /\b\d{1,3}\b/.test(normalized);
+  const likelyListReference = indexedListIntent.shouldHandle || ordinalReference;
+  if (listContext && likelyListReference) {
+    if (listContext.kind === "gmail-list") {
+      allowed = narrowRouteCandidates(allowed, ["gmail", "gmail-recipients"]);
+      reasons.push("indexed-list:gmail");
+    } else if (listContext.kind === "web-results") {
+      allowed = narrowRouteCandidates(allowed, ["web"]);
+      reasons.push("indexed-list:web");
+    } else if (listContext.kind === "workspace-list" || listContext.kind === "stored-files") {
+      allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
+      reasons.push("indexed-list:workspace");
+    }
+  }
+
+  const isShortFollowUp = normalized.length <= 120;
+  const followUpPronouns = /\b(ese|esa|eso|este|esta|esto|lo|la|el|ultimo|ultima|anterior)\b/.test(normalized);
+  if (isShortFollowUp && followUpPronouns) {
+    if ((lastGmailResultsByChat.get(params.chatId)?.length ?? 0) > 0 && !/\b(archivo|carpeta|workspace|pdf|documento)\b/.test(normalized)) {
+      allowed = narrowRouteCandidates(allowed, ["gmail", "gmail-recipients"]);
+      reasons.push("recent-gmail-followup");
+    }
+    if ((lastListedFilesByChat.get(params.chatId)?.length ?? 0) > 0 && /\b(archivo|carpeta|workspace|documento|pdf|txt|csv|json|md|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized)) {
+      allowed = narrowRouteCandidates(allowed, ["workspace", "document"]);
+      reasons.push("recent-workspace-followup");
+    }
+  }
+
+  const hasRecentConnectorContext = (lastConnectorContextByChat.get(params.chatId) ?? 0) + CONNECTOR_CONTEXT_TTL_MS > now;
+  const connectorControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
+    normalized,
+  );
+  const mentionsOtherDomain = /\b(gmail|correo|email|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(normalized);
+  if (hasRecentConnectorContext && connectorControlVerb && !mentionsOtherDomain) {
+    allowed = narrowRouteCandidates(allowed, ["connector"]);
+    reasons.push("recent-connector-context");
+  }
+
+  if (params.hasMailContext && !params.hasMemoryRecallCue) {
+    allowed = narrowRouteCandidates(allowed, ["gmail", "gmail-recipients"]);
+    reasons.push("mail-lexical-cue");
+  } else if (params.hasMemoryRecallCue) {
+    allowed = narrowRouteCandidates(allowed, ["memory", "stoic-smalltalk"]);
+    reasons.push("memory-recall-cue");
+  }
+
+  const base = uniqueRouteCandidates(params.candidates);
+  const changed = allowed.length !== base.length || allowed.some((item, index) => item !== base[index]);
+  if (!changed) {
+    return null;
+  }
+  return {
+    allowed,
+    reason: reasons.join(", "),
+  };
+}
+
+function quantile(values: number[], q: number): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const pos = Math.max(0, Math.min(sorted.length - 1, (sorted.length - 1) * q));
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const left = sorted[base] ?? sorted[0]!;
+  const right = sorted[Math.min(sorted.length - 1, base + 1)] ?? left;
+  return left + (right - left) * rest;
+}
+
+function suggestIntentThreshold(params: {
+  current: number;
+  truePositiveScores: number[];
+  falsePositiveScores: number[];
+}): number | null {
+  if (params.truePositiveScores.length < 8) {
+    return null;
+  }
+  const lowTruePositive = quantile(params.truePositiveScores, 0.2);
+  if (params.falsePositiveScores.length < 5) {
+    const conservative = Math.max(params.current, lowTruePositive - 0.01);
+    const rounded = Number(Math.max(0.05, Math.min(0.95, conservative)).toFixed(3));
+    return Math.abs(rounded - params.current) >= 0.01 ? rounded : null;
+  }
+
+  const highFalsePositive = quantile(params.falsePositiveScores, 0.8);
+  const candidate =
+    highFalsePositive < lowTruePositive
+      ? (highFalsePositive + lowTruePositive) / 2
+      : lowTruePositive - 0.01;
+  const rounded = Number(Math.max(0.05, Math.min(0.95, candidate)).toFixed(3));
+  return Math.abs(rounded - params.current) >= 0.01 ? rounded : null;
+}
+
+async function appendIntentRouterDatasetEntry(entry: IntentRouterDatasetEntry): Promise<void> {
+  const line = `${JSON.stringify(entry)}\n`;
+  intentRouterDatasetPersistQueue = intentRouterDatasetPersistQueue
+    .then(async () => {
+      await fs.mkdir(path.dirname(intentRouterDatasetFilePath), { recursive: true });
+      await fs.appendFile(intentRouterDatasetFilePath, line, "utf8");
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      logWarn(`No pude persistir dataset de intent router: ${message}`);
+    });
+  await intentRouterDatasetPersistQueue;
+}
+
+async function readIntentRouterDatasetEntries(limit: number): Promise<IntentRouterDatasetEntry[]> {
+  try {
+    const raw = await fs.readFile(intentRouterDatasetFilePath, "utf8");
+    const lines = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const selected = lines.slice(-Math.max(1, Math.min(20_000, limit)));
+    const entries: IntentRouterDatasetEntry[] = [];
+    for (const line of selected) {
+      try {
+        const parsed = JSON.parse(line) as IntentRouterDatasetEntry;
+        if (parsed && typeof parsed === "object" && typeof parsed.chatId === "number" && typeof parsed.text === "string") {
+          entries.push(parsed);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return entries;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/enoent/i.test(message)) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function buildIntentRouterStatsReport(limit: number): Promise<string> {
+  const entries = await readIntentRouterDatasetEntries(limit);
+  if (entries.length === 0) {
+    return [
+      "Intent router stats",
+      `dataset: ${toProjectRelativePath(intentRouterDatasetFilePath)}`,
+      "No hay muestras todavía.",
+    ].join("\n");
+  }
+
+  const routeNames = semanticIntentRouter.listRouteThresholds().map((item) => item.name);
+  const lines: string[] = [
+    "Intent router stats",
+    `dataset: ${toProjectRelativePath(intentRouterDatasetFilePath)}`,
+    `muestras: ${entries.length}`,
+  ];
+
+  const byRoute = new Map<
+    Exclude<NaturalIntentHandlerName, "none">,
+    {
+      selected: number;
+      hit: number;
+      falsePositive: number;
+      avgScoreNumerator: number;
+      tpScores: number[];
+      fpScores: number[];
+    }
+  >();
+
+  for (const routeName of routeNames) {
+    byRoute.set(routeName, {
+      selected: 0,
+      hit: 0,
+      falsePositive: 0,
+      avgScoreNumerator: 0,
+      tpScores: [],
+      fpScores: [],
+    });
+  }
+
+  let filteredCount = 0;
+  for (const entry of entries) {
+    if ((entry.routeFilterAllowed?.length ?? 0) > 0 && (entry.routeFilterAllowed?.length ?? 0) < entry.routeCandidates.length) {
+      filteredCount += 1;
+    }
+    if (!entry.semantic) {
+      continue;
+    }
+    const routeStats = byRoute.get(entry.semantic.handler);
+    if (!routeStats) {
+      continue;
+    }
+    routeStats.selected += 1;
+    routeStats.avgScoreNumerator += entry.semantic.score;
+    if (entry.finalHandler === entry.semantic.handler) {
+      routeStats.hit += 1;
+      routeStats.tpScores.push(entry.semantic.score);
+    } else {
+      routeStats.falsePositive += 1;
+      routeStats.fpScores.push(entry.semantic.score);
+    }
+  }
+
+  lines.push(`route_filter aplicado: ${filteredCount}/${entries.length}`);
+  lines.push("");
+  lines.push("Por ruta:");
+  for (const routeName of routeNames) {
+    const stats = byRoute.get(routeName);
+    if (!stats) {
+      continue;
+    }
+    const currentThreshold = semanticIntentRouter.getRouteThreshold(routeName) ?? 0;
+    const avgScore = stats.selected > 0 ? stats.avgScoreNumerator / stats.selected : 0;
+    const precision = stats.selected > 0 ? stats.hit / stats.selected : 0;
+    const suggested = suggestIntentThreshold({
+      current: currentThreshold,
+      truePositiveScores: stats.tpScores,
+      falsePositiveScores: stats.fpScores,
+    });
+    lines.push(
+      [
+        `- ${routeName}`,
+        `selected=${stats.selected}`,
+        `hit=${stats.hit}`,
+        `fp=${stats.falsePositive}`,
+        `precision=${(precision * 100).toFixed(1)}%`,
+        `avg_score=${avgScore.toFixed(3)}`,
+        `threshold=${currentThreshold.toFixed(3)}`,
+        `suggested=${suggested === null ? "sin cambio" : suggested.toFixed(3)}`,
+      ].join(" | "),
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function tryParseNaturalRouteDecision(raw: string): {
   handler: NaturalIntentHandlerName;
   reason?: string;
@@ -4740,7 +5401,7 @@ async function classifyNaturalIntentRouteWithAi(params: {
     "Handlers disponibles:",
     "- stoic-smalltalk: charla corta estoica/motivacional.",
     "- self-maintenance: tareas del propio agente (skills, update, restart).",
-    "- connector: estado/start/stop/restart del connector/tunnel.",
+    "- connector: estado/start/stop/restart de LIM/tunnel y consulta de mensajes LIM (first_name, last_name, fuente).",
     "- schedule: crear/listar/editar/eliminar tareas o recordatorios.",
     "- memory: preguntas de memoria/recuerdo/contexto previo.",
     "- gmail-recipients: ABM de destinatarios guardados.",
@@ -4763,7 +5424,7 @@ async function classifyNaturalIntentRouteWithAi(params: {
   ].join("\n");
   const promptContext = await buildPromptContextForQuery(text, { chatId: params.chatId });
   try {
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
     return tryParseNaturalRouteDecision(answer);
   } catch {
     return null;
@@ -4854,7 +5515,7 @@ async function classifySequencedIntentPlanWithAi(params: {
   ].join("\n");
   const promptContext = await buildPromptContextForQuery(text, { chatId: params.chatId });
   try {
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
     const parsed = tryParseAiSequencePlan(answer);
     if (!parsed || parsed.mode !== "sequence" || parsed.steps.length < 2) {
       return null;
@@ -4884,7 +5545,7 @@ async function generateSequenceStepContentWithAi(params: {
   ].join("\n");
   const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
   try {
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
     const content = answer.trim();
     return content || null;
   } catch {
@@ -4956,7 +5617,7 @@ async function classifyMissingSubjectEmailModeWithAi(params: {
     ...(background.length > 0 ? ["Contexto previo (ultimos 3 turnos):", ...background] : ["Contexto previo: (vacio)"]),
   ].join("\n");
   const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
-  const answer = await openAi.ask(prompt, { context: promptContext });
+  const answer = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
   const parsed = tryParseEmailModeDecision(answer);
   if (!parsed) {
     return fallbackLiteral ? { mode: "literal", literalBody: fallbackLiteral } : { mode: "improvise" };
@@ -5039,7 +5700,7 @@ async function draftGmailMessageWithAi(params: {
 
   try {
     const promptContext = await buildPromptContextForQuery(instruction, { chatId: params.chatId });
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
     return tryParseGmailDraftJson(answer);
   } catch {
     return null;
@@ -5254,7 +5915,7 @@ async function buildGmailAutoContent(params: {
           "Sin markdown. Solo texto plano.",
         ].join("\n");
         const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
-        const reflection = await openAi.ask(prompt, { context: promptContext });
+        const reflection = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
         if (reflection.trim()) {
           return {
             subject: "Reflexión estoica del día",
@@ -5283,7 +5944,7 @@ async function buildGmailAutoContent(params: {
     try {
       const prompt = "Escribe un poema breve en español (10-14 versos), tono sobrio y elegante, sin markdown.";
       const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
-      const poem = await openAi.ask(prompt, { context: promptContext });
+      const poem = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
       if (poem.trim()) {
         return {
           subject: "Poema del día",
@@ -6136,6 +6797,37 @@ function pickGenericFileExtension(input: { fileName?: string; telegramFilePath?:
   return "";
 }
 
+function sanitizeIncomingWorkspaceFileName(raw: string): string {
+  const baseName = path.basename(raw.trim()).replace(/[\u0000-\u001f\u007f]/g, "").replace(/[\\/]/g, "-").trim();
+  const normalized = baseName.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "archivo";
+  }
+  return normalized.slice(0, 180);
+}
+
+async function resolveUniqueIncomingWorkspaceFilePath(params: {
+  dir: string;
+  desiredName: string;
+}): Promise<string> {
+  const ext = path.extname(params.desiredName);
+  const stem = ext ? params.desiredName.slice(0, -ext.length) : params.desiredName;
+  for (let attempt = 0; attempt <= 500; attempt += 1) {
+    const candidateName = attempt === 0 ? params.desiredName : `${stem} (${attempt + 1})${ext}`;
+    const candidatePath = path.join(params.dir, candidateName);
+    try {
+      await fs.access(candidatePath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/enoent/i.test(message)) {
+        return candidatePath;
+      }
+      throw error;
+    }
+  }
+  throw new Error("No pude asignar un nombre único para el archivo adjunto");
+}
+
 async function saveIncomingImage(params: {
   incoming: IncomingImage;
   imageBuffer: Buffer;
@@ -6173,19 +6865,20 @@ async function saveIncomingWorkspaceFile(params: {
 }): Promise<{ fullPath: string; relPath: string }> {
   const now = new Date();
   const datePart = now.toISOString().slice(0, 10);
-  const timePart = now.toISOString().slice(11, 19).replace(/:/g, "");
-  const ext = pickGenericFileExtension({
+  const fallbackExt = pickGenericFileExtension({
     fileName: params.incoming.fileName,
     telegramFilePath: params.telegramFilePath,
   });
-  const base = sanitizeFileNameSegment(params.incoming.fileName);
-  const random = Math.random().toString(36).slice(2, 7);
-  const fileName = `${timePart}-m${params.incoming.messageId}-${base}-${random}${ext}`;
+  const desiredNameRaw = params.incoming.fileName?.trim() || `archivo-${params.incoming.messageId}${fallbackExt}`;
+  const desiredName = sanitizeIncomingWorkspaceFileName(desiredNameRaw);
 
   const dir = path.join(config.workspaceDir, "files", `chat-${params.chatId}`, datePart);
   await fs.mkdir(dir, { recursive: true });
 
-  const fullPath = path.join(dir, fileName);
+  const fullPath = await resolveUniqueIncomingWorkspaceFilePath({
+    dir,
+    desiredName,
+  });
   await fs.writeFile(fullPath, params.fileBuffer);
   return {
     fullPath,
@@ -6524,6 +7217,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Consultando al oraculo de silicio...",
     "Sincronizando sinapsis virtuales...",
     "Poniendo cafe virtual al modelo...",
+    "Afinando la brújula mental del bot...",
+    "Ordenando ideas en modo quirúrgico...",
+    "Cargando contexto de alto octanaje...",
+    "Puliendo la respuesta para que salga fina...",
+    "Encendiendo motor de razonamiento sin humo...",
   ],
   "shell-plan": [
     "Afilando la navaja suiza de comandos...",
@@ -6531,6 +7229,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Negociando con la terminal para que coopere...",
     "Montando plan de ataque con casco y linterna...",
     "Ajustando tornillos del plan shell...",
+    "Mapeando comandos seguros antes de tocar nada...",
+    "Desarmando el problema en pasos ejecutables...",
+    "Chequeando permisos y bordes peligrosos...",
+    "Diseñando ruta de terminal con cinturón puesto...",
+    "Preparando comando limpio, corto y reversible...",
   ],
   "doc-read": [
     "Abriendo el archivo con guantes blancos...",
@@ -6538,6 +7241,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Escaneando letras con lupa digital...",
     "Activando modo bibliotecario serio...",
     "Leyendo sin pestañear...",
+    "Extrayendo texto como arqueólogo paciente...",
+    "Desenrollando el documento hoja por hoja...",
+    "Inspeccionando el archivo con foco de precisión...",
+    "Levantando contenido útil del documento...",
+    "Decodificando formato y contenido en paralelo...",
   ],
   "doc-analyze": [
     "Subrayando lo importante en fosforito imaginario...",
@@ -6545,6 +7253,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Buscando hallazgos entre lineas...",
     "Conectando pistas del documento...",
     "Montando analisis sin humo...",
+    "Separando señal de ruido en el documento...",
+    "Convirtiendo texto largo en conclusiones claras...",
+    "Sintetizando puntos críticos y accionables...",
+    "Cruzando secciones para detectar inconsistencias...",
+    "Preparando lectura ejecutiva del contenido...",
   ],
   "web-search": [
     "Soltando sabuesos binarios por internet...",
@@ -6552,6 +7265,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Encendiendo radar anti-ruido en buscadores...",
     "Pescando fuentes utiles en mar abierto...",
     "Navegando con mapa, brujula y sentido comun...",
+    "Barrido web en curso con filtro anti-humo...",
+    "Levantando señales frescas entre titulares...",
+    "Escarbando fuentes recientes con criterio...",
+    "Explorando la red para traer solo lo relevante...",
+    "Cazando evidencias web con casco y paciencia...",
   ],
   "web-open": [
     "Abriendo la pagina con casco de seguridad...",
@@ -6559,6 +7277,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Chequeando el contenido sin tragar humo...",
     "Aterrizando en la URL con tren de aterrizaje...",
     "Desempolvando el contenido de la pagina...",
+    "Inspeccionando la URL en modo lupa forense...",
+    "Descargando y limpiando contenido de la página...",
+    "Abriendo enlace con protocolo anti-ruido...",
+    "Leyendo la página con ojos de auditor...",
+    "Extrayendo lo útil del sitio sin vueltas...",
   ],
   "gmail-query": [
     "Revisando la bandeja con traje de detective...",
@@ -6566,6 +7289,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Peinando Gmail sin perder hilos...",
     "Abriendo la correspondencia del dia...",
     "Filtrando correos con lupa y mate...",
+    "Consultando Gmail con criterio de archivista...",
+    "Rastreando mensajes clave en la bandeja...",
+    "Ordenando correos por prioridad y contexto...",
+    "Buscando el hilo correcto sin perder el rumbo...",
+    "Escaneando inbox en modo precisión...",
   ],
   "gmail-send": [
     "Puliendo el correo antes del despegue...",
@@ -6573,6 +7301,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Ajustando asunto y cuerpo para envio...",
     "Despachando correo con sello oficial...",
     "Empujando el email por la pista de salida...",
+    "Armando envío con asunto y cuerpo bien atados...",
+    "Revisando destinatario y contenido antes de salir...",
+    "Preparando correo para entrega sin rebotes...",
+    "Finalizando email en modo prolijo...",
+    "Lanzando correo con control de calidad...",
   ],
   "audio-transcribe": [
     "Afinando oidos de robot para transcribir...",
@@ -6580,6 +7313,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Escuchando con auriculares imaginarios...",
     "Traduciendo vibraciones a palabras...",
     "Procesando audio en modo estenografo turbo...",
+    "Desgranando el audio palabra por palabra...",
+    "Levantando texto desde la señal de voz...",
+    "Convirtiendo voz en texto con bisturí digital...",
+    "Transcribiendo audio con paciencia de relojero...",
+    "Capturando cada frase del audio sin perder contexto...",
   ],
   "audio-analyze": [
     "Exprimiendo la transcripcion gota a gota...",
@@ -6587,6 +7325,11 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Armando respuesta a partir de la transcripcion...",
     "Conectando puntos del audio transcripto...",
     "Procesando lo dicho sin perder contexto...",
+    "Interpretando la transcripción con lupa semántica...",
+    "Traduciendo audio a acciones concretas...",
+    "Separando intención principal de detalles secundarios...",
+    "Convirtiendo voz transcripta en plan ejecutable...",
+    "Aterrizando el pedido de audio en pasos claros...",
   ],
   generic: [
     "Moviendo engranajes internos...",
@@ -6594,36 +7337,13 @@ const PROGRESS_NOTICE_VARIANTS: Record<ProgressNoticeKind, string[]> = {
     "Cargando motores sin derramar el cafe...",
     "Haciendo magia sin trucos baratos...",
     "Preparando resultado con precision...",
+    "Alineando contexto para responder mejor...",
+    "Encajando piezas con paciencia quirúrgica...",
+    "Activando modo resolución de problemas...",
+    "Procesando solicitud con método y calma...",
+    "Terminando de cocinar una respuesta útil...",
   ],
 };
-
-const PROGRESS_COMIC_GARNISHES = [
-  "Prometo devolver todo en su lugar.",
-  "Sin romper nada importante... creo.",
-  "Con casco, guantes y dignidad.",
-  "Modo ninja de oficina activado.",
-  "Si explota, explota elegante.",
-  "Nivel de concentración: tostadora industrial.",
-  "Con más estilo que un script en viernes.",
-  "A velocidad legal pero sostenida.",
-  "Sin humo, solo resultados.",
-  "Con precisión de reloj suizo con mate.",
-  "Chequeando dos veces para no llorar después.",
-  "En piloto automático, pero despierto.",
-  "Atajando bugs como arquero en final.",
-  "Con bisturí digital y pulso firme.",
-  "Sin pánico, con teclado.",
-  "Métrica principal: que funcione.",
-  "Ajustando tornillos invisibles.",
-  "Con elegancia de planilla bien cerrada.",
-  "Sin atajos dudosos.",
-  "Como quien no quiere la cosa, pero bien.",
-  "Con atención quirúrgica al detalle molesto.",
-  "Sin drama, con método y café.",
-  "Haciendo que parezca fácil.",
-  "Respaldado por paciencia premium.",
-  "Con cero humo y bastante oficio.",
-];
 
 function normalizeProgressText(text: string): string {
   return text
@@ -6676,19 +7396,15 @@ function pickProgressNoticeVariant(kind: ProgressNoticeKind, chatId?: number): s
     return "Trabajando en eso...";
   }
   const base = variants[Math.floor(Math.random() * variants.length)] ?? "Trabajando en eso...";
-  const garnish = PROGRESS_COMIC_GARNISHES[Math.floor(Math.random() * PROGRESS_COMIC_GARNISHES.length)] ?? "";
-  const composed = garnish ? `${base} ${garnish}` : base;
 
   if (variants.length === 1 || typeof chatId !== "number") {
-    return composed;
+    return base;
   }
 
   const last = lastProgressNoticeByChat.get(chatId) ?? "";
-  let chosen = composed;
+  let chosen = base;
   for (let attempts = 0; attempts < 5 && chosen === last; attempts += 1) {
-    const nextBase = variants[Math.floor(Math.random() * variants.length)] ?? base;
-    const nextGarnish = PROGRESS_COMIC_GARNISHES[Math.floor(Math.random() * PROGRESS_COMIC_GARNISHES.length)] ?? "";
-    chosen = nextGarnish ? `${nextBase} ${nextGarnish}` : nextBase;
+    chosen = variants[Math.floor(Math.random() * variants.length)] ?? base;
   }
   lastProgressNoticeByChat.set(chatId, chosen);
   return chosen;
@@ -6697,6 +7413,37 @@ function pickProgressNoticeVariant(kind: ProgressNoticeKind, chatId?: number): s
 function buildProgressNotice(text: string, chatId?: number): string {
   const kind = classifyProgressNoticeKind(text);
   return pickProgressNoticeVariant(kind, chatId);
+}
+
+function isDetailedAnswerRequested(text: string): boolean {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) {
+    return false;
+  }
+  return /\b(detalle|detallado|detallada|en detalle|en profundidad|profundo|profunda|extenso|extensa|largo|larga|expand|amplia|amplía|desarrolla|desarrollar|exhaustiv|paso a paso|completo|completa)\b/.test(
+    normalized,
+  );
+}
+
+function compactEcoFreeChatAnswer(text: string): string {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length >= 2) {
+    return `${lines[0]}\n${lines[1]}`;
+  }
+  if (lines.length === 1) {
+    const sentences = lines[0]
+      .split(/(?<=[.!?])\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (sentences.length >= 2) {
+      return `${sentences[0]}\n${sentences[1]}`;
+    }
+    return lines[0];
+  }
+  return truncateInline(text.trim(), 220);
 }
 
 async function replyProgress(ctx: { reply: (text: string) => Promise<unknown>; chat?: { id: number } }, text: string) {
@@ -6781,6 +7528,140 @@ function getConnectorHealthUrls(): { localUrl: string; publicUrl: string } {
     localUrl: normalizeConnectorHealthUrl(config.limLocalHealthUrl, "http://127.0.0.1:3333/health"),
     publicUrl: normalizeConnectorHealthUrl(config.limPublicHealthUrl, "http://127.0.0.1:3333/health"),
   };
+}
+
+type LimQueryResult = {
+  ok: boolean;
+  found?: boolean;
+  account?: string;
+  contact?: string;
+  totalMessages?: number;
+  returnedMessages?: number;
+  queryUsed?: string;
+  messages?: Array<{
+    index?: number;
+    direction?: string;
+    time?: string;
+    text?: string;
+  }>;
+  error?: string;
+  detail?: string;
+};
+
+function normalizeLimSourceKey(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function resolveLimAccountFromSource(sourceName: string): { account?: string; error?: string } {
+  const raw = sourceName.trim();
+  if (!raw) {
+    return { error: "fuente vacia" };
+  }
+  if (/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw)) {
+    return { error: "fuente no puede ser email" };
+  }
+  const normalized = normalizeLimSourceKey(raw);
+  if (!normalized) {
+    return { error: "fuente invalida" };
+  }
+  const fromMap = config.limSourceAccountMap[normalized];
+  return { account: fromMap || normalized };
+}
+
+function buildLimMessagesUrl(account: string, firstName: string, lastName: string, count: number): string {
+  const { localUrl } = getConnectorHealthUrls();
+  const base = new URL(localUrl);
+  base.pathname = "/messages";
+  base.search = "";
+  base.searchParams.set("account", account);
+  base.searchParams.set("first_name", firstName);
+  base.searchParams.set("last_name", lastName);
+  base.searchParams.set("count", String(Math.max(1, Math.min(10, Math.floor(count)))));
+  return base.toString();
+}
+
+async function queryLimMessages(params: {
+  firstName: string;
+  lastName: string;
+  sourceName: string;
+  count?: number;
+}): Promise<LimQueryResult> {
+  const firstName = params.firstName.trim();
+  const lastName = params.lastName.trim();
+  const sourceName = params.sourceName.trim();
+  if (!firstName || !lastName || !sourceName) {
+    return { ok: false, error: "missing_params", detail: "first_name, last_name y fuente son obligatorios." };
+  }
+  const resolved = resolveLimAccountFromSource(sourceName);
+  if (!resolved.account) {
+    return { ok: false, error: "invalid_source", detail: resolved.error || "fuente invalida" };
+  }
+
+  const endpoint = buildLimMessagesUrl(resolved.account, firstName, lastName, params.count ?? 3);
+  const controller = new AbortController();
+  const timeoutMs = Math.max(2000, config.limHealthTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+    const bodyText = await response.text();
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(bodyText) as Record<string, unknown>;
+    } catch {
+      parsed = null;
+    }
+
+    if (!response.ok) {
+      const detail =
+        (parsed && (typeof parsed.error === "string" ? parsed.error : typeof parsed.message === "string" ? parsed.message : "")) ||
+        `HTTP ${response.status}`;
+      return {
+        ok: false,
+        account: resolved.account,
+        error: "lim_http_error",
+        detail,
+      };
+    }
+
+    const rows = Array.isArray(parsed?.messages) ? parsed?.messages : [];
+    return {
+      ok: Boolean(parsed?.ok),
+      found: Boolean(parsed?.found),
+      account: typeof parsed?.account === "string" ? parsed.account : resolved.account,
+      contact: typeof parsed?.contact === "string" ? parsed.contact : undefined,
+      totalMessages: typeof parsed?.totalMessages === "number" ? parsed.totalMessages : undefined,
+      returnedMessages: typeof parsed?.returnedMessages === "number" ? parsed.returnedMessages : undefined,
+      queryUsed: typeof parsed?.queryUsed === "string" ? parsed.queryUsed : undefined,
+      messages: rows
+        .slice(0, 10)
+        .map((row) => (typeof row === "object" && row !== null ? row : {}))
+        .map((row) => ({
+          index: typeof row.index === "number" ? row.index : undefined,
+          direction: typeof row.direction === "string" ? row.direction : undefined,
+          time: typeof row.time === "string" ? row.time : undefined,
+          text: typeof row.text === "string" ? row.text : undefined,
+        })),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      account: resolved.account,
+      error: "lim_request_failed",
+      detail: message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function runProfileCommandCapture(params: {
@@ -7795,7 +8676,7 @@ async function buildScheduledEmailBody(params: { chatId: number; instruction: st
       const promptContext = await buildPromptContextForQuery(instruction || "email programado", {
         chatId: params.chatId,
       });
-      const drafted = await openAi.ask(prompt, { context: promptContext });
+      const drafted = await askOpenAiForChat({ chatId: params.chatId, prompt, context: promptContext });
       if (drafted.trim()) {
         return drafted.trim();
       }
@@ -8404,6 +9285,96 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     });
   }
 
+  if (intent.action === "query") {
+    const firstName = intent.firstName?.trim() ?? "";
+    const lastName = intent.lastName?.trim() ?? "";
+    const sourceName = intent.sourceName?.trim() ?? "";
+    if (!firstName || !lastName || !sourceName) {
+      await params.ctx.reply(
+        'Para consultar LIM indica: "consulta LIM first_name:Juan last_name:Perez fuente:account_demo_c_jack [count:3]".',
+      );
+      return true;
+    }
+
+    await replyProgress(params.ctx, `Consultando LIM: ${firstName} ${lastName} | fuente ${sourceName}...`);
+    const result = await queryLimMessages({
+      firstName,
+      lastName,
+      sourceName,
+      count: intent.count ?? 3,
+    });
+    if (!result.ok) {
+      await params.ctx.reply(
+        [
+          "No pude consultar LIM.",
+          `Detalle: ${truncateInline(result.detail || result.error || "error desconocido", 260)}`,
+        ].join("\n"),
+      );
+      await safeAudit({
+        type: "connector.intent_query_failed",
+        chatId,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          action: intent.action,
+          firstName,
+          lastName,
+          sourceName,
+          count: intent.count ?? 3,
+          error: result.error || "",
+          detail: result.detail || "",
+        },
+      });
+      return true;
+    }
+
+    const lines: string[] = [];
+    lines.push(`LIM | ${result.contact || `${firstName} ${lastName}`}`);
+    lines.push(`Cuenta: ${result.account || "-"}`);
+    lines.push(`Encontrado: ${result.found ? "sí" : "no"} | Total: ${result.totalMessages ?? 0} | Devueltos: ${result.returnedMessages ?? 0}`);
+    if (result.queryUsed) {
+      lines.push(`Query usada: ${result.queryUsed}`);
+    }
+    if ((result.messages?.length ?? 0) > 0) {
+      lines.push("");
+      lines.push("Mensajes:");
+      for (const [index, message] of (result.messages ?? []).entries()) {
+        lines.push(
+          [
+            `${index + 1}. ${truncateInline(message.text || "(sin texto)", 280)}`,
+            `dir: ${message.direction || "-"} | hora: ${message.time || "-"} | idx: ${message.index ?? "-"}`,
+          ].join("\n"),
+        );
+      }
+    }
+    const responseText = lines.join("\n");
+    await replyLong(params.ctx, responseText);
+    await appendConversationTurn({
+      chatId,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(responseText, 3000),
+      source: `${params.source}:connector-intent`,
+    });
+    await safeAudit({
+      type: "connector.intent_query",
+      chatId,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        action: intent.action,
+        firstName,
+        lastName,
+        sourceName,
+        count: intent.count ?? 3,
+        account: result.account || "",
+        found: result.found ?? false,
+        returnedMessages: result.returnedMessages ?? 0,
+      },
+    });
+    return true;
+  }
+
   const profile = agentRegistry.require(getActiveAgent(chatId));
   if (!profile.allowCommands.includes("systemctl")) {
     await params.ctx.reply(
@@ -8929,7 +9900,7 @@ async function maybeHandleNaturalMemoryInstruction(params: {
       return true;
     }
 
-    const responseText = await summarizeMemoryRecallNatural(query, hits);
+    const responseText = await summarizeMemoryRecallNatural(params.ctx.chat.id, query, hits);
     await replyLong(params.ctx, responseText);
     await appendConversationTurn({
       chatId: params.ctx.chat.id,
@@ -10083,7 +11054,7 @@ async function maybeHandleNaturalDocumentInstruction(params: {
     const promptContext = await buildPromptContextForQuery(`${params.text}\n${documentResult.path}`, {
       chatId: params.ctx.chat.id,
     });
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
     await replyLong(params.ctx, answer);
     await appendConversationTurn({
       chatId: params.ctx.chat.id,
@@ -10204,6 +11175,7 @@ async function maybeHandleNaturalWebInstruction(params: {
         return true;
       }
 
+      const ecoEnabled = isEcoModeEnabled(params.ctx.chat.id);
       const question =
         intent.query.trim() || "Resume el contenido principal, los datos clave y los posibles riesgos.";
       const prompt = [
@@ -10218,13 +11190,22 @@ async function maybeHandleNaturalWebInstruction(params: {
         "",
         `Foco del análisis: ${question}`,
         "",
-        "Al final, incluye una línea de fuente con la URL usada.",
+        ...(ecoEnabled
+          ? [
+              "MODO ECO: respuesta ultra-concisa.",
+              "Formato exacto:",
+              "1) 3 bullets máximos con hallazgos clave.",
+              "2) 1 acción recomendada.",
+              "No agregues secciones extra.",
+            ]
+          : ["Al final, incluye una línea de fuente con la URL usada."]),
       ].join("\n");
 
       const promptContext = await buildPromptContextForQuery(`${params.text}\n${page.title}`, {
         chatId: params.ctx.chat.id,
       });
-      const answer = await openAi.ask(prompt, { context: promptContext });
+      const answerRaw = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
+      const answer = ecoEnabled ? truncateInline(answerRaw, 900) : answerRaw;
       await replyLong(params.ctx, answer);
       await params.ctx.reply(`Fuente: ${page.finalUrl}`);
       await appendConversationTurn({
@@ -10390,35 +11371,48 @@ async function maybeHandleNaturalWebInstruction(params: {
       )
       .join("\n\n---\n\n");
 
+    const ecoEnabled = isEcoModeEnabled(params.ctx.chat.id);
     const prompt = [
       "Responde la consulta del usuario usando SOLO la evidencia de las fuentes provistas.",
       intent.newsRequested
-        ? "El pedido es de noticias: prioriza hechos recientes y menciona fechas concretas (día/mes/año) cuando estén disponibles."
+        ? `El pedido es de noticias: prioriza hechos de los ultimos ${NEWS_MAX_AGE_DAYS} dias y menciona fechas concretas (día/mes/año) cuando estén disponibles.`
         : "Si la evidencia no alcanza, dilo explícitamente.",
       intent.newsRequested
         ? `Usa como máximo ${NEWS_MAX_REDDIT_RESULTS} fuentes de Reddit y completa con otros sitios relevantes; marca qué puntos requieren validación adicional.`
         : "Sé claro y breve.",
       intent.newsRequested
-        ? "Prioriza siempre los eventos más recientes y, si una fuente no muestra fecha clara o parece vieja, acláralo explícitamente."
+        ? `No uses como base noticias de más de ${NEWS_MAX_AGE_DAYS} días; si no hay suficiente evidencia reciente, dilo explícitamente.`
         : "Evita suposiciones.",
       "No devuelvas JSON, YAML ni bloques de código.",
-      "Entrega una respuesta natural en español con este formato:",
-      "1) Resumen breve (3-5 viñetas).",
-      "2) Lecturas recomendadas: hasta 5 ítems con título, mini-resumen y link.",
-      "Si no tienes evidencia suficiente, dilo explícitamente.",
+      ...(ecoEnabled
+        ? [
+            "MODO ECO: salida mínima en español.",
+            "Formato exacto y único:",
+            "1) 3 bullets máximos con lo más reciente/relevante.",
+            "2) 1 acción recomendada.",
+            "3) Fuentes usadas: máximo 3 links.",
+            "No agregues texto extra.",
+          ]
+        : [
+            "Entrega una respuesta natural en español con este formato:",
+            "1) Resumen breve (3-5 viñetas).",
+            "2) Lecturas recomendadas: hasta 5 ítems con título, mini-resumen y link.",
+            "Si no tienes evidencia suficiente, dilo explícitamente.",
+          ]),
       `Consulta del usuario: ${params.text}`,
       `Consulta web ejecutada: ${usedFallbackQuery ? `${query} (fallback: ${rawQuery})` : query}`,
       "",
       "Fuentes:",
       sourceBlocks,
       "",
-      "Incluye al final una sección 'Fuentes usadas:' con las URLs en viñetas.",
+      ...(ecoEnabled ? [] : ["Incluye al final una sección 'Fuentes usadas:' con las URLs en viñetas."]),
     ].join("\n");
 
     const promptContext = await buildPromptContextForQuery(params.text, {
       chatId: params.ctx.chat.id,
     });
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answerRaw = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
+    const answer = ecoEnabled ? truncateInline(answerRaw, 1200) : answerRaw;
     await replyLong(params.ctx, answer);
     await appendConversationTurn({
       chatId: params.ctx.chat.id,
@@ -11043,7 +12037,7 @@ async function buildStoicSmalltalkReply(chatId: number, userText: string): Promi
         .filter(Boolean)
         .join("\n");
       const promptContext = await buildPromptContextForQuery(userText, { chatId });
-      const answer = await openAi.ask(prompt, { context: promptContext });
+      const answer = await askOpenAiForChat({ chatId, prompt, context: promptContext });
       if (answer.trim()) {
         return truncateInline(answer.trim(), 800);
       }
@@ -11346,6 +12340,19 @@ async function maybeHandleNaturalIntentPipeline(params: {
   userId?: number;
   persistUserTurn: boolean;
 }): Promise<boolean> {
+  const hasPendingWorkspaceDeleteConfirmation = (chatId: number): boolean => {
+    const now = Date.now();
+    const pendingDelete = pendingWorkspaceDeleteByChat.get(chatId);
+    if (pendingDelete && pendingDelete.expiresAtMs > now) {
+      return true;
+    }
+    const pendingDeletePath = pendingWorkspaceDeletePathByChat.get(chatId);
+    if (pendingDeletePath && pendingDeletePath.expiresAtMs > now) {
+      return true;
+    }
+    return false;
+  };
+
   const chained = splitChainedInstructions(params.text);
   if (chained.length >= 2) {
     if (params.persistUserTurn) {
@@ -11359,6 +12366,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
     }
     await params.ctx.reply(`Ejecutando flujo encadenado (${chained.length} pasos)...`);
     const stepSummary: Array<{ index: number; text: string; handled: boolean }> = [];
+    let pausedByConfirmation = false;
+    let pausedAtStep = 0;
     for (let index = 0; index < chained.length; index += 1) {
       const stepText = chained[index] ?? "";
       await params.ctx.reply(`Paso ${index + 1}/${chained.length}: ${truncateInline(stepText, 120)}`);
@@ -11376,6 +12385,14 @@ async function maybeHandleNaturalIntentPipeline(params: {
         text: truncateInline(stepText, 120),
         handled,
       });
+      if (hasPendingWorkspaceDeleteConfirmation(params.ctx.chat.id)) {
+        pausedByConfirmation = true;
+        pausedAtStep = index + 1;
+        await params.ctx.reply(
+          `Flujo en pausa en paso ${pausedAtStep}/${chained.length}: necesito tu confirmación ("si" o "no") antes de continuar.`,
+        );
+        break;
+      }
     }
     const okCount = stepSummary.filter((item) => item.handled).length;
     const failedCount = stepSummary.length - okCount;
@@ -11386,14 +12403,14 @@ async function maybeHandleNaturalIntentPipeline(params: {
       params.ctx,
       [
         "Resumen de flujo encadenado",
-        `pasos: ${stepSummary.length} | procesados: ${okCount} | no interpretados: ${failedCount}`,
+        `pasos: ${chained.length} | procesados: ${stepSummary.length} | ok: ${okCount} | no interpretados: ${failedCount}${pausedByConfirmation ? ` | pausado en paso ${pausedAtStep}` : ""}`,
         ...lines,
       ].join("\n"),
     );
     return true;
   }
 
-  if (!params.source.includes(":seq-step-")) {
+  if (!params.source.includes(":seq-step-") && !params.source.includes(":chain-")) {
     const sequencedPlan = await classifySequencedIntentPlanWithAi({
       chatId: params.ctx.chat.id,
       text: params.text,
@@ -11410,6 +12427,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
       }
       await params.ctx.reply(`Ejecutando plan secuenciado (${sequencedPlan.steps.length} pasos)...`);
       const stepSummary: Array<{ index: number; text: string; handled: boolean }> = [];
+      let pausedByConfirmation = false;
+      let pausedAtStep = 0;
       for (let index = 0; index < sequencedPlan.steps.length; index += 1) {
         const step = sequencedPlan.steps[index]!;
         const aiContent = step.aiContentPrompt
@@ -11436,6 +12455,14 @@ async function maybeHandleNaturalIntentPipeline(params: {
           text: truncateInline(step.instruction, 120),
           handled,
         });
+        if (hasPendingWorkspaceDeleteConfirmation(params.ctx.chat.id)) {
+          pausedByConfirmation = true;
+          pausedAtStep = index + 1;
+          await params.ctx.reply(
+            `Plan en pausa en paso ${pausedAtStep}/${sequencedPlan.steps.length}: necesito tu confirmación ("si" o "no") antes de continuar.`,
+          );
+          break;
+        }
       }
       const okCount = stepSummary.filter((item) => item.handled).length;
       const failedCount = stepSummary.length - okCount;
@@ -11446,8 +12473,11 @@ async function maybeHandleNaturalIntentPipeline(params: {
         details: {
           source: params.source,
           steps: sequencedPlan.steps.length,
-          processed: okCount,
+          processed: stepSummary.length,
+          processedOk: okCount,
           failed: failedCount,
+          pausedByConfirmation,
+          pausedAtStep: pausedAtStep > 0 ? pausedAtStep : null,
           ...(sequencedPlan.reason ? { reason: sequencedPlan.reason } : {}),
           textPreview: truncateInline(params.text, 220),
         },
@@ -11457,7 +12487,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
         params.ctx,
         [
           "Resumen de plan secuenciado",
-          `pasos: ${stepSummary.length} | procesados: ${okCount} | no interpretados: ${failedCount}`,
+          `pasos: ${sequencedPlan.steps.length} | procesados: ${stepSummary.length} | ok: ${okCount} | no interpretados: ${failedCount}${pausedByConfirmation ? ` | pausado en paso ${pausedAtStep}` : ""}`,
           ...lines,
         ].join("\n"),
       );
@@ -11473,7 +12503,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
     );
 
   const baseHandlers: Array<{
-    name: string;
+    name: Exclude<NaturalIntentHandlerName, "none">;
     fn: (params: {
       ctx: ChatReplyContext;
       text: string;
@@ -11511,28 +12541,62 @@ async function maybeHandleNaturalIntentPipeline(params: {
       : baseHandlers;
 
   let routedHandlers = handlers;
+  let semanticRouteDecision: SemanticRouteDecision | null = null;
   let aiRouteDecision: { handler: NaturalIntentHandlerName; reason?: string } | null = null;
   const routeCandidates = handlers.map((item) => item.name as Exclude<NaturalIntentHandlerName, "none">);
-  aiRouteDecision = await classifyNaturalIntentRouteWithAi({
+  const routeFilterDecision = buildIntentRouterContextFilter({
     chatId: params.ctx.chat.id,
     text: params.text,
     candidates: routeCandidates,
+    hasMailContext,
+    hasMemoryRecallCue,
   });
-  if (aiRouteDecision && aiRouteDecision.handler !== "none") {
-    const preferred = handlers.find((item) => item.name === aiRouteDecision?.handler);
+  const semanticAllowedCandidates = routeFilterDecision?.allowed ?? routeCandidates;
+
+  semanticRouteDecision = semanticIntentRouter.route(params.text, {
+    allowed: semanticAllowedCandidates as IntentRouteName[],
+    topK: 3,
+  });
+  if (semanticRouteDecision) {
+    const preferred = handlers.find((item) => item.name === semanticRouteDecision?.handler);
     if (preferred) {
       routedHandlers = [preferred, ...handlers.filter((item) => item.name !== preferred.name)];
       await safeAudit({
-        type: "intent.router.ai",
+        type: "intent.router.semantic",
         chatId: params.ctx.chat.id,
         userId: params.userId,
         details: {
           source: params.source,
           selected: preferred.name,
-          ...(aiRouteDecision.reason ? { reason: aiRouteDecision.reason } : {}),
+          score: semanticRouteDecision.score,
+          reason: semanticRouteDecision.reason,
+          alternatives: semanticRouteDecision.alternatives,
           textPreview: truncateInline(params.text, 220),
         },
       });
+    }
+  } else {
+    aiRouteDecision = await classifyNaturalIntentRouteWithAi({
+      chatId: params.ctx.chat.id,
+      text: params.text,
+      candidates: semanticAllowedCandidates,
+    });
+    if (aiRouteDecision && aiRouteDecision.handler !== "none") {
+      const preferred = handlers.find((item) => item.name === aiRouteDecision?.handler);
+      if (preferred) {
+        routedHandlers = [preferred, ...handlers.filter((item) => item.name !== preferred.name)];
+        await safeAudit({
+          type: "intent.router.ai",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            selected: preferred.name,
+            ...(aiRouteDecision.reason ? { reason: aiRouteDecision.reason } : {}),
+            textPreview: truncateInline(params.text, 220),
+          },
+        });
+      }
     }
   }
 
@@ -11548,9 +12612,43 @@ async function maybeHandleNaturalIntentPipeline(params: {
           handler: handler.name,
           mailContext: hasMailContext,
           memoryRecallCue: hasMemoryRecallCue,
+          routeCandidates,
+          routeFilterReason: routeFilterDecision?.reason ?? null,
+          routeFilterAllowed: routeFilterDecision?.allowed ?? null,
+          semanticRouterSelected: semanticRouteDecision?.handler ?? null,
+          semanticRouterScore: semanticRouteDecision?.score ?? null,
           aiRouterSelected: aiRouteDecision?.handler ?? null,
           textPreview: truncateInline(params.text, 220),
         },
+      });
+      await appendIntentRouterDatasetEntry({
+        ts: new Date().toISOString(),
+        chatId: params.ctx.chat.id,
+        ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
+        source: params.source,
+        text: truncateInline(params.text.trim(), 500),
+        hasMailContext,
+        hasMemoryRecallCue,
+        routeCandidates,
+        ...(routeFilterDecision
+          ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed }
+          : {}),
+        ...(semanticRouteDecision
+          ? {
+              semantic: {
+                handler: semanticRouteDecision.handler,
+                score: semanticRouteDecision.score,
+                reason: semanticRouteDecision.reason,
+                alternatives: semanticRouteDecision.alternatives as Array<{
+                  name: Exclude<NaturalIntentHandlerName, "none">;
+                  score: number;
+                }>,
+              },
+            }
+          : {}),
+        ...(aiRouteDecision ? { ai: aiRouteDecision } : {}),
+        finalHandler: handler.name,
+        handled: true,
       });
       return true;
     }
@@ -11566,11 +12664,68 @@ async function maybeHandleNaturalIntentPipeline(params: {
         handler: "indexed-list-reference",
         mailContext: hasMailContext,
         memoryRecallCue: hasMemoryRecallCue,
+        routeCandidates,
+        routeFilterReason: routeFilterDecision?.reason ?? null,
+        routeFilterAllowed: routeFilterDecision?.allowed ?? null,
         textPreview: truncateInline(params.text, 220),
       },
     });
+    await appendIntentRouterDatasetEntry({
+      ts: new Date().toISOString(),
+      chatId: params.ctx.chat.id,
+      ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
+      source: params.source,
+      text: truncateInline(params.text.trim(), 500),
+      hasMailContext,
+      hasMemoryRecallCue,
+      routeCandidates,
+      ...(routeFilterDecision ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed } : {}),
+      ...(semanticRouteDecision
+        ? {
+            semantic: {
+              handler: semanticRouteDecision.handler,
+              score: semanticRouteDecision.score,
+              reason: semanticRouteDecision.reason,
+              alternatives: semanticRouteDecision.alternatives as Array<{
+                name: Exclude<NaturalIntentHandlerName, "none">;
+                score: number;
+              }>,
+            },
+          }
+        : {}),
+      ...(aiRouteDecision ? { ai: aiRouteDecision } : {}),
+      finalHandler: "indexed-list-reference",
+      handled: true,
+    });
     return true;
   }
+  await appendIntentRouterDatasetEntry({
+    ts: new Date().toISOString(),
+    chatId: params.ctx.chat.id,
+    ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
+    source: params.source,
+    text: truncateInline(params.text.trim(), 500),
+    hasMailContext,
+    hasMemoryRecallCue,
+    routeCandidates,
+    ...(routeFilterDecision ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed } : {}),
+    ...(semanticRouteDecision
+      ? {
+          semantic: {
+            handler: semanticRouteDecision.handler,
+            score: semanticRouteDecision.score,
+            reason: semanticRouteDecision.reason,
+            alternatives: semanticRouteDecision.alternatives as Array<{
+              name: Exclude<NaturalIntentHandlerName, "none">;
+              score: number;
+            }>,
+          },
+        }
+      : {}),
+    ...(aiRouteDecision ? { ai: aiRouteDecision } : {}),
+    finalHandler: "none",
+    handled: false,
+  });
   return false;
 }
 
@@ -11598,6 +12753,7 @@ bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
   const active = getActiveAgent(chatId);
   const shellMode = isAiShellModeEnabled(chatId) ? "on" : "off";
+  const ecoMode = isEcoModeEnabled(chatId) ? "on" : "off";
   const adminMode = adminSecurity.isAdminModeEnabled(chatId) ? "on" : "off";
   const panicMode = adminSecurity.isPanicModeEnabled() ? "on" : "off";
   await ctx.reply(
@@ -11605,6 +12761,7 @@ bot.command("start", async (ctx) => {
       "Houdi Agent activo.",
       `Agente actual: ${active}`,
       `Shell IA: ${shellMode}`,
+      `ECO mode: ${ecoMode}`,
       `Admin mode: ${adminMode}`,
       `Panic mode: ${panicMode}`,
       "Usa /help para ver comandos.",
@@ -11628,6 +12785,11 @@ bot.command("help", async (ctx) => {
       "/images [limit] - Listar imágenes guardadas para este chat",
       "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
       "/web <consulta> - Buscar en la web",
+      '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
+      "/news <consulta> [limit] - Noticias recientes (GNews/NewsAPI, últimos 7 días)",
+      "/crypto [consulta] [limit] - Precios crypto con CoinGecko",
+      "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
+      "/reddit <consulta> [limit] - Buscar posts en Reddit (API)",
       "/webopen <n|url> [pregunta] - Abrir resultado web y opcionalmente analizarlo",
       "/webask <consulta> - Buscar + sintetizar respuesta con fuentes",
       "/agenda ... - Crear/listar/editar/eliminar tareas programadas",
@@ -11644,6 +12806,8 @@ bot.command("help", async (ctx) => {
       "/selfskill draft <start|add|show|apply|cancel> - Armar skill en varios mensajes",
       "/selfrestart - Reiniciar servicio del agente",
       "/selfupdate [check] - Actualizar a la última versión del repositorio",
+      "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
+      "/intentstats [n] - Métricas de enrutamiento y sugerencias de threshold",
       "Enviar nota de voz/audio - Se transcribe y se responde con IA",
       "Enviar archivo (document) - Se guarda en workspace/files/...",
       "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
@@ -11729,6 +12893,7 @@ bot.command("status", async (ctx) => {
       `Tareas activas: ${runningCount}`,
       `Agente actual: ${getActiveAgent(ctx.chat.id)}`,
       `Shell IA: ${isAiShellModeEnabled(ctx.chat.id) ? "on" : "off"}`,
+      `ECO mode: ${isEcoModeEnabled(ctx.chat.id) ? `on (max ${config.openAiEcoMaxOutputTokens} tok)` : "off"}`,
       `Admin mode: ${adminSecurity.isAdminModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"} (${rebootAllowedInAgent ? "permitido en agente actual" : "no permitido en agente actual"})`,
@@ -11748,6 +12913,27 @@ bot.command("status", async (ctx) => {
       memoryStatusLine,
     ].join("\n"),
   );
+});
+
+bot.command("intentstats", async (ctx) => {
+  const rawLimit = String(ctx.match ?? "").trim();
+  const parsed = rawLimit ? Number.parseInt(rawLimit, 10) : NaN;
+  const limit = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 20_000) : 2_000;
+  try {
+    const report = await buildIntentRouterStatsReport(limit);
+    await replyLong(ctx, report);
+    await safeAudit({
+      type: "intent.router.stats",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        limit,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude generar intent stats: ${message}`);
+  }
 });
 
 bot.command("agent", async (ctx) => {
@@ -12112,7 +13298,7 @@ bot.command("ask", async (ctx) => {
     const promptContext = await buildPromptContextForQuery(question, {
       chatId: ctx.chat.id,
     });
-    const answer = await openAi.ask(question, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: ctx.chat.id, prompt: question, context: promptContext });
     await replyLong(ctx, answer);
     await appendConversationTurn({
       chatId: ctx.chat.id,
@@ -12758,7 +13944,7 @@ bot.command("askfile", async (ctx) => {
     const promptContext = await buildPromptContextForQuery(`${documentPath}\n${question}`, {
       chatId: ctx.chat.id,
     });
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answer = await askOpenAiForChat({ chatId: ctx.chat.id, prompt, context: promptContext });
     await replyLong(ctx, answer);
 
     await appendConversationTurn({
@@ -12874,6 +14060,400 @@ bot.command("web", async (ctx) => {
   }
 });
 
+bot.command("lim", async (ctx) => {
+  if (!config.enableLimControl) {
+    await ctx.reply("LIM está deshabilitado por configuración (ENABLE_LIM_CONTROL=false).");
+    return;
+  }
+
+  const input = String(ctx.match ?? "").trim();
+  if (!input) {
+    await ctx.reply('Uso: /lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3]');
+    return;
+  }
+
+  const firstName = input.match(/\bfirst[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i)?.[1]?.trim() ?? "";
+  const lastName = input.match(/\blast[_\s-]?name\s*[:=]\s*([^\n,;|]+)/i)?.[1]?.trim() ?? "";
+  const sourceName = input.match(/\b(fuente|source)\s*[:=]\s*([^\n,;|]+)/i)?.[2]?.trim() ?? "";
+  const countRaw = Number.parseInt(input.match(/\bcount\s*[:=]\s*(\d{1,2})\b/i)?.[1] ?? "", 10);
+  const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : 3;
+
+  if (!firstName || !lastName || !sourceName) {
+    await ctx.reply('Faltan parámetros. Uso: /lim first_name:Juan last_name:Perez fuente:account_demo_c_jack [count:3]');
+    return;
+  }
+
+  await replyProgress(ctx, `Consultando LIM: ${firstName} ${lastName}...`);
+  const result = await queryLimMessages({
+    firstName,
+    lastName,
+    sourceName,
+    count,
+  });
+
+  if (!result.ok) {
+    await ctx.reply(
+      [
+        "No pude consultar LIM.",
+        `Detalle: ${truncateInline(result.detail || result.error || "error desconocido", 260)}`,
+      ].join("\n"),
+    );
+    await safeAudit({
+      type: "connector.command_query_failed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        firstName,
+        lastName,
+        sourceName,
+        count,
+        error: result.error || "",
+        detail: result.detail || "",
+      },
+    });
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push(`LIM | ${result.contact || `${firstName} ${lastName}`}`);
+  lines.push(`Cuenta: ${result.account || "-"}`);
+  lines.push(`Encontrado: ${result.found ? "sí" : "no"} | Total: ${result.totalMessages ?? 0} | Devueltos: ${result.returnedMessages ?? 0}`);
+  if (result.queryUsed) {
+    lines.push(`Query usada: ${result.queryUsed}`);
+  }
+  if ((result.messages?.length ?? 0) > 0) {
+    lines.push("");
+    lines.push("Mensajes:");
+    for (const [index, message] of (result.messages ?? []).entries()) {
+      lines.push(
+        [
+          `${index + 1}. ${truncateInline(message.text || "(sin texto)", 280)}`,
+          `dir: ${message.direction || "-"} | hora: ${message.time || "-"} | idx: ${message.index ?? "-"}`,
+        ].join("\n"),
+      );
+    }
+  }
+  const responseText = lines.join("\n");
+  await replyLong(ctx, responseText);
+  await safeAudit({
+    type: "connector.command_query",
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    details: {
+      firstName,
+      lastName,
+      sourceName,
+      count,
+      account: result.account || "",
+      found: result.found ?? false,
+      returnedMessages: result.returnedMessages ?? 0,
+    },
+  });
+});
+
+bot.command("news", async (ctx) => {
+  const rawInput = String(ctx.match ?? "").trim();
+  if (!rawInput) {
+    await ctx.reply("Uso: /news <consulta> [limit]");
+    return;
+  }
+
+  const tokens = rawInput.split(/\s+/).filter(Boolean);
+  const maybeLimit = Number.parseInt(tokens[tokens.length - 1] ?? "", 10);
+  const limit = Number.isFinite(maybeLimit) && maybeLimit > 0 ? Math.min(10, maybeLimit) : 5;
+  const query =
+    Number.isFinite(maybeLimit) && maybeLimit > 0 ? tokens.slice(0, -1).join(" ").trim() : rawInput;
+  if (!query) {
+    await ctx.reply("Uso: /news <consulta> [limit]");
+    return;
+  }
+
+  if (!newsApi.isConfigured()) {
+    await ctx.reply("News API no configurada. Define GNEWS_API_KEY o NEWSAPI_KEY en .env.");
+    return;
+  }
+
+  const to = new Date();
+  const from = new Date(to.getTime() - NEWS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000);
+  await replyProgress(ctx, `Buscando noticias recientes (${NEWS_MAX_AGE_DAYS} días): ${query}`);
+
+  try {
+    const articles = await newsApi.searchLatest({
+      query,
+      limit,
+      language: "es",
+      from,
+      to,
+    });
+    if (articles.length === 0) {
+      await ctx.reply("No encontré noticias recientes con ese criterio.");
+      return;
+    }
+
+    const lines = articles.map((item, index) =>
+      [
+        `${index + 1}. ${item.title}`,
+        item.description ? `Resumen: ${normalizeSearchSnippet(item.description, 200)}` : "Resumen: sin extracto.",
+        `Fuente: ${item.source} | Fecha: ${formatIsoDateCompact(item.publishedAt)}`,
+        `Link: ${item.url}`,
+      ].join("\n"),
+    );
+    const text = [
+      `Noticias recientes (${articles.length}) para: ${query}`,
+      ...lines,
+      `Proveedor: ${newsApi.providerName()}`,
+      "Tip: usa /webopen <n> para abrir y analizar un resultado.",
+    ].join("\n\n");
+
+    const hits = articles.map((item) => ({
+      title: item.title,
+      url: item.url,
+      snippet: [item.source, item.publishedAt, item.description].filter(Boolean).join(" | "),
+    }));
+    lastWebResultsByChat.set(ctx.chat.id, hits);
+    rememberWebResultsListContext({
+      chatId: ctx.chat.id,
+      title: `News API: ${query}`,
+      hits,
+      source: "telegram:/news",
+    });
+
+    await replyLong(ctx, text);
+    await safeAudit({
+      type: "news.search",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        query,
+        limit,
+        provider: newsApi.providerName(),
+        results: articles.length,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude consultar News API: ${message}`);
+    await safeAudit({
+      type: "news.search_failed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        query,
+        limit,
+        error: message,
+      },
+    });
+  }
+});
+
+bot.command("crypto", async (ctx) => {
+  const rawInput = String(ctx.match ?? "").trim();
+  const tokens = rawInput.split(/\s+/).filter(Boolean);
+  const maybeLimit = Number.parseInt(tokens[tokens.length - 1] ?? "", 10);
+  const limit = Number.isFinite(maybeLimit) && maybeLimit > 0 ? Math.min(10, maybeLimit) : 5;
+  const query =
+    Number.isFinite(maybeLimit) && maybeLimit > 0 ? tokens.slice(0, -1).join(" ").trim() : rawInput;
+
+  await replyProgress(
+    ctx,
+    query ? `Consultando CoinGecko: ${query}` : "Consultando CoinGecko (top mercado)...",
+  );
+  try {
+    const markets = query
+      ? await coinGeckoApi.searchMarkets(query, limit)
+      : await coinGeckoApi.getTopMarkets(limit);
+    if (markets.length === 0) {
+      await ctx.reply("No encontré monedas para esa búsqueda.");
+      return;
+    }
+
+    const lines = markets.map((coin, index) =>
+      [
+        `${index + 1}. ${coin.name} (${coin.symbol.toUpperCase()})`,
+        `Precio: ${formatUsd(coin.currentPriceUsd)} | 24h: ${formatSignedPercent(coin.priceChange24hPct)} | Rank: ${coin.marketCapRank ?? "n/d"}`,
+        `Actualizado: ${formatIsoDateCompact(coin.lastUpdated)}`,
+      ].join("\n"),
+    );
+
+    await replyLong(
+      ctx,
+      [
+        query ? `Crypto para: ${query}` : `Top crypto por market cap (${markets.length})`,
+        ...lines,
+      ].join("\n\n"),
+    );
+    await safeAudit({
+      type: "crypto.search",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        query: query || null,
+        limit,
+        results: markets.length,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude consultar CoinGecko: ${message}`);
+    await safeAudit({
+      type: "crypto.search_failed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        query: query || null,
+        limit,
+        error: message,
+      },
+    });
+  }
+});
+
+bot.command("weather", async (ctx) => {
+  const rawLocation = String(ctx.match ?? "").trim();
+  const location = rawLocation || "Buenos Aires";
+  await replyProgress(ctx, `Consultando clima en ${location}...`);
+
+  try {
+    const weather = await openMeteoApi.getWeather(location);
+    const currentLine = [
+      `Ahora: ${weather.current.weatherText}`,
+      `${weather.current.temperatureC.toFixed(1)}°C`,
+      `viento ${weather.current.windKmh.toFixed(1)} km/h`,
+      weather.current.humidityPct !== null ? `humedad ${Math.round(weather.current.humidityPct)}%` : "",
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    const nextDays = weather.nextDays
+      .slice(0, 3)
+      .map(
+        (day, index) =>
+          `${index + 1}. ${day.date} | ${day.weatherText} | min ${day.minC.toFixed(1)}°C / max ${day.maxC.toFixed(1)}°C`,
+      );
+
+    await replyLong(
+      ctx,
+      [
+        `Clima en ${weather.locationName} (${weather.timezone})`,
+        currentLine,
+        ...(nextDays.length > 0 ? ["", "Próximos días:", ...nextDays] : []),
+      ].join("\n"),
+    );
+    await safeAudit({
+      type: "weather.lookup",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        location,
+        resolved: weather.locationName,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude consultar Open-Meteo: ${message}`);
+    await safeAudit({
+      type: "weather.lookup_failed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        location,
+        error: message,
+      },
+    });
+  }
+});
+
+bot.command("reddit", async (ctx) => {
+  const rawInput = String(ctx.match ?? "").trim();
+  if (!rawInput) {
+    await ctx.reply("Uso: /reddit <consulta> [limit]");
+    return;
+  }
+
+  const tokens = rawInput.split(/\s+/).filter(Boolean);
+  const maybeLimit = Number.parseInt(tokens[tokens.length - 1] ?? "", 10);
+  const limit = Number.isFinite(maybeLimit) && maybeLimit > 0 ? Math.min(10, maybeLimit) : 5;
+  const queryText =
+    Number.isFinite(maybeLimit) && maybeLimit > 0 ? tokens.slice(0, -1).join(" ").trim() : rawInput;
+  if (!queryText) {
+    await ctx.reply("Uso: /reddit <consulta> [limit]");
+    return;
+  }
+
+  const subredditMatch = queryText.match(/^\s*r\/([a-z0-9_]+)\s+(.+)$/i);
+  const subreddit = subredditMatch?.[1]?.trim();
+  const query = (subredditMatch?.[2] ?? queryText).trim();
+  if (!query) {
+    await ctx.reply("Consulta vacía para Reddit.");
+    return;
+  }
+
+  await replyProgress(ctx, `Buscando en Reddit API: ${subreddit ? `r/${subreddit} | ` : ""}${query}`);
+  try {
+    const posts = await redditApi.searchPosts({
+      query,
+      ...(subreddit ? { subreddit } : {}),
+      sort: "new",
+      time: "week",
+      limit,
+    });
+    if (posts.length === 0) {
+      await ctx.reply("No encontré resultados en Reddit para esa consulta.");
+      return;
+    }
+
+    const hits = redditPostsToWebSearchResults(posts);
+    lastWebResultsByChat.set(ctx.chat.id, hits);
+    rememberWebResultsListContext({
+      chatId: ctx.chat.id,
+      title: `Reddit: ${subreddit ? `r/${subreddit} | ` : ""}${query}`,
+      hits,
+      source: "telegram:/reddit",
+    });
+
+    const lines = posts.map((post, index) =>
+      [
+        `${index + 1}. ${post.title}`,
+        `Subreddit: r/${post.subreddit} | Fecha: ${formatRedditPostDate(post.createdUtc)} | Score: ${post.score} | Comentarios: ${post.numComments}`,
+        `Link: ${post.url}`,
+      ].join("\n"),
+    );
+    await replyLong(
+      ctx,
+      [
+        `Resultados Reddit (${posts.length}) para: ${query}${subreddit ? ` en r/${subreddit}` : ""}`,
+        ...lines,
+        "Tip: usa /webopen <n> para abrir y analizar un resultado.",
+      ].join("\n\n"),
+    );
+    await safeAudit({
+      type: "reddit.search",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        query,
+        subreddit: subreddit ?? null,
+        limit,
+        results: posts.length,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude consultar Reddit API: ${message}`);
+    await safeAudit({
+      type: "reddit.search_failed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        query,
+        subreddit: subreddit ?? null,
+        limit,
+        error: message,
+      },
+    });
+  }
+});
+
 bot.command("webopen", async (ctx) => {
   if (!config.enableWebBrowse) {
     await ctx.reply("Navegación web deshabilitada por configuración (ENABLE_WEB_BROWSE=false).");
@@ -12925,6 +14505,7 @@ bot.command("webopen", async (ctx) => {
       return;
     }
 
+    const ecoEnabled = isEcoModeEnabled(ctx.chat.id);
     const prompt = [
       "Analiza este contenido web y responde la pregunta del usuario.",
       `URL: ${page.finalUrl}`,
@@ -12936,13 +14517,19 @@ bot.command("webopen", async (ctx) => {
       "",
       `Pregunta: ${parsed.question}`,
       "",
-      "Al final, incluye una línea de fuente con la URL usada.",
+      ...(ecoEnabled
+        ? [
+            "MODO ECO: respuesta ultra-concisa.",
+            "Usa 3 bullets máximos + 1 acción recomendada.",
+          ]
+        : ["Al final, incluye una línea de fuente con la URL usada."]),
     ].join("\n");
 
     const promptContext = await buildPromptContextForQuery(`${parsed.question}\n${page.title}`, {
       chatId: ctx.chat.id,
     });
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answerRaw = await askOpenAiForChat({ chatId: ctx.chat.id, prompt, context: promptContext });
+    const answer = ecoEnabled ? truncateInline(answerRaw, 900) : answerRaw;
     await replyLong(ctx, answer);
     await ctx.reply(`Fuente: ${page.finalUrl}`);
 
@@ -13063,35 +14650,48 @@ bot.command("webask", async (ctx) => {
       )
       .join("\n\n---\n\n");
 
+    const ecoEnabled = isEcoModeEnabled(ctx.chat.id);
     const prompt = [
       "Responde la consulta del usuario usando SOLO la evidencia de las fuentes provistas.",
       newsRequested
-        ? "El pedido es de noticias: prioriza hechos recientes y menciona fechas concretas (dia/mes/ano) cuando esten disponibles."
+        ? `El pedido es de noticias: prioriza hechos de los ultimos ${NEWS_MAX_AGE_DAYS} dias y menciona fechas concretas (dia/mes/ano) cuando esten disponibles.`
         : "Si la evidencia no alcanza, dilo explicitamente.",
       newsRequested
         ? `Usa como maximo ${NEWS_MAX_REDDIT_RESULTS} fuentes de Reddit y completa con otros sitios relevantes; marca que puntos requieren validacion adicional.`
         : "Se claro y breve.",
       newsRequested
-        ? "Prioriza siempre los eventos mas recientes y, si una fuente no muestra fecha clara o parece vieja, aclara esa limitacion."
+        ? `No uses como base noticias de mas de ${NEWS_MAX_AGE_DAYS} dias; si no hay suficiente evidencia reciente, dilo explicitamente.`
         : "Evita suposiciones.",
       "No devuelvas JSON, YAML ni bloques de codigo.",
-      "Entrega una respuesta natural en espanol con este formato:",
-      "1) Resumen breve (3-5 viñetas).",
-      "2) Lecturas recomendadas: hasta 5 items con titulo, mini-resumen y link.",
-      "Si no tienes evidencia suficiente, dilo explicitamente.",
+      ...(ecoEnabled
+        ? [
+            "MODO ECO: salida mínima en español.",
+            "Formato exacto y único:",
+            "1) 3 bullets máximos con lo más reciente/relevante.",
+            "2) 1 acción recomendada.",
+            "3) Fuentes usadas: máximo 3 links.",
+            "No agregues texto extra.",
+          ]
+        : [
+            "Entrega una respuesta natural en espanol con este formato:",
+            "1) Resumen breve (3-5 viñetas).",
+            "2) Lecturas recomendadas: hasta 5 items con titulo, mini-resumen y link.",
+            "Si no tienes evidencia suficiente, dilo explicitamente.",
+          ]),
       `Consulta del usuario: ${rawQuery}`,
       `Consulta web ejecutada: ${usedFallbackQuery ? `${searchResult.query} (fallback: ${rawQuery})` : searchResult.query}`,
       "",
       "Fuentes:",
       sourceBlocks,
       "",
-      "Incluye al final una sección 'Fuentes usadas:' con las URLs en viñetas.",
+      ...(ecoEnabled ? [] : ["Incluye al final una sección 'Fuentes usadas:' con las URLs en viñetas."]),
     ].join("\n");
 
     const promptContext = await buildPromptContextForQuery(rawQuery, {
       chatId: ctx.chat.id,
     });
-    const answer = await openAi.ask(prompt, { context: promptContext });
+    const answerRaw = await askOpenAiForChat({ chatId: ctx.chat.id, prompt, context: promptContext });
+    const answer = ecoEnabled ? truncateInline(answerRaw, 1200) : answerRaw;
     await replyLong(ctx, answer);
 
     await appendConversationTurn({
@@ -14044,6 +15644,46 @@ bot.command("selfupdate", async (ctx) => {
   });
 });
 
+bot.command("eco", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim().toLowerCase();
+
+  if (!raw || raw === "status") {
+    await ctx.reply(
+      [
+        `ECO mode está ${isEcoModeEnabled(ctx.chat.id) ? "on" : "off"}.`,
+        `max output tokens ECO: ${config.openAiEcoMaxOutputTokens}`,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (raw !== "on" && raw !== "off") {
+    await ctx.reply("Uso: /eco on|off|status");
+    return;
+  }
+
+  const enabled = raw === "on";
+  setEcoMode(ctx.chat.id, enabled);
+  await ctx.reply(
+    [
+      `ECO mode ahora está ${enabled ? "on" : "off"}.`,
+      enabled
+        ? `Respuestas IA más compactas y ahorro de tokens (tope ${config.openAiEcoMaxOutputTokens}).`
+        : `Se vuelve al tope normal (${config.openAiMaxOutputTokens}) y respuesta estándar.`,
+    ].join("\n"),
+  );
+
+  await safeAudit({
+    type: "eco.toggle",
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    details: {
+      enabled,
+      maxOutputTokens: enabled ? config.openAiEcoMaxOutputTokens : config.openAiMaxOutputTokens,
+    },
+  });
+});
+
 bot.command("shellmode", async (ctx) => {
   const raw = String(ctx.match ?? "").trim().toLowerCase();
   if (!raw) {
@@ -14263,9 +15903,10 @@ bot.command("panic", async (ctx) => {
   });
 });
 
-bot.on(["message:photo", "message:document"], async (ctx) => {
+bot.on(["message:photo", "message:document"], async (ctx, next) => {
   const incoming = extractIncomingImage(ctx.message);
   if (!incoming) {
+    await next();
     return;
   }
 
@@ -14344,25 +15985,44 @@ bot.on(["message:photo", "message:document"], async (ctx) => {
       return;
     }
 
+    const ecoEnabled = isEcoModeEnabled(ctx.chat.id);
     const prompt = incoming.caption?.trim()
       ? [
           "Analiza la imagen adjunta y responde la instrucción del usuario.",
           `Instrucción: ${incoming.caption.trim()}`,
           "Si hay texto visible relevante, inclúyelo en la respuesta.",
+          ...(ecoEnabled
+            ? [
+                "MODO ECO: respuesta ultra-concisa.",
+                "Formato exacto: 1) 3 bullets máximos 2) 1 acción sugerida.",
+                "Máximo 420 caracteres.",
+              ]
+            : []),
         ].join("\n")
-      : "Describe la imagen en español de forma clara y breve, incluyendo texto visible relevante.";
+      : [
+          "Describe la imagen en español de forma clara y breve, incluyendo texto visible relevante.",
+          ...(ecoEnabled
+            ? [
+                "MODO ECO: usa 3 bullets máximos y 1 acción sugerida.",
+                "Máximo 420 caracteres.",
+              ]
+            : []),
+        ].join("\n");
     const promptContext = await buildPromptContextForQuery(
       incoming.caption?.trim() || `analizar imagen ${path.basename(saved.relPath)}`,
       {
         chatId: ctx.chat.id,
       },
     );
-    const analysis = await openAi.analyzeImage({
+    const analysisRaw = await openAi.analyzeImage({
       image: downloaded.buffer,
       mimeType: resolvedMimeType,
       prompt,
       context: promptContext,
+      concise: ecoEnabled,
+      maxOutputTokens: ecoEnabled ? Math.min(config.openAiEcoMaxOutputTokens, 180) : undefined,
     });
+    const analysis = ecoEnabled ? truncateInline(analysisRaw, 700) : analysisRaw;
 
     const response = `${summaryHeader}\n\nAnalisis:\n${analysis}`;
     await replyLong(ctx, response);
@@ -14399,9 +16059,10 @@ bot.on(["message:photo", "message:document"], async (ctx) => {
   }
 });
 
-bot.on("message:document", async (ctx) => {
+bot.on("message:document", async (ctx, next) => {
   const incoming = extractIncomingWorkspaceFile(ctx.message);
   if (!incoming) {
+    await next();
     return;
   }
 
@@ -14467,6 +16128,35 @@ bot.on("message:document", async (ctx) => {
         mimeType: incoming.mimeType,
       },
     });
+
+    const captionTask = incoming.caption?.trim();
+    if (captionTask) {
+      const instructionText = [
+        captionTask,
+        "",
+        `Archivo adjunto: ${saved.relPath}`,
+        "Usa ese archivo como contexto principal para resolver la tarea.",
+      ].join("\n");
+      await ctx.reply("Ejecutando instrucción del archivo adjunto...");
+      await safeAudit({
+        type: "file.caption_task_dispatched",
+        chatId: ctx.chat.id,
+        userId: ctx.from?.id,
+        details: {
+          source: "telegram:file",
+          path: saved.relPath,
+          captionChars: captionTask.length,
+        },
+      });
+      await handleIncomingTextMessage({
+        ctx,
+        text: instructionText,
+        source: "telegram:file:caption-task",
+        userId: ctx.from?.id,
+        persistUserTurn: false,
+        allowSlashPrefix: false,
+      });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await safeAudit({
@@ -14482,9 +16172,10 @@ bot.on("message:document", async (ctx) => {
   }
 });
 
-bot.on(["message:voice", "message:audio", "message:document"], async (ctx) => {
+bot.on(["message:voice", "message:audio", "message:document"], async (ctx, next) => {
   const incoming = extractIncomingAudio(ctx.message);
   if (!incoming) {
+    await next();
     return;
   }
 
@@ -14533,36 +16224,16 @@ bot.on(["message:voice", "message:audio", "message:document"], async (ctx) => {
 
     await replyLong(ctx, `Transcripción:\n${transcriptPreview}${previewTail}`);
 
-    const promptInput = incoming.caption
-      ? [
-          "Audio transcripto del usuario:",
-          transcript,
-          "",
-          `Instrucción adicional del usuario (caption): ${incoming.caption}`,
-        ].join("\n")
-      : transcript;
+    const textForExecution = incoming.caption ? `${transcript}\n\n${incoming.caption}` : transcript;
 
-    await appendConversationTurn({
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      role: "user",
-      text: incoming.caption ? `[AUDIO] ${transcript}\n[CAPTION] ${incoming.caption}` : `[AUDIO] ${transcript}`,
+    await replyProgress(ctx, "Interpretando pedido de audio...");
+    await handleIncomingTextMessage({
+      ctx,
+      text: textForExecution,
       source: "telegram:audio",
-    });
-
-    await replyProgress(ctx, `Analizando transcripción con OpenAI (${openAi.getModel()})...`);
-    const promptContext = await buildPromptContextForQuery(promptInput, {
-      chatId: ctx.chat.id,
-    });
-    const answer = await openAi.ask(promptInput, { context: promptContext });
-    await replyLong(ctx, answer);
-
-    await appendConversationTurn({
-      chatId: ctx.chat.id,
       userId: ctx.from?.id,
-      role: "assistant",
-      text: answer,
-      source: "telegram:audio",
+      persistUserTurn: true,
+      allowSlashPrefix: false,
     });
 
     await safeAudit({
@@ -14572,7 +16243,8 @@ bot.on(["message:voice", "message:audio", "message:document"], async (ctx) => {
       details: {
         kind: incoming.kind,
         transcriptChars: transcript.length,
-        answerChars: answer.length,
+        captionChars: incoming.caption?.length ?? 0,
+        dispatchedTo: "handleIncomingTextMessage",
       },
     });
   } catch (error) {
@@ -14693,7 +16365,16 @@ async function handleIncomingTextMessage(params: {
     const promptContext = await buildPromptContextForQuery(textWithReplyReference, {
       chatId: params.ctx.chat.id,
     });
-    const answer = await openAi.ask(textWithReplyReference, { context: promptContext });
+    const answerRaw = await askOpenAiForChat({
+      chatId: params.ctx.chat.id,
+      prompt: textWithReplyReference,
+      context: promptContext,
+    });
+    const ecoEnabled = isEcoModeEnabled(params.ctx.chat.id);
+    const answer =
+      ecoEnabled && !isDetailedAnswerRequested(textWithReplyReference)
+        ? compactEcoFreeChatAnswer(answerRaw)
+        : answerRaw;
     await replyLong(params.ctx, answer);
     await appendConversationTurn({
       chatId: params.ctx.chat.id,

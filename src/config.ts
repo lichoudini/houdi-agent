@@ -17,6 +17,7 @@ const EnvSchema = z.object({
   HOUDI_MEMORY_BACKEND: z.enum(["hybrid", "scan"]).default("hybrid"),
   HOUDI_SCHEDULE_FILE: z.string().trim().default("./houdi-schedule.json"),
   HOUDI_RECIPIENTS_FILE: z.string().trim().default("./houdi-recipients.json"),
+  HOUDI_INTENT_ROUTER_DATASET_FILE: z.string().trim().default("./houdi-intent-router-dataset.jsonl"),
   HOUDI_SCHEDULE_POLL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
   HOUDI_SELFSKILL_DRAFTS_FILE: z.string().trim().default("./houdi-selfskill-drafts.json"),
   HOUDI_INTERESTS_FILE: z.string().trim().default("./houdi-interests.json"),
@@ -31,6 +32,8 @@ const EnvSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_MODEL: z.string().trim().default("gpt-4o-mini"),
   OPENAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(8192).default(800),
+  HOUDI_ECO_MODE_DEFAULT: z.string().optional(),
+  OPENAI_ECO_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(4096).default(200),
   HOUDI_PROGRESS_NOTICES: z.string().optional(),
   OPENAI_AUDIO_MODEL: z.string().trim().default("whisper-1"),
   OPENAI_AUDIO_LANGUAGE: z.string().trim().optional(),
@@ -44,6 +47,8 @@ const EnvSchema = z.object({
   WEB_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
   WEB_FETCH_MAX_BYTES: z.coerce.number().int().positive().max(10_000_000).default(2_000_000),
   WEB_CONTENT_MAX_CHARS: z.coerce.number().int().positive().max(200_000).default(15_000),
+  GNEWS_API_KEY: z.string().trim().optional(),
+  NEWSAPI_KEY: z.string().trim().optional(),
   ENABLE_GMAIL_ACCOUNT: z.string().optional(),
   GMAIL_CLIENT_ID: z.string().trim().optional(),
   GMAIL_CLIENT_SECRET: z.string().trim().optional(),
@@ -57,6 +62,7 @@ const EnvSchema = z.object({
   LIM_LOCAL_HEALTH_URL: z.string().trim().optional(),
   LIM_PUBLIC_HEALTH_URL: z.string().trim().optional(),
   LIM_HEALTH_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).optional(),
+  LIM_SOURCE_ACCOUNT_MAP_JSON: z.string().trim().optional(),
   ENABLE_CONNECTOR_CONTROL: z.string().optional(),
   CONNECTOR_APP_DIR: z.string().trim().optional(),
   CONNECTOR_RETRIEVER_SERVICE: z.string().trim().optional(),
@@ -101,6 +107,33 @@ function parseBooleanFlag(value: string | undefined, defaultValue: boolean): boo
     return false;
   }
   throw new Error(`Invalid boolean flag value: ${value}`);
+}
+
+function parseStringMapJson(value: string | undefined): Record<string, string> {
+  if (!value || !value.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const output: Record<string, string> = {};
+    for (const [key, rawVal] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof rawVal !== "string") {
+        continue;
+      }
+      const normalizedKey = key.trim().toLowerCase();
+      const normalizedVal = rawVal.trim();
+      if (!normalizedKey || !normalizedVal) {
+        continue;
+      }
+      output[normalizedKey] = normalizedVal;
+    }
+    return output;
+  } catch {
+    return {};
+  }
 }
 
 function isValidIPv4(host: string): boolean {
@@ -161,6 +194,7 @@ export const config = {
   memoryBackend: env.HOUDI_MEMORY_BACKEND,
   scheduleFile: env.HOUDI_SCHEDULE_FILE,
   recipientsFile: env.HOUDI_RECIPIENTS_FILE,
+  intentRouterDatasetFile: env.HOUDI_INTENT_ROUTER_DATASET_FILE,
   schedulePollMs: env.HOUDI_SCHEDULE_POLL_MS,
   selfSkillDraftsFile: env.HOUDI_SELFSKILL_DRAFTS_FILE,
   interestsFile: env.HOUDI_INTERESTS_FILE,
@@ -175,6 +209,8 @@ export const config = {
   openAiApiKey: env.OPENAI_API_KEY?.trim() || undefined,
   openAiModel: env.OPENAI_MODEL,
   openAiMaxOutputTokens: env.OPENAI_MAX_OUTPUT_TOKENS,
+  ecoModeDefault: parseBooleanFlag(env.HOUDI_ECO_MODE_DEFAULT, false),
+  openAiEcoMaxOutputTokens: env.OPENAI_ECO_MAX_OUTPUT_TOKENS,
   progressNotices: parseBooleanFlag(env.HOUDI_PROGRESS_NOTICES, false),
   openAiAudioModel: env.OPENAI_AUDIO_MODEL,
   openAiAudioLanguage: env.OPENAI_AUDIO_LANGUAGE?.trim() || undefined,
@@ -188,6 +224,8 @@ export const config = {
   webFetchTimeoutMs: env.WEB_FETCH_TIMEOUT_MS,
   webFetchMaxBytes: env.WEB_FETCH_MAX_BYTES,
   webContentMaxChars: env.WEB_CONTENT_MAX_CHARS,
+  gnewsApiKey: env.GNEWS_API_KEY?.trim() || undefined,
+  newsApiKey: env.NEWSAPI_KEY?.trim() || undefined,
   enableGmailAccount: parseBooleanFlag(env.ENABLE_GMAIL_ACCOUNT, false),
   gmailClientId: env.GMAIL_CLIENT_ID?.trim() || undefined,
   gmailClientSecret: env.GMAIL_CLIENT_SECRET?.trim() || undefined,
@@ -201,6 +239,7 @@ export const config = {
   limLocalHealthUrl: env.LIM_LOCAL_HEALTH_URL || env.CONNECTOR_LOCAL_HEALTH_URL || "http://127.0.0.1:3333/health",
   limPublicHealthUrl: env.LIM_PUBLIC_HEALTH_URL || env.CONNECTOR_PUBLIC_HEALTH_URL || "http://127.0.0.1:3333/health",
   limHealthTimeoutMs: env.LIM_HEALTH_TIMEOUT_MS ?? env.CONNECTOR_HEALTH_TIMEOUT_MS ?? 7000,
+  limSourceAccountMap: parseStringMapJson(env.LIM_SOURCE_ACCOUNT_MAP_JSON),
   localApiEnabled: parseBooleanFlag(env.HOUDI_LOCAL_API_ENABLED, true),
   localApiHost: normalizeLocalApiHost(env.HOUDI_LOCAL_API_HOST),
   localApiPort: env.HOUDI_LOCAL_API_PORT,

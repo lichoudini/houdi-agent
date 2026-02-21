@@ -151,8 +151,18 @@ function buildSharedSystemPrompt(context?: PromptContextSnapshot): string {
   return lines.trim();
 }
 
-function buildAskSystemPrompt(context?: PromptContextSnapshot): string {
-  return buildSharedSystemPrompt(context);
+function buildAskSystemPrompt(context?: PromptContextSnapshot, options?: { concise?: boolean }): string {
+  if (!options?.concise) {
+    return buildSharedSystemPrompt(context);
+  }
+  return [
+    buildSharedSystemPrompt(context),
+    "",
+    "## Modo ECO",
+    "Minimiza tokens: responde en formato compacto, directo y orientado a ejecutar.",
+    "No uses introducciones ni explicaciones largas salvo pedido explícito del usuario.",
+    "Máximo recomendado: 3-5 líneas o una lista corta de acciones.",
+  ].join("\n");
 }
 
 function buildShellSystemPrompt(context?: PromptContextSnapshot): string {
@@ -184,7 +194,7 @@ export class OpenAiService {
     return config.openAiModel;
   }
 
-  async ask(prompt: string, options?: { context?: PromptContextSnapshot }): Promise<string> {
+  async ask(prompt: string, options?: { context?: PromptContextSnapshot; concise?: boolean; maxOutputTokens?: number }): Promise<string> {
     if (!this.client) {
       throw new Error("OPENAI_API_KEY no está configurada en .env");
     }
@@ -196,11 +206,11 @@ export class OpenAiService {
 
     const response = await this.client.responses.create({
       model: config.openAiModel,
-      max_output_tokens: config.openAiMaxOutputTokens,
+      max_output_tokens: options?.maxOutputTokens ?? config.openAiMaxOutputTokens,
       input: [
         {
           role: "system",
-          content: buildAskSystemPrompt(options?.context),
+          content: buildAskSystemPrompt(options?.context, { concise: options?.concise }),
         },
         {
           role: "user",
@@ -255,6 +265,8 @@ export class OpenAiService {
     mimeType?: string;
     prompt?: string;
     context?: PromptContextSnapshot;
+    concise?: boolean;
+    maxOutputTokens?: number;
   }): Promise<string> {
     if (!this.client) {
       throw new Error("OPENAI_API_KEY no está configurada en .env");
@@ -272,11 +284,11 @@ export class OpenAiService {
 
     const response = await this.client.responses.create({
       model: config.openAiModel,
-      max_output_tokens: config.openAiMaxOutputTokens,
+      max_output_tokens: params.maxOutputTokens ?? config.openAiMaxOutputTokens,
       input: [
         {
           role: "system",
-          content: buildAskSystemPrompt(params.context),
+          content: buildAskSystemPrompt(params.context, { concise: params.concise }),
         },
         {
           role: "user",

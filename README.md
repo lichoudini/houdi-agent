@@ -121,6 +121,8 @@ cp .env.example .env
 - `WEB_FETCH_TIMEOUT_MS` (default: `20000`)
 - `WEB_FETCH_MAX_BYTES` (default: `2000000`)
 - `WEB_CONTENT_MAX_CHARS` (default: `15000`)
+- `GNEWS_API_KEY` (opcional, proveedor recomendado para `/news`)
+- `NEWSAPI_KEY` (opcional, fallback para `/news`)
 - `ENABLE_GMAIL_ACCOUNT` (default: `false`)
 - `GMAIL_CLIENT_ID` (OAuth client ID)
 - `GMAIL_CLIENT_SECRET` (OAuth client secret)
@@ -134,6 +136,7 @@ cp .env.example .env
 - `LIM_LOCAL_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
 - `LIM_PUBLIC_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
 - `LIM_HEALTH_TIMEOUT_MS` (default: `7000`)
+- `LIM_SOURCE_ACCOUNT_MAP_JSON` (opcional, mapeo `fuente -> account`, JSON string)
 - `HOUDI_LOCAL_API_ENABLED` (default: `true`, habilita bridge local CLI->bot)
 - `HOUDI_LOCAL_API_HOST` (default: `127.0.0.1`)
 - `HOUDI_LOCAL_API_PORT` (default: `3210`)
@@ -408,6 +411,17 @@ Con `ENABLE_LIM_CONTROL=true`, puedes operar una app externa y su túnel sin com
 - `apagá LIM`
 - `levantá LIM solo app` (sin tunnel)
 
+Consulta directa de mensajes LIM (contacto + fuente):
+
+- `/lim first_name:Juan last_name:Perez fuente:account_demo_c_jack count:3`
+- `consulta LIM first_name:Juan last_name:Perez fuente:account_demo_c_jack`
+
+`fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
+
+```env
+LIM_SOURCE_ACCOUNT_MAP_JSON={"account_demo_c":"account_demo_c_jack","account_demo_b":"account_demo_b_marylin"}
+```
+
 Instalación de servicios `systemd --user` para dejarlo persistente:
 
 ```bash
@@ -425,6 +439,10 @@ El script crea:
 Comandos:
 
 - `/web <consulta>`: busca en la web y devuelve resultados numerados.
+- `/news <consulta> [limit]`: noticias recientes (últimos 7 días) vía GNews/NewsAPI.
+- `/crypto [consulta] [limit]`: mercado crypto en USD (CoinGecko).
+- `/weather [ubicación]`: clima actual + próximos días (Open-Meteo).
+- `/reddit <consulta> [limit]`: búsqueda de posts en Reddit API.
 - `/webopen <n|url> [pregunta]`: abre un resultado (o URL directa). Si agregas pregunta, lo analiza con IA.
 - `/webask <consulta>`: búsqueda + síntesis automática con fuentes.
 
