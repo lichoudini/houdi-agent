@@ -76,20 +76,19 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   );
   const hasDrawVerb = /\b(dibuj\w*|traz\w*|ascii|ascci)\b/.test(normalized);
   const hasCopyMessageToFileCue =
-    /\b(copia|copiar|copiame|copiá|copia)\b/.test(normalized) &&
+    /\b(copiar|copia|copiame|copia?me|copia)\b/.test(normalized) &&
     /\b(mensaje|correo|mail|email)\b/.test(normalized) &&
     /\b(archivo|txt|csv|json|md|log)\b/.test(normalized);
-  const hasCopyVerb = /\b(copi[\p{L}\d_]*|duplic[\p{L}\d_]*|clon[\p{L}\d_]*)\b/iu.test(normalized);
-  const hasPasteVerb = /\b(peg[\p{L}\d_]*|paste)\b/iu.test(normalized);
+  const hasCopyVerb = /\b(copiar|copia|duplicar|duplica|clonar|clona)\b/.test(normalized);
+  const hasPasteVerb = /\b(pegar|pega|pegalo|pegala|paste)\b/.test(normalized);
   const hasSimpleFileKeyword = /\b(txt|csv|json|jsonl|md|yaml|yml|xml|html|htm|css|js|ini|log)\b/.test(normalized);
   const hasFolderWord = /\b(carpeta|directorio|folder)\b/.test(normalized);
-  const hasDeleteVerb = /\b(elimin[\p{L}\d_]*|borr[\p{L}\d_]*|quit[\p{L}\d_]*|suprim[\p{L}\d_]*|remove|delete)\b/iu.test(
-    normalized,
-  );
+  const hasDeleteVerb = /\b(eliminar|elimina|borrar|borra|quitar|quita|suprimir|suprime|remove|delete)\b/.test(normalized);
   const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
-  const hasSendVerb = /\b(envi[\p{L}\d_]*|mand[\p{L}\d_]*|pas[\p{L}\d_]*|compart[\p{L}\d_]*|adjunt[\p{L}\d_]*|sub[\p{L}\d_]*)\b/iu.test(
-    normalized,
-  );
+  const hasSendVerb =
+    /\b(enviar|envia|enviame|enviame|mandar|manda|mandame|pasar|pasa|compartir|comparte|adjuntar|adjunta|subir|sube)\b/.test(
+      normalized,
+    );
   const hasSendNoun = /\b(archivo|archivos|documento|documentos|file|files|pdf|imagen|imagenes|foto|fotos)\b/.test(
     normalized,
   );
@@ -104,6 +103,42 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   const deletePathCandidate = deps.extractWorkspaceDeletePathCandidate(deletePhrase);
   const deleteExtensions = deps.extractWorkspaceDeleteExtensions(deletePhrase || original);
   const deleteContentsOfPath = deps.extractWorkspaceDeleteContentsPath(deletePhrase || original);
+  const hasExplicitContentMarker =
+    /\b(?:con(?:tenido)?|contenido|texto|body|data|datos)\s*(?::|=)\s*/i.test(original) ||
+    rawQuotedSegments.length >= 2 ||
+    /\n/.test(original);
+  const writeTargetHint = deps.pickFirstNonEmpty(
+    quoted[0],
+    explicitWorkspacePath,
+    explicitNamedPath,
+    fileLikePath,
+    fromFilePhrase,
+  );
+  const shouldPrioritizeWrite =
+    Boolean(writeTargetHint) &&
+    (hasWriteVerb || hasEditVerb || hasDrawVerb || /\b(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?archivo\b/.test(normalized)) &&
+    hasExplicitContentMarker;
+
+  if (shouldPrioritizeWrite) {
+    const formatHint = deps.detectSimpleTextExtensionHint(original);
+    const targetPath = deps.resolveWorkspaceWritePathWithHint(writeTargetHint, formatHint);
+    const content = deps.extractNaturalWorkspaceWriteContent({
+      text: original,
+      rawQuotedSegments,
+      selectedPath: targetPath,
+    });
+    const append =
+      /\b(al\s+final|append|anex\w*|agreg\w*)\b/.test(normalized) &&
+      !/\b(reemplaz\w*|sobrescrib\w*)\b/.test(normalized);
+    return {
+      shouldHandle: true,
+      action: "write",
+      ...(targetPath ? { path: targetPath } : {}),
+      ...(typeof content === "string" ? { content } : {}),
+      ...(append ? { append: true } : {}),
+      ...(formatHint ? { formatHint } : {}),
+    };
+  }
 
   if (
     hasDeleteVerb &&
@@ -149,11 +184,11 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
 
   const renameIntent =
     /\b(renombr\w*|rename)\b/.test(normalized) ||
-    (/\b(cambi\w*)\b/.test(normalized) && /\b(nombre)\b/.test(normalized)) ||
-    /\b(cambi\w*)\s+([^\s"'`]+)\s+(?:a|por|como)\s+([^\s"'`]+)/.test(normalized);
+    (/\b(cambiar|cambia|cambiarle|cambiale)\b/.test(normalized) && /\b(nombre)\b/.test(normalized)) ||
+    /\b(cambiar|cambia)\s+([^\s"'`]+)\s+(?:a|por|como)\s+([^\s"'`]+)/.test(normalized);
   if (renameIntent) {
     const phraseMatch =
-      original.match(/\b(?:renombr\w*|rename|cambi\w*\s+nombre(?:\s+de)?|cambi\w*)\s+(.+?)\s+(?:a|por|como)\s+(.+)$/i) ??
+      original.match(/\b(?:renombr\w*|rename|cambiar\s+nombre(?:\s+de)?|cambia(?:r)?)\s+(.+?)\s+(?:a|por|como)\s+(.+)$/i) ??
       null;
     const sourcePath = quoted[0] ?? deps.cleanWorkspacePathPhrase(phraseMatch?.[1] ?? "");
     const targetPath = quoted[1] ?? deps.cleanWorkspacePathPhrase(phraseMatch?.[2] ?? "");
@@ -247,7 +282,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   }
 
   if (hasCopyVerb) {
-    const phraseMatch = original.match(/\b(?:copi[\p{L}\d_]*|duplic[\p{L}\d_]*|clon[\p{L}\d_]*)\s+(.+?)(?:\s+(?:a|hacia)\s+(.+))?$/iu);
+    const phraseMatch = original.match(/\b(?:copiar|copia|duplicar|duplica|clonar|clona)\s+(.+?)(?:\s+(?:a|hacia)\s+(.+))?$/iu);
     const sourceSegment = phraseMatch?.[1] ?? original;
     const selector = deps.extractWorkspaceNameSelectorFromSegment({
       segment: sourceSegment,
@@ -269,7 +304,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   }
 
   if (hasPasteVerb && (hasWorkspaceFileContext || /\b(portapapeles|clipboard)\b/.test(normalized))) {
-    const phraseMatch = original.match(/\b(?:peg[\p{L}\d_]*|paste)\s+(?:en|a|hacia)?\s*(.+)$/iu);
+    const phraseMatch = original.match(/\b(?:pegar|pega|pegalo|pegala|paste)\s+(?:en|a|hacia)?\s*(.+)$/iu);
     const targetPath = quoted[0] ?? explicitWorkspacePath ?? deps.cleanWorkspacePathPhrase(phraseMatch?.[1] ?? "");
     return {
       shouldHandle: true,
@@ -284,7 +319,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
     (hasSendNoun || hasFileLikeToken || hasWorkspaceWord || quoted.length > 0 || Boolean(explicitWorkspacePath))
   ) {
     const phraseMatch = original.match(
-      /\b(?:envi[\p{L}\d_]*|mand[\p{L}\d_]*|pas[\p{L}\d_]*|compart[\p{L}\d_]*|adjunt[\p{L}\d_]*|sub[\p{L}\d_]*)\s+(.+)$/iu,
+      /\b(?:enviar|envia|enviame|enviame|mandar|manda|mandame|pasar|pasa|compartir|comparte|adjuntar|adjunta|subir|sube)\s+(.+)$/iu,
     );
     const fileIndex = deps.parseWorkspaceFileIndexReference(original) ?? undefined;
     const targetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, deps.cleanWorkspacePathPhrase(phraseMatch?.[1] ?? ""));
