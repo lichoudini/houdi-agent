@@ -10,7 +10,7 @@ dist/
 *.lock
 houdi-audit.log
 backups/
-workspace/
+/workspace/
 houdi-schedule.json
 houdi-interests.json
 houdi-selfskill-drafts.json
