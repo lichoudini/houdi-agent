@@ -213,6 +213,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/intentcalibrate [n]`
 - `/intentcurate [n] [apply]`
 - `/intentab`
+- `/safe on|off|status`
 - `/shell <instrucción>`
 - `/shellmode on|off`
 - `/exec <comando> [args]`

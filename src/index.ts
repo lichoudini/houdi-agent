@@ -183,6 +183,7 @@ const idempotency = new RequestIdempotencyService(sqliteState, config.idempotenc
 const activeAgentByChat = new Map<number, string>();
 const aiShellModeByChat = new Map<number, boolean>();
 const ecoModeByChat = new Map<number, boolean>();
+const safeModeByChat = new Map<number, boolean>();
 const openAiModelByChat = new Map<number, string>();
 const OPENAI_MODELS_BY_COST: Array<{ model: string; tier: "bajo" | "medio" | "alto"; notes: string }> = [
   { model: "gpt-5-nano", tier: "bajo", notes: "ultra económico para tareas simples y alto volumen" },
@@ -364,6 +365,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "selfrestart",
   "selfupdate",
   "eco",
+  "safe",
   "shellmode",
   "shell",
   "adminmode",
@@ -446,6 +448,14 @@ function setEcoMode(chatId: number, enabled: boolean): void {
   ecoModeByChat.set(chatId, enabled);
 }
 
+function isSafeModeEnabled(chatId: number): boolean {
+  return safeModeByChat.get(chatId) ?? false;
+}
+
+function setSafeMode(chatId: number, enabled: boolean): void {
+  safeModeByChat.set(chatId, enabled);
+}
+
 function getOpenAiModelForChat(chatId: number): string {
   const custom = openAiModelByChat.get(chatId)?.trim();
   return custom || config.openAiModel;
@@ -481,6 +491,18 @@ function buildAgentVersionText(): string {
   return `Houdi Agent versión ${config.agentVersion}`;
 }
 
+function buildSafeDeterministicPrompt(prompt: string): string {
+  return [
+    "[SAFE_MODE=ON]",
+    "Interpreta este input como orden precisa y literal.",
+    "Prioriza ejecutar exactamente lo pedido sin creatividad innecesaria.",
+    "No infieras pasos extras no solicitados.",
+    "Si falta un dato crítico, responde con una sola pregunta concreta.",
+    "",
+    prompt,
+  ].join("\n");
+}
+
 async function askOpenAiForChat(params: {
   chatId: number;
   prompt: string;
@@ -489,7 +511,9 @@ async function askOpenAiForChat(params: {
   maxOutputTokens?: number;
 }): Promise<string> {
   const ecoEnabled = isEcoModeEnabled(params.chatId);
-  return openAi.ask(params.prompt, {
+  const safeEnabled = isSafeModeEnabled(params.chatId);
+  const effectivePrompt = safeEnabled ? buildSafeDeterministicPrompt(params.prompt) : params.prompt;
+  return openAi.ask(effectivePrompt, {
     context: params.context,
     concise: params.concise ?? ecoEnabled,
     maxOutputTokens: params.maxOutputTokens ?? (ecoEnabled ? config.openAiEcoMaxOutputTokens : undefined),
@@ -11794,6 +11818,7 @@ bot.command("start", async (ctx) => {
   const active = getActiveAgent(chatId);
   const shellMode = isAiShellModeEnabled(chatId) ? "on" : "off";
   const ecoMode = isEcoModeEnabled(chatId) ? "on" : "off";
+  const safeMode = isSafeModeEnabled(chatId) ? "on" : "off";
   const adminMode = isAdminApprovalRequired(chatId) ? "on" : "off";
   const panicMode = adminSecurity.isPanicModeEnabled() ? "on" : "off";
   await ctx.reply(
@@ -11803,6 +11828,7 @@ bot.command("start", async (ctx) => {
       `Agente actual: ${active}`,
       `Shell IA: ${shellMode}`,
       `ECO mode: ${ecoMode}`,
+      `SAFE mode: ${safeMode}`,
       `Admin mode: ${adminMode}`,
       `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${panicMode}`,
@@ -11850,6 +11876,7 @@ bot.command("help", async (ctx) => {
       "/selfrestart - Reiniciar servicio del agente",
       "/selfupdate [check] - Actualizar a la última versión del repositorio",
       "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
+      "/safe on|off|status - Modo determinista para interpretar órdenes precisas",
       "/intentstats [n] - Métricas de enrutamiento y sugerencias de threshold",
       "/intentfit [n] [iter] - Ajusta thresholds del router semántico con dataset",
       "/intentreload - Recarga configuración de rutas semánticas desde archivo",
@@ -12000,6 +12027,7 @@ bot.command("status", async (ctx) => {
       `Agente actual: ${getActiveAgent(ctx.chat.id)}`,
       `Shell IA: ${isAiShellModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `ECO mode: ${isEcoModeEnabled(ctx.chat.id) ? `on (max ${config.openAiEcoMaxOutputTokens} tok)` : "off"}`,
+      `SAFE mode: ${isSafeModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `Admin mode: ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
       `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
@@ -15016,6 +15044,35 @@ bot.command("eco", async (ctx) => {
     details: {
       enabled,
       maxOutputTokens: enabled ? config.openAiEcoMaxOutputTokens : config.openAiMaxOutputTokens,
+    },
+  });
+});
+
+bot.command("safe", async (ctx) => {
+  const input = String(ctx.match ?? "").trim().toLowerCase();
+  if (!input || ["status", "show"].includes(input)) {
+    await ctx.reply(`SAFE mode está ${isSafeModeEnabled(ctx.chat.id) ? "on" : "off"}.`);
+    return;
+  }
+
+  if (!["on", "off"].includes(input)) {
+    await ctx.reply("Uso: /safe on|off|status");
+    return;
+  }
+
+  const enabled = input === "on";
+  setSafeMode(ctx.chat.id, enabled);
+  await ctx.reply(
+    enabled
+      ? "SAFE mode activado: interpretaré tus mensajes como órdenes precisas y deterministas."
+      : "SAFE mode desactivado.",
+  );
+  await safeAudit({
+    type: "safe.toggle",
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    details: {
+      enabled,
     },
   });
 });
