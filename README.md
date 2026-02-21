@@ -425,6 +425,7 @@ Notas de consulta LIM:
 
 - En lenguaje natural, `count` por defecto es `3` (max `10`).
 - La lectura prioriza mensajes del prospecto (entrantes/no propios).
+- El parser usa estrategia híbrida (reglas + fallback IA) para extraer `first_name`, `last_name`, `fuente` y reducir errores de interpretación en frases libres.
 
 `fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
 

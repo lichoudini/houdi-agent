@@ -4149,16 +4149,44 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     };
   }
 
+  const afterLimRaw = original.match(/\b(?:\/?lim)\b[:\s,-]*(.+)$/i)?.[1]?.trim() ?? "";
+  const limInlineMatch = afterLimRaw.match(
+    /^(?:de\s+)?([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+(?:en|desde|fuente|source)\s+(.+)$/i,
+  );
+  if ((explicitContext || Boolean(options?.allowImplicit)) && limInlineMatch) {
+    const sourceInline = (limInlineMatch[3] ?? "")
+      .replace(/\bcount\s*[:=]\s*\d{1,2}\b/gi, "")
+      .replace(/\b(?:ultimos?|últimos?)\s+\d{1,2}\s+mensajes?\b/gi, "")
+      .trim();
+    if (sourceInline) {
+      return {
+        shouldHandle: true,
+        action: "query",
+        firstName: (limInlineMatch[1] ?? "").trim(),
+        lastName: (limInlineMatch[2] ?? "").trim(),
+        sourceName: sourceInline,
+        count,
+        prospectOnly: true,
+      };
+    }
+  }
+
   // Fallback flexible: "lim Rodrigo Toscano Linkedin_Marylin [count:2]"
   const rawNoCount = original
+    .replace(/^\s*(?:consulta(?:r)?|revisa(?:r)?|busca(?:r)?|trae(?:r)?|lee(?:r)?|mira(?:r)?|ver)\b\s*/i, " ")
     .replace(/\bcount\s*[:=]\s*\d{1,2}\b/gi, " ")
     .replace(/\b(?:ultimos?|últimos?)\s+\d{1,2}\s+mensajes?\b/gi, " ")
     .trim();
   const fallbackTokens = rawNoCount
     .split(/\s+/)
-    .map((token) => token.trim())
+    .map((token) => token.replace(/^[,;:.]+|[,;:.]+$/g, "").trim())
     .filter(Boolean)
-    .filter((token) => !/^(lim|connector|message|retriever|mensajes?|mensaje|de|en|del|para)$/i.test(token));
+    .filter(
+      (token) =>
+        !/^(lim|connector|message|retriever|mensajes?|mensaje|de|en|del|para|consulta|consultar|revisa|revisar|ver|mira|mirar|trae|traer|busca|buscar|lee|leer)$/i.test(
+          token,
+        ),
+    );
   if ((explicitContext || Boolean(options?.allowImplicit)) && fallbackTokens.length >= 3) {
     const maybeFirstName = fallbackTokens[0] ?? "";
     const maybeLastName = fallbackTokens[1] ?? "";
@@ -4222,6 +4250,92 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     action,
     includeTunnel,
   };
+}
+
+function tryParseConnectorIntentWithAi(raw: string): ConnectorNaturalIntent | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as Record<string, unknown>;
+    const actionRaw = typeof parsed.action === "string" ? normalizeIntentText(parsed.action) : "";
+    const allowedActions = new Set<ConnectorNaturalAction>(["query", "status", "start", "stop", "restart"]);
+    if (!allowedActions.has(actionRaw as ConnectorNaturalAction)) {
+      return null;
+    }
+    const firstName = typeof parsed.firstName === "string" ? parsed.firstName.trim() : "";
+    const lastName = typeof parsed.lastName === "string" ? parsed.lastName.trim() : "";
+    const sourceName = typeof parsed.sourceName === "string" ? parsed.sourceName.trim() : "";
+    const countRaw = Number.parseInt(String(parsed.count ?? ""), 10);
+    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : undefined;
+    const prospectOnly =
+      typeof parsed.prospectOnly === "boolean"
+        ? parsed.prospectOnly
+        : actionRaw === "query"
+          ? true
+          : undefined;
+
+    return {
+      shouldHandle: true,
+      action: actionRaw as ConnectorNaturalAction,
+      ...(firstName ? { firstName } : {}),
+      ...(lastName ? { lastName } : {}),
+      ...(sourceName ? { sourceName } : {}),
+      ...(typeof count === "number" ? { count } : {}),
+      ...(typeof prospectOnly === "boolean" ? { prospectOnly } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function classifyConnectorIntentWithAi(params: { chatId: number; text: string }): Promise<ConnectorNaturalIntent | null> {
+  if (!openAi.isConfigured()) {
+    return null;
+  }
+  const text = params.text.trim();
+  if (!text) {
+    return null;
+  }
+  const prompt = [
+    "Extrae intención LIM desde un mensaje de usuario.",
+    "Responde SOLO JSON válido con estas claves:",
+    "{",
+    '  "action": "query|status|start|stop|restart",',
+    '  "firstName": "string|null",',
+    '  "lastName": "string|null",',
+    '  "sourceName": "string|null",',
+    '  "count": number|null,',
+    '  "prospectOnly": boolean',
+    "}",
+    "",
+    "Reglas:",
+    "- Si pide mensajes/contacto, action=query.",
+    "- Si action=query, intenta extraer firstName, lastName, sourceName y count (default 3).",
+    "- No inventes datos; usa null si no está.",
+    "- Si dice 'no propios/entrantes/prospecto', prospectOnly=true.",
+    "",
+    `Mensaje: ${text}`,
+  ].join("\n");
+
+  try {
+    const answer = await askOpenAiForChat({
+      chatId: params.chatId,
+      prompt,
+      concise: true,
+      maxOutputTokens: 180,
+    });
+    return tryParseConnectorIntentWithAi(answer);
+  } catch {
+    return null;
+  }
 }
 
 const SCHEDULE_WEEKDAY_TO_INDEX: Record<string, number> = {
@@ -9328,7 +9442,31 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     return false;
   }
 
-  const intent = detectConnectorNaturalIntent(params.text);
+  const normalizedTextForIntent = normalizeIntentText(params.text);
+  const hasLikelyQueryCue =
+    /\b(mensaje|mensajes|prospecto|contacto|lead|ultimo|último|ultimos|últimos|de\s+[a-záéíóúñ'`.-]+\s+[a-záéíóúñ'`.-]+)\b/i.test(
+      normalizedTextForIntent,
+    );
+  const parsedIntent = detectConnectorNaturalIntent(params.text);
+  const hasInvalidQueryName =
+    parsedIntent.action === "query" &&
+    /\b(revisa|revisar|consulta|consultar|busca|buscar|trae|traer|lee|leer|mira|mirar|ver)\b/.test(
+      normalizeIntentText(parsedIntent.firstName ?? ""),
+    );
+  const needsAiFallback =
+    !parsedIntent.shouldHandle ||
+    !parsedIntent.action ||
+    (parsedIntent.action === "query" &&
+      (!parsedIntent.firstName || !parsedIntent.lastName || !parsedIntent.sourceName || hasInvalidQueryName)) ||
+    (parsedIntent.action === "status" && hasLikelyQueryCue);
+  const aiIntent = needsAiFallback
+    ? await classifyConnectorIntentWithAi({
+        chatId,
+        text: params.text,
+      })
+    : null;
+  const intent = aiIntent?.shouldHandle && aiIntent.action ? aiIntent : parsedIntent;
+
   if (!intent.shouldHandle || !intent.action) {
     return false;
   }
