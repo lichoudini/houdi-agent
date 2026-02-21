@@ -376,6 +376,11 @@ Comandos:
 - `/gmail untrash <messageId>`
 - `/gmail star <messageId>`
 - `/gmail unstar <messageId>`
+- `/gmail recipients list`
+- `/gmail recipients add "<nombre>" <email>`
+- `/gmail recipients edit <nombre|n> [name="<nuevo nombre>"] [email=<nuevo@email>]`
+- `/gmail recipients del <nombre|n>`
+- `/gmail recipients clear`
 
 Modo natural (sin comandos):
 
@@ -383,6 +388,9 @@ Modo natural (sin comandos):
 - `lee el correo 2`
 - `marcalo como leído`
 - `enviá un correo a ana@empresa.com asunto: Reunión cuerpo: Confirmo mañana 10am`
+- `agrega destinatario Ana ana@empresa.com`
+- `actualiza destinatario Ana ana.nueva@empresa.com`
+- `elimina destinatario Ana`
 - `decime el estado de gmail`
 - `mostrame el perfil de la cuenta gmail conectada`
 

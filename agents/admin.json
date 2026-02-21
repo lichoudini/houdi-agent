@@ -2,6 +2,7 @@
   "name": "admin",
   "description": "Agente de administración con comandos extendidos (usar con cuidado)",
   "cwd": ".",
+  "workspaceOnly": false,
   "allowCommands": [
     "pwd",
     "ls",
@@ -20,6 +21,7 @@
     "sudo",
     "systemctl",
     "shutdown",
-    "journalctl"
+    "journalctl",
+    "*"
   ]
 }

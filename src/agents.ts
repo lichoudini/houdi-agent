@@ -7,6 +7,7 @@ const AgentProfileSchema = z.object({
   description: z.string().trim().min(1).optional(),
   cwd: z.string().trim().min(1).default("."),
   allowCommands: z.array(z.string().trim().min(1)).min(1),
+  workspaceOnly: z.boolean().default(false),
 });
 
 export type AgentProfile = z.infer<typeof AgentProfileSchema>;
@@ -20,6 +21,7 @@ function normalizeAgent(profile: AgentProfile): AgentProfile {
     ...profile,
     cwd: profile.cwd.trim(),
     allowCommands: commands,
+    workspaceOnly: Boolean(profile.workspaceOnly),
   };
 }
 

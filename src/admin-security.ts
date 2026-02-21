@@ -16,8 +16,20 @@ type AdminSecurityOptions = {
   approvalTtlMs: number;
 };
 
-function buildApprovalId(): string {
-  return `ap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const APPROVAL_ID_LENGTH = 4;
+const APPROVAL_ID_ALPHABET = "0123456789";
+
+function randomApprovalId(): string {
+  let out = "";
+  for (let i = 0; i < APPROVAL_ID_LENGTH; i += 1) {
+    const idx = Math.floor(Math.random() * APPROVAL_ID_ALPHABET.length);
+    out += APPROVAL_ID_ALPHABET[idx] ?? "x";
+  }
+  return out;
+}
+
+function normalizeApprovalId(id: string): string {
+  return id.trim().toLowerCase();
 }
 
 export class AdminSecurityController {
@@ -53,8 +65,18 @@ export class AdminSecurityController {
   }): PendingApproval {
     this.purgeExpired();
     const now = Date.now();
+    let id = "";
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      id = randomApprovalId();
+      if (!this.pendingById.has(id)) {
+        break;
+      }
+    }
+    if (!id || this.pendingById.has(id)) {
+      throw new Error("No se pudo generar un ID de aprobación único.");
+    }
     const approval: PendingApproval = {
-      id: buildApprovalId(),
+      id,
       kind: params.kind,
       chatId: params.chatId,
       userId: params.userId,
@@ -77,27 +99,29 @@ export class AdminSecurityController {
 
   consumeApproval(id: string, chatId?: number): PendingApproval | null {
     this.purgeExpired();
-    const approval = this.pendingById.get(id);
+    const normalizedId = normalizeApprovalId(id);
+    const approval = this.pendingById.get(normalizedId);
     if (!approval) {
       return null;
     }
     if (typeof chatId === "number" && approval.chatId !== chatId) {
       return null;
     }
-    this.pendingById.delete(id);
+    this.pendingById.delete(normalizedId);
     return approval;
   }
 
   denyApproval(id: string, chatId?: number): PendingApproval | null {
     this.purgeExpired();
-    const approval = this.pendingById.get(id);
+    const normalizedId = normalizeApprovalId(id);
+    const approval = this.pendingById.get(normalizedId);
     if (!approval) {
       return null;
     }
     if (typeof chatId === "number" && approval.chatId !== chatId) {
       return null;
     }
-    this.pendingById.delete(id);
+    this.pendingById.delete(normalizedId);
     return approval;
   }
 

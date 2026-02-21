@@ -1,7 +1,8 @@
 {
   "name": "operator",
   "description": "Agente operativo con permisos administrativos (equivalente a admin)",
-  "cwd": ".",
+  "cwd": "./workspace",
+  "workspaceOnly": true,
   "allowCommands": [
     "pwd",
     "ls",
@@ -20,6 +21,7 @@
     "sudo",
     "systemctl",
     "shutdown",
-    "journalctl"
+    "journalctl",
+    "*"
   ]
 }

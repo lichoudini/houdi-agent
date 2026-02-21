@@ -102,8 +102,15 @@ type AssistantReplySnapshot = {
   source: string;
   atMs: number;
 };
+type RecentConversationTurn = {
+  role: "user" | "assistant";
+  text: string;
+  source: string;
+  atMs: number;
+};
 const lastAssistantReplyByChat = new Map<number, AssistantReplySnapshot>();
 const assistantReplyHistoryByChat = new Map<number, AssistantReplySnapshot[]>();
+const recentConversationByChat = new Map<number, RecentConversationTurn[]>();
 type SavedEmailRecipient = {
   chatId: number;
   name: string;
@@ -178,6 +185,11 @@ const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
 const SELF_UPDATE_APPROVAL_COMMAND = "__selfupdate__";
 const NEWS_MAX_REDDIT_RESULTS = 2;
 const CONNECTOR_CONTEXT_TTL_MS = 30 * 60 * 1000;
+const RECENT_EMAIL_ROUTER_CONTEXT_TURNS = 3;
+const RECENT_INTENT_ROUTER_CONTEXT_TURNS = 3;
+const RECENT_CONVERSATION_TURN_LIMIT = 40;
+const NATURAL_INTENT_ROUTER_MIN_TEXT_CHARS = 12;
+const AI_SEQUENCE_ROUTER_MAX_STEPS = 6;
 const WORKSPACE_DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const WORKSPACE_DELETE_PATH_PROMPT_TTL_MS = 5 * 60 * 1000;
 const INDEXED_LIST_CONTEXT_TTL_MS = 2 * 60 * 60 * 1000;
@@ -586,6 +598,9 @@ type WorkspaceNaturalIntent = {
   sourcePath?: string;
   targetPath?: string;
   selector?: WorkspaceNameSelector;
+  deleteExtensions?: string[];
+  deleteContentsOfPath?: string;
+  append?: boolean;
   fileIndex?: number;
   content?: string;
   formatHint?: string;
@@ -626,6 +641,7 @@ type GmailNaturalIntent = {
   bcc?: string;
   draftRequested?: boolean;
   draftInstruction?: string;
+  forceAiByMissingSubject?: boolean;
   autoContentKind?: "document" | "poem" | "news" | "reminders" | "stoic" | "assistant-last";
   recipientName?: string;
 };
@@ -637,6 +653,24 @@ type GmailRecipientNaturalIntent = {
   action?: GmailRecipientNaturalAction;
   name?: string;
   email?: string;
+};
+
+type NaturalIntentHandlerName =
+  | "stoic-smalltalk"
+  | "self-maintenance"
+  | "connector"
+  | "schedule"
+  | "memory"
+  | "gmail-recipients"
+  | "gmail"
+  | "workspace"
+  | "document"
+  | "web"
+  | "none";
+
+type AiSequencePlanStep = {
+  instruction: string;
+  aiContentPrompt?: string;
 };
 
 type DurableUserFact = {
@@ -1073,22 +1107,122 @@ async function deleteEmailRecipient(chatIdInput: number, nameInput: string): Pro
   return removed ?? null;
 }
 
-function resolveEmailRecipient(chatIdInput: number, nameInput: string): SavedEmailRecipient | null {
+function resolveEmailRecipientSelector(
+  chatIdInput: number,
+  selectorInput: string,
+): { row: SavedEmailRecipient; index: number } | null {
   const chatId = Math.floor(chatIdInput);
-  const nameKey = normalizeRecipientNameKey(nameInput);
+  const selector = selectorInput.trim();
+  if (!selector) {
+    return null;
+  }
+
+  const list = emailRecipientsByChat.get(chatId) ?? [];
+  if (list.length === 0) {
+    return null;
+  }
+
+  if (/^\d+$/.test(selector)) {
+    const sorted = listEmailRecipients(chatId);
+    const position = Number.parseInt(selector, 10);
+    if (!Number.isFinite(position) || position < 1 || position > sorted.length) {
+      return null;
+    }
+    const picked = sorted[position - 1];
+    if (!picked) {
+      return null;
+    }
+    const index = list.findIndex((item) => item.nameKey === picked.nameKey);
+    if (index < 0) {
+      return null;
+    }
+    return { row: list[index]!, index };
+  }
+
+  const nameKey = normalizeRecipientNameKey(selector);
   if (!nameKey) {
     return null;
   }
-  const list = emailRecipientsByChat.get(chatId) ?? [];
-  const exact = list.find((item) => item.nameKey === nameKey);
-  if (exact) {
-    return exact;
+  const exactIndex = list.findIndex((item) => item.nameKey === nameKey);
+  if (exactIndex >= 0) {
+    return { row: list[exactIndex]!, index: exactIndex };
   }
-  const startsWith = list.filter((item) => item.nameKey.startsWith(nameKey));
+  const startsWith = list
+    .map((item, index) => ({ item, index }))
+    .filter((entry) => entry.item.nameKey.startsWith(nameKey));
   if (startsWith.length === 1) {
-    return startsWith[0] ?? null;
+    const only = startsWith[0]!;
+    return { row: only.item, index: only.index };
   }
   return null;
+}
+
+async function deleteEmailRecipientBySelector(chatIdInput: number, selectorInput: string): Promise<SavedEmailRecipient | null> {
+  const chatId = Math.floor(chatIdInput);
+  const resolved = resolveEmailRecipientSelector(chatId, selectorInput);
+  if (!resolved) {
+    return null;
+  }
+  const list = emailRecipientsByChat.get(chatId) ?? [];
+  const [removed] = list.splice(resolved.index, 1);
+  emailRecipientsByChat.set(chatId, list);
+  await queuePersistEmailRecipients();
+  return removed ?? null;
+}
+
+async function clearEmailRecipients(chatIdInput: number): Promise<number> {
+  const chatId = Math.floor(chatIdInput);
+  const list = emailRecipientsByChat.get(chatId) ?? [];
+  const removedCount = list.length;
+  emailRecipientsByChat.set(chatId, []);
+  await queuePersistEmailRecipients();
+  return removedCount;
+}
+
+async function updateEmailRecipientBySelector(params: {
+  chatId: number;
+  selector: string;
+  nextName?: string;
+  nextEmail?: string;
+}): Promise<{ previous: SavedEmailRecipient; row: SavedEmailRecipient } | null> {
+  const chatId = Math.floor(params.chatId);
+  const resolved = resolveEmailRecipientSelector(chatId, params.selector);
+  if (!resolved) {
+    return null;
+  }
+  const list = emailRecipientsByChat.get(chatId) ?? [];
+  const previous = resolved.row;
+  const nextName = params.nextName ? normalizeRecipientName(params.nextName) : previous.name;
+  const nextEmail = params.nextEmail ? normalizeRecipientEmail(params.nextEmail) : previous.email;
+  if (!nextName) {
+    throw new Error("Nombre de destinatario vacío.");
+  }
+  if (!isValidEmailAddress(nextEmail)) {
+    throw new Error("Email inválido.");
+  }
+  const nextNameKey = normalizeRecipientNameKey(nextName);
+  const duplicateIndex = list.findIndex((item, index) => item.nameKey === nextNameKey && index !== resolved.index);
+  if (duplicateIndex >= 0) {
+    throw new Error(`Ya existe un destinatario con nombre "${nextName}".`);
+  }
+  const updated: SavedEmailRecipient = {
+    ...previous,
+    name: nextName,
+    nameKey: nextNameKey,
+    email: nextEmail,
+    updatedAt: new Date().toISOString(),
+  };
+  list[resolved.index] = updated;
+  emailRecipientsByChat.set(chatId, list);
+  await queuePersistEmailRecipients();
+  return {
+    previous,
+    row: updated,
+  };
+}
+
+function resolveEmailRecipient(chatIdInput: number, nameInput: string): SavedEmailRecipient | null {
+  return resolveEmailRecipientSelector(chatIdInput, nameInput)?.row ?? null;
 }
 
 function cleanDurableFactValue(raw: string): string {
@@ -1507,6 +1641,114 @@ async function findWorkspaceFilesBySelector(
         continue;
       }
       if (!workspaceFileNameMatchesSelector(entry.name, selector)) {
+        continue;
+      }
+      const relative = path.relative(baseWorkspace, full).replace(/\\/g, "/");
+      if (!relative || relative.startsWith("..")) {
+        continue;
+      }
+      const normalized = normalizeWorkspaceRelativePath(relative);
+      if (!normalized) {
+        continue;
+      }
+      matches.push({
+        path: normalized,
+        relPath: `workspace/${normalized}`,
+      });
+      if (matches.length >= WORKSPACE_SELECTOR_MAX_MATCHES) {
+        truncated = true;
+        break;
+      }
+    }
+    if (matches.length >= WORKSPACE_SELECTOR_MAX_MATCHES) {
+      break;
+    }
+  }
+
+  return {
+    scopeRelPath: resolveWorkspacePath(scopeNormalized).relPath,
+    matches,
+    truncated,
+  };
+}
+
+async function findWorkspaceFilesByExtensions(params: {
+  extensions: string[];
+  scopePath?: string;
+}): Promise<{
+  scopeRelPath: string;
+  matches: Array<{ path: string; relPath: string }>;
+  truncated: boolean;
+}> {
+  const normalizedExts = Array.from(
+    new Set(
+      params.extensions
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean)
+        .map((item) => (item.startsWith(".") ? item : `.${item}`))
+        .map((item) => item.replace(/[^.a-z0-9]/g, ""))
+        .filter((item) => /^\.[a-z0-9]{1,12}$/.test(item)),
+    ),
+  );
+  if (normalizedExts.length === 0) {
+    return {
+      scopeRelPath: resolveWorkspacePath(params.scopePath ?? "").relPath,
+      matches: [],
+      truncated: false,
+    };
+  }
+
+  const scopeNormalized = normalizeWorkspaceRelativePath(params.scopePath ?? "");
+  const scope = resolveWorkspacePath(scopeNormalized);
+  let scopeStat: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    scopeStat = await fs.stat(scope.fullPath);
+  } catch {
+    throw new Error(`No existe la carpeta base: ${scope.relPath}`);
+  }
+
+  const startDir = scopeStat.isDirectory() ? scope.fullPath : path.dirname(scope.fullPath);
+  const baseWorkspace = path.resolve(config.workspaceDir);
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: startDir, depth: 0 }];
+  const seen = new Set<string>();
+  const matches: Array<{ path: string; relPath: string }> = [];
+  let truncated = false;
+  let scannedDirs = 0;
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (seen.has(current.dir)) {
+      continue;
+    }
+    seen.add(current.dir);
+    scannedDirs += 1;
+    if (scannedDirs > WORKSPACE_SELECTOR_MAX_DIRS) {
+      truncated = true;
+      break;
+    }
+
+    let entries: Dirent[] = [];
+    try {
+      entries = await fs.readdir(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(current.dir, entry.name);
+      if (entry.isDirectory()) {
+        if (current.depth < WORKSPACE_SELECTOR_MAX_DEPTH) {
+          queue.push({ dir: full, depth: current.depth + 1 });
+        } else {
+          truncated = true;
+        }
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!normalizedExts.includes(ext)) {
         continue;
       }
       const relative = path.relative(baseWorkspace, full).replace(/\\/g, "/");
@@ -2026,6 +2268,34 @@ function extractWorkspaceDeletePathCandidate(text: string): string {
   return candidate;
 }
 
+function extractWorkspaceDeleteExtensions(text: string): string[] {
+  const matched = text.match(/\.[a-z0-9]{1,12}\b/gi) ?? [];
+  return Array.from(
+    new Set(
+      matched
+        .map((item) => item.trim().toLowerCase())
+        .map((item) => item.replace(/[^.a-z0-9]/g, ""))
+        .filter((item) => /^\.[a-z0-9]{1,12}$/.test(item)),
+    ),
+  );
+}
+
+function extractWorkspaceDeleteContentsPath(text: string): string {
+  const original = text.trim();
+  if (!original) {
+    return "";
+  }
+  const candidate =
+    original.match(
+      /\b(?:todo(?:s)?(?:\s+el)?\s+contenido|todo\s+lo\s+que\s+hay|todo(?:s)?\s+los?\s+archivos)\s+(?:de|en)\s+(?:la\s+|el\s+)?(?:carpeta|directorio|folder)\s+(.+)$/i,
+    )?.[1] ??
+    "";
+  if (!candidate) {
+    return "";
+  }
+  return cleanWorkspacePathPhrase(candidate);
+}
+
 function pickFirstNonEmpty(...values: Array<string | undefined | null>): string {
   for (const value of values) {
     if (typeof value !== "string") {
@@ -2321,6 +2591,16 @@ function extractNaturalWorkspaceWriteContent(params: {
     }
   }
 
+  const drawMatch = text.match(
+    /\b(?:dibuj\w*|traz\w*)\s+([\s\S]+?)(?:\s+(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?(?:archivo|documento|file)\b[\s\S]*)?$/i,
+  );
+  if (drawMatch?.[1]) {
+    const candidate = drawMatch[1].trim();
+    if (candidate) {
+      return formatNaturalInlineBulletList(candidate);
+    }
+  }
+
   const jsonStart = text.indexOf("{");
   const jsonEnd = text.lastIndexOf("}");
   if (jsonStart >= 0 && jsonEnd > jsonStart) {
@@ -2423,6 +2703,7 @@ async function writeWorkspaceTextFile(params: {
   relativePath: string;
   content?: string;
   overwrite?: boolean;
+  append?: boolean;
 }): Promise<{ relPath: string; size: number; created: boolean }> {
   const normalized = normalizeWorkspaceRelativePath(params.relativePath);
   if (!normalized) {
@@ -2435,7 +2716,8 @@ async function writeWorkspaceTextFile(params: {
   }
 
   const resolved = resolveWorkspacePath(normalized);
-  const overwrite = Boolean(params.overwrite);
+  const append = Boolean(params.append);
+  const overwrite = append ? true : Boolean(params.overwrite);
   const defaultExt = path.extname(normalized).toLowerCase();
   const defaultContent = defaultExt === ".json" ? "{}\n" : "";
   const content = typeof params.content === "string" ? params.content : defaultContent;
@@ -2460,7 +2742,7 @@ async function writeWorkspaceTextFile(params: {
   await fs.mkdir(path.dirname(resolved.fullPath), { recursive: true });
   await fs.writeFile(resolved.fullPath, content, {
     encoding: "utf8",
-    flag: overwrite ? "w" : "wx",
+    flag: append ? "a" : overwrite ? "w" : "wx",
   });
   const stat = await fs.stat(resolved.fullPath);
   return {
@@ -2570,6 +2852,10 @@ function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
       normalized,
     );
   const hasWriteVerb = /\b(escrib\w*|guard\w*|redact\w*|arm\w*)\b/.test(normalized);
+  const hasEditVerb = /\b(edit\w*|modific\w*|actualiz\w*|complet\w*|agreg\w*|anex\w*|append|insert\w*)\b/.test(
+    normalized,
+  );
+  const hasDrawVerb = /\b(dibuj\w*|traz\w*|ascii|ascci)\b/.test(normalized);
   const hasCopyMessageToFileCue =
     /\b(copia|copiar|copiame|copiá|copia)\b/.test(normalized) &&
     /\b(mensaje|correo|mail|email)\b/.test(normalized) &&
@@ -2597,6 +2883,8 @@ function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
   );
   const deletePhrase = deletePhraseMatch?.[1] ?? "";
   const deletePathCandidate = extractWorkspaceDeletePathCandidate(deletePhrase);
+  const deleteExtensions = extractWorkspaceDeleteExtensions(deletePhrase || original);
+  const deleteContentsOfPath = extractWorkspaceDeleteContentsPath(deletePhrase || original);
 
   if (
     hasDeleteVerb &&
@@ -2609,6 +2897,23 @@ function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
       /\bl[oa]s?\b/.test(normalized) ||
       Boolean(deletePathCandidate))
   ) {
+    if (deleteContentsOfPath) {
+      return {
+        shouldHandle: true,
+        action: "delete",
+        deleteContentsOfPath,
+      };
+    }
+
+    if (deleteExtensions.length > 0) {
+      return {
+        shouldHandle: true,
+        action: "delete",
+        deleteExtensions,
+        ...(defaultSelectorScope ? { path: defaultSelectorScope } : {}),
+      };
+    }
+
     const selector = extractWorkspaceNameSelectorFromSegment({
       segment: deletePhrase || original,
       defaultScopePath: defaultSelectorScope,
@@ -2663,11 +2968,11 @@ function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
 
   const hasRenameOrMoveVerb = renameIntent || moveIntent;
   const writeIntent =
-    ((hasCreateVerb || hasWriteVerb) &&
+    ((hasCreateVerb || hasWriteVerb || hasEditVerb || hasDrawVerb) &&
       !hasFolderWord &&
       !hasRenameOrMoveVerb &&
       (hasFileWord || hasSimpleFileKeyword || Boolean(fileLikePath))) ||
-    (hasCreateVerb && Boolean(fileLikePath)) ||
+    ((hasCreateVerb || hasEditVerb || hasDrawVerb) && Boolean(fileLikePath)) ||
     (hasCopyMessageToFileCue && Boolean(fileLikePath));
   if (writeIntent) {
     const formatHint = detectSimpleTextExtensionHint(original);
@@ -2678,11 +2983,15 @@ function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
       rawQuotedSegments,
       selectedPath: targetPath,
     });
+    const append =
+      /\b(al\s+final|append|anex\w*|agreg\w*)\b/.test(normalized) &&
+      !/\b(reemplaz\w*|sobrescrib\w*)\b/.test(normalized);
     return {
       shouldHandle: true,
       action: "write",
       ...(targetPath ? { path: targetPath } : {}),
       ...(typeof content === "string" ? { content } : {}),
+      ...(append ? { append: true } : {}),
       ...(formatHint ? { formatHint } : {}),
     };
   }
@@ -4298,6 +4607,366 @@ function detectGmailDraftRequested(textNormalized: string, hasBodyLabel: boolean
   return /\b(asunto\s+vinculado|listado\s+de\s+las?\s+ultimas?\s+noticias)\b/.test(textNormalized);
 }
 
+function extractLiteralBodyRequest(text: string): string {
+  const candidate =
+    text.match(/\bque\s+diga\s*(?::|=)?\s*(.+)$/i)?.[1]?.trim() ??
+    text.match(/\b(?:texto|mensaje|cuerpo)\s+(?:exacto|literal)\s*(?::|=)?\s*(.+)$/i)?.[1]?.trim() ??
+    "";
+  if (!candidate) {
+    return "";
+  }
+  const unquoted = candidate.replace(/^["'`]+|["'`]+$/g, "").trim();
+  return truncateInline(unquoted, 10_000);
+}
+
+function extractNaturalSubjectRequest(text: string): string {
+  const candidate =
+    text.match(/\b(?:el\s+)?(?:asunto|subject)\s*(?:ser[aá]|es|ser[ií]a)\s*[:=-]\s*(.+)$/i)?.[1]?.trim() ??
+    text.match(/\b(?:el\s+)?(?:asunto|subject)\s*(?:ser[aá]|es|ser[ií]a)\s+(.+)$/i)?.[1]?.trim() ??
+    "";
+  if (!candidate) {
+    return "";
+  }
+  const cleaned = candidate
+    .replace(/\b(?:cuerpo|mensaje|texto|body)\s*[:=-].*$/i, "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[.?!\s]+$/g, "")
+    .trim();
+  return truncateInline(cleaned, 200);
+}
+
+function detectCreativeEmailCue(textNormalized: string): boolean {
+  const creativeWord =
+    /\b(improvis\w*|alegre|creativ\w*|original|invent\w*|bonito|lindo|inspirador|poetico|poético)\b/.test(
+      textNormalized,
+    );
+  const askToWrite =
+    /\b(arma\w*|redact\w*|escrib\w*|genera\w*|crea\w*|que\s+contenga|a\s+tu\s+criterio|como\s+quieras)\b/.test(
+      textNormalized,
+    );
+  const songOrPoemRequest =
+    /\b(cancion|canción|poema|verso|letra)\b/.test(textNormalized) &&
+    /\b(sobre|de|con)\b/.test(textNormalized);
+  return (creativeWord && askToWrite) || songOrPoemRequest;
+}
+
+function getRecentConversationContext(chatId: number, currentUserText: string, limit: number): string[] {
+  const turns = recentConversationByChat.get(chatId) ?? [];
+  if (turns.length === 0) {
+    return [];
+  }
+  const trimmedCurrent = currentUserText.trim();
+  const filtered = turns.filter((turn, idx) => {
+    if (turn.role !== "user") {
+      return true;
+    }
+    if (idx !== turns.length - 1) {
+      return true;
+    }
+    return turn.text.trim() !== trimmedCurrent;
+  });
+  const picked = filtered.slice(-Math.max(1, limit));
+  return picked.map((turn) => `${turn.role}: ${truncateInline(turn.text, 400)}`);
+}
+
+function getRecentEmailRouterContext(chatId: number, currentUserText: string): string[] {
+  return getRecentConversationContext(chatId, currentUserText, RECENT_EMAIL_ROUTER_CONTEXT_TURNS);
+}
+
+function tryParseNaturalRouteDecision(raw: string): {
+  handler: NaturalIntentHandlerName;
+  reason?: string;
+} | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as {
+      handler?: unknown;
+      reason?: unknown;
+    };
+    const handler = typeof parsed.handler === "string" ? parsed.handler.trim().toLowerCase() : "";
+    const allowed = new Set<NaturalIntentHandlerName>([
+      "stoic-smalltalk",
+      "self-maintenance",
+      "connector",
+      "schedule",
+      "memory",
+      "gmail-recipients",
+      "gmail",
+      "workspace",
+      "document",
+      "web",
+      "none",
+    ]);
+    if (!allowed.has(handler as NaturalIntentHandlerName)) {
+      return null;
+    }
+    const reason = typeof parsed.reason === "string" ? truncateInline(parsed.reason.trim(), 180) : "";
+    return {
+      handler: handler as NaturalIntentHandlerName,
+      ...(reason ? { reason } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function classifyNaturalIntentRouteWithAi(params: {
+  chatId: number;
+  text: string;
+  candidates: Exclude<NaturalIntentHandlerName, "none">[];
+}): Promise<{ handler: NaturalIntentHandlerName; reason?: string } | null> {
+  const text = params.text.trim();
+  if (!openAi.isConfigured() || text.length < NATURAL_INTENT_ROUTER_MIN_TEXT_CHARS) {
+    return null;
+  }
+  const background = getRecentConversationContext(params.chatId, text, RECENT_INTENT_ROUTER_CONTEXT_TURNS);
+  const candidateList = Array.from(new Set(params.candidates));
+  if (candidateList.length === 0) {
+    return null;
+  }
+  const prompt = [
+    "Clasifica una instruccion de usuario a UN handler del bot.",
+    "Devuelve SOLO JSON valido.",
+    "",
+    "Handlers disponibles:",
+    "- stoic-smalltalk: charla corta estoica/motivacional.",
+    "- self-maintenance: tareas del propio agente (skills, update, restart).",
+    "- connector: estado/start/stop/restart del connector/tunnel.",
+    "- schedule: crear/listar/editar/eliminar tareas o recordatorios.",
+    "- memory: preguntas de memoria/recuerdo/contexto previo.",
+    "- gmail-recipients: ABM de destinatarios guardados.",
+    "- gmail: leer/enviar/gestionar correos.",
+    "- workspace: archivos/carpetas locales, borrar, mover, listar, enviar.",
+    "- document: leer/analizar contenido documental.",
+    "- web: buscar noticias o informacion en internet.",
+    "- none: si no corresponde a ningun handler.",
+    "",
+    "Reglas:",
+    `- Debes elegir un valor de esta lista: ${[...candidateList, "none"].join(", ")}`,
+    "- Si hay ambiguedad fuerte, usa none.",
+    "- Prioriza gmail-recipients sobre gmail cuando habla de destinatarios/contactos.",
+    "",
+    'Formato de salida: {"handler":"<valor>","reason":"motivo breve"}',
+    `Pedido actual: ${text}`,
+    ...(background.length > 0
+      ? ["Contexto reciente (ultimos turnos):", ...background]
+      : ["Contexto reciente: (vacio)"]),
+  ].join("\n");
+  const promptContext = await buildPromptContextForQuery(text, { chatId: params.chatId });
+  try {
+    const answer = await openAi.ask(prompt, { context: promptContext });
+    return tryParseNaturalRouteDecision(answer);
+  } catch {
+    return null;
+  }
+}
+
+function tryParseAiSequencePlan(raw: string): { mode: "single" | "sequence"; steps: AiSequencePlanStep[]; reason?: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as {
+      mode?: unknown;
+      steps?: unknown;
+      reason?: unknown;
+    };
+    const modeRaw = typeof parsed.mode === "string" ? parsed.mode.trim().toLowerCase() : "";
+    if (modeRaw !== "single" && modeRaw !== "sequence") {
+      return null;
+    }
+    const steps = (Array.isArray(parsed.steps) ? parsed.steps : [])
+      .map((entry) => {
+        const instruction =
+          typeof (entry as { instruction?: unknown })?.instruction === "string"
+            ? truncateInline((entry as { instruction: string }).instruction.trim(), 700)
+            : "";
+        const aiContentPrompt =
+          typeof (entry as { ai_content_prompt?: unknown })?.ai_content_prompt === "string"
+            ? truncateInline((entry as { ai_content_prompt: string }).ai_content_prompt.trim(), 700)
+            : "";
+        if (!instruction) {
+          return null;
+        }
+        return {
+          instruction,
+          ...(aiContentPrompt ? { aiContentPrompt } : {}),
+        };
+      })
+      .filter((item): item is AiSequencePlanStep => Boolean(item))
+      .slice(0, AI_SEQUENCE_ROUTER_MAX_STEPS);
+    const reason = typeof parsed.reason === "string" ? truncateInline(parsed.reason.trim(), 180) : "";
+    return {
+      mode: modeRaw,
+      steps,
+      ...(reason ? { reason } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function classifySequencedIntentPlanWithAi(params: {
+  chatId: number;
+  text: string;
+}): Promise<{ steps: AiSequencePlanStep[]; reason?: string } | null> {
+  const text = params.text.trim();
+  if (!openAi.isConfigured() || text.length < NATURAL_INTENT_ROUTER_MIN_TEXT_CHARS) {
+    return null;
+  }
+  const background = getRecentConversationContext(params.chatId, text, RECENT_INTENT_ROUTER_CONTEXT_TURNS);
+  const prompt = [
+    "Eres un router de instrucciones secuenciadas.",
+    "Debes decidir si el pedido es single o sequence.",
+    "Si es sequence, devuelve pasos concretos en orden de ejecucion.",
+    "Devuelve SOLO JSON valido.",
+    "",
+    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, connector, self-maintenance, stoic-smalltalk.",
+    "",
+    "Reglas:",
+    "- Usa mode=sequence solo si hay 2 o mas acciones distintas o dependientes.",
+    "- Si no, usa mode=single y steps vacio.",
+    "- Cada step.instruction debe ser accionable por el agente en lenguaje natural.",
+    "- Si un paso necesita texto creativo/largo, agrega ai_content_prompt y usa {{ai_content}} dentro de instruction.",
+    `- Maximo ${AI_SEQUENCE_ROUTER_MAX_STEPS} pasos.`,
+    "",
+    'Formato: {"mode":"single|sequence","steps":[{"instruction":"string","ai_content_prompt":"string opcional"}],"reason":"motivo breve"}',
+    `Pedido actual: ${text}`,
+    ...(background.length > 0
+      ? ["Contexto reciente (ultimos turnos):", ...background]
+      : ["Contexto reciente: (vacio)"]),
+  ].join("\n");
+  const promptContext = await buildPromptContextForQuery(text, { chatId: params.chatId });
+  try {
+    const answer = await openAi.ask(prompt, { context: promptContext });
+    const parsed = tryParseAiSequencePlan(answer);
+    if (!parsed || parsed.mode !== "sequence" || parsed.steps.length < 2) {
+      return null;
+    }
+    return {
+      steps: parsed.steps,
+      ...(parsed.reason ? { reason: parsed.reason } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function generateSequenceStepContentWithAi(params: {
+  chatId: number;
+  userText: string;
+  stepInstruction: string;
+  contentPrompt: string;
+}): Promise<string | null> {
+  const prompt = [
+    "Genera SOLO el contenido solicitado.",
+    "No expliques nada, no uses markdown, no agregues encabezados.",
+    "",
+    `Pedido original: ${params.userText}`,
+    `Paso: ${params.stepInstruction}`,
+    `Contenido a generar: ${params.contentPrompt}`,
+  ].join("\n");
+  const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
+  try {
+    const answer = await openAi.ask(prompt, { context: promptContext });
+    const content = answer.trim();
+    return content || null;
+  } catch {
+    return null;
+  }
+}
+
+function materializeSequenceStepInstruction(step: AiSequencePlanStep, aiContent: string | null): string {
+  if (!aiContent) {
+    return step.instruction;
+  }
+  if (step.instruction.includes("{{ai_content}}")) {
+    return step.instruction.replace(/\{\{ai_content\}\}/g, aiContent);
+  }
+  return `${step.instruction}\ncontenido: ${aiContent}`;
+}
+
+function tryParseEmailModeDecision(raw: string): { mode: "improvise" | "literal"; literalBody?: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as { mode?: unknown; literal_body?: unknown };
+    const modeRaw = typeof parsed.mode === "string" ? parsed.mode.trim().toLowerCase() : "";
+    if (modeRaw !== "improvise" && modeRaw !== "literal") {
+      return null;
+    }
+    const literalBody = typeof parsed.literal_body === "string" ? parsed.literal_body.trim() : "";
+    return modeRaw === "literal"
+      ? { mode: "literal", ...(literalBody ? { literalBody } : {}) }
+      : { mode: "improvise" };
+  } catch {
+    return null;
+  }
+}
+
+async function classifyMissingSubjectEmailModeWithAi(params: {
+  chatId: number;
+  userText: string;
+}): Promise<{ mode: "improvise" | "literal"; literalBody?: string }> {
+  const fallbackLiteral = extractLiteralBodyRequest(params.userText);
+  if (!openAi.isConfigured()) {
+    return fallbackLiteral ? { mode: "literal", literalBody: fallbackLiteral } : { mode: "improvise" };
+  }
+  const background = getRecentEmailRouterContext(params.chatId, params.userText);
+  const prompt = [
+    "Clasifica una instruccion de envio de email.",
+    "Objetivo: elegir SOLO entre dos modos.",
+    '- "improvise": IA redacta asunto y cuerpo nuevos segun pedido.',
+    '- "literal": enviar texto literal pedido por usuario.',
+    "Debes maximizar el objetivo real del usuario y no copiar el prompt si pide creatividad.",
+    "",
+    "Reglas de decision:",
+    "- Si el usuario pide 'que diga ...', 'texto exacto ...' o equivalente, usa literal.",
+    "- Si pide crear/redactar/improvisar/cancion/poema/mensaje alegre, usa improvise.",
+    "- Si hay ambiguedad, prioriza improvise.",
+    "",
+    "Devuelve SOLO JSON valido:",
+    '{"mode":"improvise"|"literal","literal_body":"string opcional solo si mode=literal"}',
+    "",
+    `Pedido actual: ${params.userText}`,
+    ...(background.length > 0 ? ["Contexto previo (ultimos 3 turnos):", ...background] : ["Contexto previo: (vacio)"]),
+  ].join("\n");
+  const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
+  const answer = await openAi.ask(prompt, { context: promptContext });
+  const parsed = tryParseEmailModeDecision(answer);
+  if (!parsed) {
+    return fallbackLiteral ? { mode: "literal", literalBody: fallbackLiteral } : { mode: "improvise" };
+  }
+  if (parsed.mode === "literal" && !parsed.literalBody) {
+    return fallbackLiteral ? { mode: "literal", literalBody: fallbackLiteral } : { mode: "improvise" };
+  }
+  return parsed;
+}
+
 function buildGmailDraftInstruction(text: string): string {
   return text
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
@@ -4450,7 +5119,7 @@ function detectGmailAutoContentKind(
   if (/\b(poema|poesia|poes[ií]a)\b/.test(textNormalized)) {
     return "poem";
   }
-  if (/\b(reflexion|reflexion\s+estoica|estoic|marco\s+aurelio|estoicismo)\b/.test(textNormalized)) {
+  if (/\b(reflexion|reflexion\s+estoica|estoic|estoicco|estoic[oa]s?|estoicismo|marco\s+aurelio)\b/.test(textNormalized)) {
     return "stoic";
   }
   if (/\b(ultimas?|ultimos?|noticias?|news|actualidad|titulares?)\b/.test(textNormalized)) {
@@ -4773,6 +5442,9 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
     let cc = "";
     let bcc = "";
     let draftInstruction = "";
+    const explicitLiteralBody = extractLiteralBodyRequest(original);
+    const explicitNaturalSubject = extractNaturalSubjectRequest(original);
+    const creativeCue = detectCreativeEmailCue(normalized);
 
     if (quotedSegments.length >= 2) {
       subject = quotedSegments[0] ?? "";
@@ -4783,21 +5455,30 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
       body = labeled.body;
       cc = labeled.cc;
       bcc = labeled.bcc;
-      if (!body) {
-        body = original.match(/\bque diga\b[:\s,-]*(.+)$/i)?.[1]?.trim() ?? "";
+      if (!body && explicitLiteralBody) {
+        body = explicitLiteralBody;
       }
 
-      const draftRequested = detectGmailDraftRequested(normalized, labeled.hasBodyLabel);
+      const draftRequested = !explicitLiteralBody && (creativeCue || detectGmailDraftRequested(normalized, labeled.hasBodyLabel));
       if (draftRequested) {
         draftInstruction = buildGmailDraftInstruction(original);
       }
-      if (!body && !draftRequested && !shouldAvoidLiteralBodyFallback(normalized)) {
+      if (!body && !draftRequested && !explicitLiteralBody && !shouldAvoidLiteralBodyFallback(normalized)) {
         body = buildGmailDraftInstruction(original);
       }
     }
 
-    if (!draftInstruction && !body && quotedSegments.length < 2 && detectGmailDraftRequested(normalized, false)) {
+    if (!draftInstruction && !body && !explicitLiteralBody && quotedSegments.length < 2 && (creativeCue || detectGmailDraftRequested(normalized, false))) {
       draftInstruction = buildGmailDraftInstruction(original);
+    }
+    if (!subject && explicitNaturalSubject) {
+      subject = explicitNaturalSubject;
+    }
+    const subjectWasExplicit = Boolean(subject.trim());
+    const forceAiDraftByMissingSubject = !subjectWasExplicit;
+    if (forceAiDraftByMissingSubject) {
+      draftInstruction = buildGmailDraftInstruction(original) || original.trim();
+      body = "";
     }
     const draftRequested = Boolean(draftInstruction);
     if (!subject) {
@@ -4824,6 +5505,7 @@ function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
       ...(bcc ? { bcc } : {}),
       draftRequested,
       ...(draftInstruction ? { draftInstruction } : {}),
+      ...(forceAiDraftByMissingSubject ? { forceAiByMissingSubject: true } : {}),
       ...(autoContentKind ? { autoContentKind } : {}),
       ...(!emailCandidates[0] && recipientName ? { recipientName } : {}),
     };
@@ -5734,6 +6416,19 @@ async function appendConversationTurn(params: {
   if (!text) {
     return;
   }
+  const recent = recentConversationByChat.get(params.chatId) ?? [];
+  recentConversationByChat.set(
+    params.chatId,
+    [
+      ...recent,
+      {
+        role: params.role,
+        text: truncateInline(text, 4_000),
+        source: params.source,
+        atMs: Date.now(),
+      },
+    ].slice(-RECENT_CONVERSATION_TURN_LIMIT),
+  );
   try {
     await contextMemory.appendConversationTurn({
       chatId: params.chatId,
@@ -8377,6 +9072,11 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
       }
 
       const autoPathGenerated = !filePath;
+      const appendMode = Boolean(intent.append);
+      const explicitOverwriteCue =
+        /\b(sobrescrib\w*|reemplaz\w*|actualiz\w*|modific\w*|edit\w*|dibuj\w*|traz\w*)\b/.test(normalizedWriteRequest) &&
+        !/\b(no\s+sobrescrib\w*|sin\s+sobrescrib\w*)\b/.test(normalizedWriteRequest);
+      const overwriteMode = !appendMode && (explicitOverwriteCue || !explicitCreationCue);
       if (!filePath && !explicitCreationCue) {
         await params.ctx.reply(
           [
@@ -8392,12 +9092,20 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
       const written = await writeWorkspaceTextFile({
         relativePath: filePath,
         ...(typeof content === "string" ? { content } : {}),
+        ...(appendMode ? { append: true } : {}),
+        ...(overwriteMode ? { overwrite: true } : {}),
       });
       if (typeof content === "string" && content.trim()) {
         rememberLastDocumentSnapshot(params.ctx.chat.id, written.relPath, content);
       }
       const responseText = [
-        written.created ? "Archivo creado en workspace." : "Archivo actualizado en workspace.",
+        written.created
+          ? "Archivo creado en workspace."
+          : appendMode
+            ? "Contenido agregado al archivo en workspace."
+            : overwriteMode
+              ? "Archivo sobrescrito en workspace."
+              : "Archivo actualizado en workspace.",
         ...(autoPathGenerated ? ["nombre: autogenerado"] : []),
         `ruta: ${written.relPath}`,
         `tamano: ${formatBytes(written.size)}`,
@@ -8420,6 +9128,8 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
           path: written.relPath,
           size: written.size,
           created: written.created,
+          append: appendMode,
+          overwrite: overwriteMode,
           contentChars: typeof content === "string" ? content.length : 0,
           autoPathGenerated,
           autoNumberUsed,
@@ -8771,6 +9481,81 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
     }
 
     if (intent.action === "delete") {
+      if (intent.deleteContentsOfPath) {
+        pendingWorkspaceDeletePathByChat.delete(params.ctx.chat.id);
+        const scope = resolveWorkspacePath(intent.deleteContentsOfPath);
+        let stat: Awaited<ReturnType<typeof fs.stat>>;
+        try {
+          stat = await fs.stat(scope.fullPath);
+        } catch {
+          await params.ctx.reply(`No existe la carpeta: ${scope.relPath}`);
+          return true;
+        }
+        if (!stat.isDirectory()) {
+          await params.ctx.reply(`La ruta indicada no es carpeta: ${scope.relPath}`);
+          return true;
+        }
+        const entries = await fs.readdir(scope.fullPath, { withFileTypes: true });
+        const paths = entries
+          .map((entry) => normalizeWorkspaceRelativePath(path.posix.join(intent.deleteContentsOfPath!, entry.name)))
+          .filter(Boolean);
+        if (paths.length === 0) {
+          await params.ctx.reply(`La carpeta ya está vacía: ${scope.relPath}`);
+          return true;
+        }
+        const pending = queueWorkspaceDeleteConfirmation({
+          chatId: params.ctx.chat.id,
+          paths,
+          source: params.source,
+          userId: params.userId,
+        });
+        const responseText = [
+          "Confirmación requerida para eliminar en workspace.",
+          `alcance: contenido completo de ${scope.relPath}`,
+          `rutas: ${pending.paths.length}`,
+          `expira en: ${pendingWorkspaceDeleteRemainingSeconds(pending)}s`,
+          ...formatWorkspacePathPreview(pending.paths, 8),
+          'Responde "si" para confirmar o "no" para cancelar.',
+        ].join("\n");
+        await replyLong(params.ctx, responseText);
+        return true;
+      }
+
+      if (intent.deleteExtensions && intent.deleteExtensions.length > 0) {
+        pendingWorkspaceDeletePathByChat.delete(params.ctx.chat.id);
+        const selected = await findWorkspaceFilesByExtensions({
+          extensions: intent.deleteExtensions,
+          ...(intent.path?.trim() ? { scopePath: intent.path.trim() } : {}),
+        });
+        if (selected.matches.length === 0) {
+          await params.ctx.reply(
+            [
+              "No encontré archivos con esas extensiones.",
+              `extensiones: ${intent.deleteExtensions.join(", ")}`,
+              `alcance: ${selected.scopeRelPath}`,
+            ].join("\n"),
+          );
+          return true;
+        }
+        const pending = queueWorkspaceDeleteConfirmation({
+          chatId: params.ctx.chat.id,
+          paths: selected.matches.map((item) => item.path),
+          source: params.source,
+          userId: params.userId,
+        });
+        const responseText = [
+          "Confirmación requerida para eliminar en workspace.",
+          `extensiones: ${intent.deleteExtensions.join(", ")}`,
+          `alcance: ${selected.scopeRelPath}`,
+          `rutas: ${pending.paths.length}${selected.truncated ? " (limitado por tope)" : ""}`,
+          `expira en: ${pendingWorkspaceDeleteRemainingSeconds(pending)}s`,
+          ...formatWorkspacePathPreview(pending.paths, 8),
+          'Responde "si" para confirmar o "no" para cancelar.',
+        ].join("\n");
+        await replyLong(params.ctx, responseText);
+        return true;
+      }
+
       if (intent.selector) {
         pendingWorkspaceDeletePathByChat.delete(params.ctx.chat.id);
         const selected = await findWorkspaceFilesBySelector(intent.selector, { includeDirs: true });
@@ -9944,7 +10729,59 @@ async function maybeHandleNaturalGmailInstruction(params: {
         }
         body = autoContent.body;
       }
-      if (intent.draftRequested && !intent.autoContentKind) {
+      if (intent.forceAiByMissingSubject) {
+        const modeDecision = await classifyMissingSubjectEmailModeWithAi({
+          chatId: params.ctx.chat.id,
+          userText: params.text,
+        });
+        if (modeDecision.mode === "literal") {
+          const literalBody = modeDecision.literalBody?.trim() || extractLiteralBodyRequest(params.text);
+          if (!literalBody) {
+            await params.ctx.reply(
+              [
+                "No envié el correo: IA eligió modo literal, pero no encontró texto literal claro.",
+                'Prueba con: "que diga <texto>" o define asunto/cuerpo explícitos.',
+              ].join("\n"),
+            );
+            return true;
+          }
+          body = literalBody;
+          if (!subject || subject === "Mensaje desde Houdi Agent") {
+            subject = "Mensaje literal solicitado";
+          }
+        } else {
+          const instruction = intent.draftInstruction?.trim() || params.text.trim();
+          if (!openAi.isConfigured()) {
+            await params.ctx.reply(
+              [
+                "No envié el correo: falta OPENAI para improvisar asunto y cuerpo.",
+                "Opciones:",
+                '1) Define asunto y cuerpo explícitos (ej: asunto: X cuerpo: Y).',
+                "2) Configura OPENAI_API_KEY.",
+              ].join("\n"),
+            );
+            return true;
+          }
+          await replyProgress(params.ctx, "Redactando asunto y cuerpo con IA...");
+          const draft = await draftGmailMessageWithAi({
+            chatId: params.ctx.chat.id,
+            to,
+            instruction,
+          });
+          if (!draft) {
+            await params.ctx.reply(
+              [
+                "No envié el correo: no pude improvisar asunto/cuerpo con IA en este intento.",
+                "Reintenta o define asunto/cuerpo explícitos.",
+              ].join("\n"),
+            );
+            return true;
+          }
+          subject = draft.subject;
+          body = draft.body;
+        }
+      }
+      if (intent.draftRequested && !intent.autoContentKind && !intent.forceAiByMissingSubject) {
         const instruction = intent.draftInstruction?.trim() || params.text.trim();
         if (openAi.isConfigured()) {
           await replyProgress(params.ctx, "Redactando email...");
@@ -10556,6 +11393,78 @@ async function maybeHandleNaturalIntentPipeline(params: {
     return true;
   }
 
+  if (!params.source.includes(":seq-step-")) {
+    const sequencedPlan = await classifySequencedIntentPlanWithAi({
+      chatId: params.ctx.chat.id,
+      text: params.text,
+    });
+    if (sequencedPlan && sequencedPlan.steps.length >= 2) {
+      if (params.persistUserTurn) {
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "user",
+          text: params.text,
+          source: params.source,
+        });
+      }
+      await params.ctx.reply(`Ejecutando plan secuenciado (${sequencedPlan.steps.length} pasos)...`);
+      const stepSummary: Array<{ index: number; text: string; handled: boolean }> = [];
+      for (let index = 0; index < sequencedPlan.steps.length; index += 1) {
+        const step = sequencedPlan.steps[index]!;
+        const aiContent = step.aiContentPrompt
+          ? await generateSequenceStepContentWithAi({
+              chatId: params.ctx.chat.id,
+              userText: params.text,
+              stepInstruction: step.instruction,
+              contentPrompt: step.aiContentPrompt,
+            })
+          : null;
+        const stepText = materializeSequenceStepInstruction(step, aiContent);
+        await params.ctx.reply(`Paso ${index + 1}/${sequencedPlan.steps.length}: ${truncateInline(step.instruction, 140)}`);
+        const handled = await maybeHandleNaturalIntentPipeline({
+          ...params,
+          text: stepText,
+          source: `${params.source}:seq-step-${index + 1}`,
+          persistUserTurn: false,
+        });
+        if (!handled) {
+          await params.ctx.reply(`No pude interpretar el paso ${index + 1}: "${truncateInline(step.instruction, 200)}"`);
+        }
+        stepSummary.push({
+          index: index + 1,
+          text: truncateInline(step.instruction, 120),
+          handled,
+        });
+      }
+      const okCount = stepSummary.filter((item) => item.handled).length;
+      const failedCount = stepSummary.length - okCount;
+      await safeAudit({
+        type: "intent.plan.sequence",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          steps: sequencedPlan.steps.length,
+          processed: okCount,
+          failed: failedCount,
+          ...(sequencedPlan.reason ? { reason: sequencedPlan.reason } : {}),
+          textPreview: truncateInline(params.text, 220),
+        },
+      });
+      const lines = stepSummary.map((item) => `${item.index}. ${item.handled ? "OK" : "NO"} | ${item.text}`);
+      await replyLong(
+        params.ctx,
+        [
+          "Resumen de plan secuenciado",
+          `pasos: ${stepSummary.length} | procesados: ${okCount} | no interpretados: ${failedCount}`,
+          ...lines,
+        ].join("\n"),
+      );
+      return true;
+    }
+  }
+
   const normalized = normalizeIntentText(params.text);
   const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
   const hasMemoryRecallCue =
@@ -10601,7 +11510,33 @@ async function maybeHandleNaturalIntentPipeline(params: {
         ]
       : baseHandlers;
 
-  for (const handler of handlers) {
+  let routedHandlers = handlers;
+  let aiRouteDecision: { handler: NaturalIntentHandlerName; reason?: string } | null = null;
+  const routeCandidates = handlers.map((item) => item.name as Exclude<NaturalIntentHandlerName, "none">);
+  aiRouteDecision = await classifyNaturalIntentRouteWithAi({
+    chatId: params.ctx.chat.id,
+    text: params.text,
+    candidates: routeCandidates,
+  });
+  if (aiRouteDecision && aiRouteDecision.handler !== "none") {
+    const preferred = handlers.find((item) => item.name === aiRouteDecision?.handler);
+    if (preferred) {
+      routedHandlers = [preferred, ...handlers.filter((item) => item.name !== preferred.name)];
+      await safeAudit({
+        type: "intent.router.ai",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          selected: preferred.name,
+          ...(aiRouteDecision.reason ? { reason: aiRouteDecision.reason } : {}),
+          textPreview: truncateInline(params.text, 220),
+        },
+      });
+    }
+  }
+
+  for (const handler of routedHandlers) {
     const handled = await handler.fn(params);
     if (handled) {
       await safeAudit({
@@ -10613,6 +11548,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
           handler: handler.name,
           mailContext: hasMailContext,
           memoryRecallCue: hasMemoryRecallCue,
+          aiRouterSelected: aiRouteDecision?.handler ?? null,
           textPreview: truncateInline(params.text, 220),
         },
       });
@@ -12216,6 +13152,19 @@ bot.command("gmail", async (ctx) => {
     "/gmail untrash <messageId>",
     "/gmail star <messageId>",
     "/gmail unstar <messageId>",
+    "/gmail recipients list",
+    '/gmail recipients add "<nombre>" <email>',
+    '/gmail recipients edit <nombre|n> [name="<nuevo nombre>"] [email=<nuevo@email>]',
+    "/gmail recipients del <nombre|n>",
+    "/gmail recipients clear",
+  ].join("\n");
+  const recipientsUsage = [
+    "Uso destinatarios:",
+    "/gmail recipients list",
+    '/gmail recipients add "<nombre>" <email>',
+    '/gmail recipients edit <nombre|n> [name="<nuevo nombre>"] [email=<nuevo@email>]',
+    "/gmail recipients del <nombre|n>",
+    "/gmail recipients clear",
   ].join("\n");
 
   const input = String(ctx.match ?? "").trim();
@@ -12248,6 +13197,174 @@ bot.command("gmail", async (ctx) => {
       ].join("\n"),
     );
     return;
+  }
+
+  if (subcommand === "recipients" || subcommand === "recipient" || subcommand === "destinatarios") {
+    const sub = (tokens.shift() ?? "list").toLowerCase();
+    const parsed = parseKeyValueOptions(tokens);
+
+    try {
+      if (["list", "ls", "status"].includes(sub)) {
+        const list = listEmailRecipients(actor.chatId);
+        if (list.length === 0) {
+          await ctx.reply("No hay destinatarios guardados.");
+          return;
+        }
+        const lines = list.map((item, idx) => `${idx + 1}. ${item.name} <${item.email}>`);
+        await replyLong(ctx, [`Destinatarios guardados (${list.length}):`, ...lines].join("\n"));
+        return;
+      }
+
+      if (["add", "new", "create", "alta"].includes(sub)) {
+        const optionEmail = parsed.options.email?.trim() ?? "";
+        const email = normalizeRecipientEmail(optionEmail || (parsed.args[parsed.args.length - 1] ?? ""));
+        const nameRaw = parsed.options.name?.trim() || parsed.args.slice(0, optionEmail ? parsed.args.length : -1).join(" ");
+        const name = normalizeRecipientName(nameRaw);
+        if (!name || !email) {
+          await ctx.reply(`Faltan datos.\n\n${recipientsUsage}`);
+          return;
+        }
+        const result = await upsertEmailRecipient({
+          chatId: actor.chatId,
+          name,
+          email,
+        });
+        await ctx.reply(
+          result.created
+            ? `Destinatario agregado: ${result.row.name} <${result.row.email}>`
+            : `Destinatario actualizado: ${result.row.name} <${result.row.email}>`,
+        );
+        await safeAudit({
+          type: "gmail.recipients_upsert",
+          chatId: actor.chatId,
+          userId: actor.userId,
+          details: {
+            created: result.created,
+            name: result.row.name,
+            email: result.row.email,
+          },
+        });
+        return;
+      }
+
+      if (["edit", "set", "update", "mod", "modificar"].includes(sub)) {
+        const selector = parsed.args[0]?.trim() || parsed.options.id?.trim() || parsed.options.selector?.trim() || "";
+        const tailArgs = parsed.args.slice(1);
+        let nextName = parsed.options.name?.trim() || "";
+        let nextEmail = parsed.options.email?.trim() || "";
+        if (!nextName && !nextEmail && tailArgs.length > 0) {
+          if (tailArgs.length === 1) {
+            if (isValidEmailAddress(tailArgs[0] ?? "")) {
+              nextEmail = tailArgs[0] ?? "";
+            } else {
+              nextName = tailArgs[0] ?? "";
+            }
+          } else {
+            const last = tailArgs[tailArgs.length - 1] ?? "";
+            if (isValidEmailAddress(last)) {
+              nextEmail = last;
+              nextName = tailArgs.slice(0, -1).join(" ");
+            } else {
+              nextName = tailArgs.join(" ");
+            }
+          }
+        }
+        if (!selector || (!nextName && !nextEmail)) {
+          await ctx.reply(`Faltan datos para editar.\n\n${recipientsUsage}`);
+          return;
+        }
+        const updated = await updateEmailRecipientBySelector({
+          chatId: actor.chatId,
+          selector,
+          ...(nextName ? { nextName } : {}),
+          ...(nextEmail ? { nextEmail } : {}),
+        });
+        if (!updated) {
+          await ctx.reply(`No encontré destinatario "${selector}".`);
+          return;
+        }
+        await ctx.reply(
+          [
+            "Destinatario modificado:",
+            `antes: ${updated.previous.name} <${updated.previous.email}>`,
+            `ahora: ${updated.row.name} <${updated.row.email}>`,
+          ].join("\n"),
+        );
+        await safeAudit({
+          type: "gmail.recipients_update",
+          chatId: actor.chatId,
+          userId: actor.userId,
+          details: {
+            selector,
+            previousName: updated.previous.name,
+            previousEmail: updated.previous.email,
+            currentName: updated.row.name,
+            currentEmail: updated.row.email,
+          },
+        });
+        return;
+      }
+
+      if (["del", "delete", "rm", "remove", "baja", "eliminar", "borra"].includes(sub)) {
+        const selector =
+          parsed.args.join(" ").trim() ||
+          parsed.options.id?.trim() ||
+          parsed.options.selector?.trim() ||
+          parsed.options.name?.trim() ||
+          "";
+        if (!selector) {
+          await ctx.reply(`Indica el destinatario a eliminar.\n\n${recipientsUsage}`);
+          return;
+        }
+        const removed = await deleteEmailRecipientBySelector(actor.chatId, selector);
+        if (!removed) {
+          await ctx.reply(`No encontré destinatario "${selector}".`);
+          return;
+        }
+        await ctx.reply(`Destinatario eliminado: ${removed.name} <${removed.email}>`);
+        await safeAudit({
+          type: "gmail.recipients_delete",
+          chatId: actor.chatId,
+          userId: actor.userId,
+          details: {
+            selector,
+            name: removed.name,
+            email: removed.email,
+          },
+        });
+        return;
+      }
+
+      if (["clear", "wipe", "reset"].includes(sub)) {
+        const removedCount = await clearEmailRecipients(actor.chatId);
+        await ctx.reply(`Destinatarios eliminados: ${removedCount}`);
+        await safeAudit({
+          type: "gmail.recipients_clear",
+          chatId: actor.chatId,
+          userId: actor.userId,
+          details: {
+            removedCount,
+          },
+        });
+        return;
+      }
+
+      await ctx.reply(`Subcomando recipients no reconocido: ${sub}\n\n${recipientsUsage}`);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.reply(`No pude operar destinatarios: ${message}`);
+      await safeAudit({
+        type: "gmail.recipients_failed",
+        chatId: actor.chatId,
+        userId: actor.userId,
+        details: {
+          sub,
+          error: message,
+        },
+      });
+      return;
+    }
   }
 
   const accessIssue = getGmailAccessIssue(ctx);
@@ -13480,6 +14597,11 @@ async function handleIncomingTextMessage(params: {
   userId?: number;
   persistUserTurn?: boolean;
   allowSlashPrefix?: boolean;
+  replyReference?: {
+    messageId?: number;
+    fromName?: string;
+    text: string;
+  };
 }): Promise<void> {
   const text = params.text.trim();
   if (!text) {
@@ -13490,6 +14612,18 @@ async function handleIncomingTextMessage(params: {
   const source = params.source;
   const persistUserTurn = params.persistUserTurn ?? true;
   const allowSlashPrefix = params.allowSlashPrefix ?? false;
+  const replyReferenceText = params.replyReference?.text?.trim() ?? "";
+  const hasReplyReference = replyReferenceText.length > 0;
+  const textWithReplyReference = hasReplyReference
+    ? [
+        text,
+        "",
+        "[REPLY_REFERENCE]",
+        `message_id=${params.replyReference?.messageId ?? "n/a"}`,
+        `from=${truncateInline(params.replyReference?.fromName?.trim() || "desconocido", 120)}`,
+        `text=${truncateInline(replyReferenceText, 3000)}`,
+      ].join("\n")
+    : text;
 
   const handledPendingWorkspaceDelete = await maybeHandlePendingWorkspaceDeleteConfirmation({
     ctx: params.ctx,
@@ -13531,14 +14665,14 @@ async function handleIncomingTextMessage(params: {
       chatId: params.ctx.chat.id,
       userId,
       role: "user",
-      text,
+      text: textWithReplyReference,
       source,
     });
   }
 
   if (isAiShellModeEnabled(params.ctx.chat.id)) {
     try {
-      await executeAiShellInstruction(params.ctx, text);
+      await executeAiShellInstruction(params.ctx, textWithReplyReference);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await params.ctx.reply(`Error en shell IA: ${message}`);
@@ -13556,10 +14690,10 @@ async function handleIncomingTextMessage(params: {
   await replyProgress(params.ctx, "Pensando con OpenAI...");
 
   try {
-    const promptContext = await buildPromptContextForQuery(text, {
+    const promptContext = await buildPromptContextForQuery(textWithReplyReference, {
       chatId: params.ctx.chat.id,
     });
-    const answer = await openAi.ask(text, { context: promptContext });
+    const answer = await openAi.ask(textWithReplyReference, { context: promptContext });
     await replyLong(params.ctx, answer);
     await appendConversationTurn({
       chatId: params.ctx.chat.id,
@@ -13735,6 +14869,29 @@ async function startLocalBridgeServer(): Promise<void> {
 }
 
 bot.on("message:text", async (ctx) => {
+  const replied = (ctx.message as { reply_to_message?: Record<string, unknown> }).reply_to_message;
+  const repliedTextRaw =
+    replied && typeof replied === "object"
+      ? (typeof replied.text === "string"
+          ? replied.text
+          : typeof replied.caption === "string"
+            ? replied.caption
+            : "")
+      : "";
+  const repliedMessageId =
+    replied && typeof replied === "object" && typeof replied.message_id === "number" ? replied.message_id : undefined;
+  const repliedFromName = (() => {
+    if (!replied || typeof replied !== "object") {
+      return "";
+    }
+    const from = (replied as { from?: unknown }).from;
+    if (!from || typeof from !== "object") {
+      return "";
+    }
+    const firstName = (from as { first_name?: unknown }).first_name;
+    return typeof firstName === "string" ? firstName : "";
+  })();
+
   await handleIncomingTextMessage({
     ctx,
     text: ctx.message.text,
@@ -13742,6 +14899,15 @@ bot.on("message:text", async (ctx) => {
     userId: ctx.from?.id,
     persistUserTurn: true,
     allowSlashPrefix: false,
+    ...(repliedTextRaw.trim()
+      ? {
+          replyReference: {
+            ...(typeof repliedMessageId === "number" ? { messageId: repliedMessageId } : {}),
+            ...(repliedFromName.trim() ? { fromName: repliedFromName.trim() } : {}),
+            text: repliedTextRaw.trim(),
+          },
+        }
+      : {}),
   });
 });
 

@@ -39,6 +39,54 @@ function appendTruncated(base: string, chunk: string, maxChars: number): string 
   return next.slice(next.length - maxChars);
 }
 
+function tokenizeExecInput(raw: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const char of raw) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (escaped) {
+    current += "\\";
+  }
+  if (quote) {
+    throw new Error("Unclosed quote in command. Close all quotes before running /exec.");
+  }
+  if (current) {
+    tokens.push(current);
+  }
+  return tokens;
+}
+
 function parseExecInput(rawInput: string): { command: string; args: string[] } {
   const input = rawInput.trim();
   if (!input) {
@@ -48,7 +96,7 @@ function parseExecInput(rawInput: string): { command: string; args: string[] } {
     throw new Error("Only single-line commands are allowed in this MVP");
   }
 
-  const parts = input.split(/\s+/).filter(Boolean);
+  const parts = tokenizeExecInput(input);
   const command = parts[0]?.trim().toLowerCase() ?? "";
   const args = parts.slice(1);
 
@@ -67,6 +115,45 @@ function parseExecInput(rawInput: string): { command: string; args: string[] } {
 
 function buildTaskId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function containsPathEscape(raw: string): boolean {
+  const value = raw.trim();
+  if (!value) {
+    return false;
+  }
+  if (value.startsWith("/") || value.startsWith("~")) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(value)) {
+    return true;
+  }
+  const parts = value.split(/[\\/]+/).filter(Boolean);
+  return parts.includes("..");
+}
+
+function validateWorkspaceOnlyExecution(command: string, args: string[]): void {
+  const blockedCommands = new Set([
+    "sudo",
+    "su",
+    "doas",
+    "systemctl",
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "mount",
+    "umount",
+    "chroot",
+    "nsenter",
+  ]);
+  if (blockedCommands.has(command)) {
+    throw new Error(`Command "${command}" is blocked in workspace-only mode.`);
+  }
+  for (const arg of args) {
+    if (containsPathEscape(arg)) {
+      throw new Error(`Argument "${arg}" escapes workspace-only policy.`);
+    }
+  }
 }
 
 export class TaskRunner {
@@ -104,17 +191,29 @@ export class TaskRunner {
 
   start(profile: AgentProfile, rawInput: string): RunningTask {
     const { command, args } = parseExecInput(rawInput);
-    if (!profile.allowCommands.includes(command)) {
+    const allowsAll = profile.allowCommands.includes("*");
+    if (!allowsAll && !profile.allowCommands.includes(command)) {
       throw new Error(
         `Command "${command}" is not allowed for agent "${profile.name}". Allowed: ${profile.allowCommands.join(", ")}`,
       );
     }
 
     const cwd = path.resolve(process.cwd(), profile.cwd);
+    if (profile.workspaceOnly) {
+      validateWorkspaceOnlyExecution(command, args);
+    }
     const child = spawn(command, args, {
       cwd,
       shell: false,
-      env: process.env,
+      env: {
+        ...process.env,
+        ...(profile.workspaceOnly
+          ? {
+              HOME: cwd,
+              PWD: cwd,
+            }
+          : {}),
+      },
     });
 
     const task: Task = {
