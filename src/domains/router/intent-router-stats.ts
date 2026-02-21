@@ -28,7 +28,17 @@ export type IntentRouterDatasetEntry = {
   routerCanaryVersion?: string;
   routerLayers?: string[];
   routerLayerReason?: string;
+  routerHierarchyDomains?: string[];
+  routerHierarchyReason?: string;
+  routerHierarchyAllowed?: string[];
   routerEnsembleTop?: Array<{ name: string; score: number }>;
+  routerTypedExtraction?: {
+    route: string;
+    action?: string;
+    missing: string[];
+    required: string[];
+    summary: string;
+  };
   finalHandler: string;
   handled: boolean;
 };

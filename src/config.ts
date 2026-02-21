@@ -30,8 +30,19 @@ const EnvSchema = z.object({
   HOUDI_INTENT_ROUTER_AB_VARIANT_B_ALPHA: z.coerce.number().min(0.05).max(0.95).default(0.66),
   HOUDI_INTENT_ROUTER_AB_VARIANT_B_MIN_GAP: z.coerce.number().min(0).max(0.5).default(0.02),
   HOUDI_INTENT_ROUTER_AB_VARIANT_B_THRESHOLD_SHIFT: z.coerce.number().min(-0.3).max(0.3).default(0),
+  HOUDI_INTENT_ROUTER_ROUTE_ALPHA_OVERRIDES_JSON: z.string().trim().optional(),
   HOUDI_INTENT_ROUTER_ALERT_PRECISION_MIN: z.coerce.number().min(0).max(1).default(0.55),
   HOUDI_INTENT_ROUTER_ALERT_MIN_SAMPLES: z.coerce.number().int().min(1).max(1000).default(20),
+  HOUDI_INTENT_ROUTER_HARD_NEGATIVES_ENABLED: z.string().optional(),
+  HOUDI_INTENT_ROUTER_HARD_NEGATIVES_POLL_MS: z.coerce.number().int().positive().max(86_400_000).default(1_800_000),
+  HOUDI_INTENT_ROUTER_HARD_NEGATIVES_READ_LIMIT: z.coerce.number().int().min(100).max(20_000).default(4000),
+  HOUDI_INTENT_ROUTER_HARD_NEGATIVES_MAX_PER_ROUTE: z.coerce.number().int().min(1).max(100).default(10),
+  HOUDI_INTENT_ROUTER_HARD_NEGATIVES_MIN_ADDED: z.coerce.number().int().min(1).max(200).default(2),
+  HOUDI_INTENT_ROUTER_CANARY_GUARD_ENABLED: z.string().optional(),
+  HOUDI_INTENT_ROUTER_CANARY_GUARD_POLL_MS: z.coerce.number().int().positive().max(86_400_000).default(300_000),
+  HOUDI_INTENT_ROUTER_CANARY_GUARD_MIN_SAMPLES: z.coerce.number().int().min(5).max(5000).default(60),
+  HOUDI_INTENT_ROUTER_CANARY_GUARD_MIN_ACCURACY: z.coerce.number().min(0).max(1).default(0.55),
+  HOUDI_INTENT_ROUTER_CANARY_GUARD_BREACHES_TO_DISABLE: z.coerce.number().int().min(1).max(20).default(2),
   HOUDI_STATE_DB_FILE: z.string().trim().default("./workspace/state/houdi-state.sqlite"),
   HOUDI_IDEMPOTENCY_TTL_MS: z.coerce.number().int().positive().max(7 * 24 * 60 * 60 * 1000).default(86_400_000),
   HOUDI_AGENT_POLICY_FILE: z.string().trim().default("./workspace/state/agent-policy.json"),
@@ -154,6 +165,45 @@ function parseStringMapJson(value: string | undefined): Record<string, string> {
   }
 }
 
+function parseIntentRouteAlphaMapJson(value: string | undefined): Record<string, number> {
+  if (!value || !value.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const allowed = new Set([
+      "stoic-smalltalk",
+      "self-maintenance",
+      "connector",
+      "schedule",
+      "memory",
+      "gmail-recipients",
+      "gmail",
+      "workspace",
+      "document",
+      "web",
+    ]);
+    const output: Record<string, number> = {};
+    for (const [rawKey, rawValue] of Object.entries(parsed as Record<string, unknown>)) {
+      const key = rawKey.trim();
+      if (!allowed.has(key)) {
+        continue;
+      }
+      const numeric = Number(rawValue);
+      if (!Number.isFinite(numeric)) {
+        continue;
+      }
+      output[key] = Math.max(0.05, Math.min(0.95, Number(numeric)));
+    }
+    return output;
+  } catch {
+    return {};
+  }
+}
+
 function normalizeLimSourceMapKey(value: string): string {
   return value
     .normalize("NFD")
@@ -248,8 +298,19 @@ export const config = {
   intentRouterAbVariantBAlpha: env.HOUDI_INTENT_ROUTER_AB_VARIANT_B_ALPHA,
   intentRouterAbVariantBMinGap: env.HOUDI_INTENT_ROUTER_AB_VARIANT_B_MIN_GAP,
   intentRouterAbVariantBThresholdShift: env.HOUDI_INTENT_ROUTER_AB_VARIANT_B_THRESHOLD_SHIFT,
+  intentRouterRouteAlphaOverrides: parseIntentRouteAlphaMapJson(env.HOUDI_INTENT_ROUTER_ROUTE_ALPHA_OVERRIDES_JSON),
   intentRouterAlertPrecisionMin: env.HOUDI_INTENT_ROUTER_ALERT_PRECISION_MIN,
   intentRouterAlertMinSamples: env.HOUDI_INTENT_ROUTER_ALERT_MIN_SAMPLES,
+  intentRouterHardNegativesEnabled: parseBooleanFlag(env.HOUDI_INTENT_ROUTER_HARD_NEGATIVES_ENABLED, true),
+  intentRouterHardNegativesPollMs: env.HOUDI_INTENT_ROUTER_HARD_NEGATIVES_POLL_MS,
+  intentRouterHardNegativesReadLimit: env.HOUDI_INTENT_ROUTER_HARD_NEGATIVES_READ_LIMIT,
+  intentRouterHardNegativesMaxPerRoute: env.HOUDI_INTENT_ROUTER_HARD_NEGATIVES_MAX_PER_ROUTE,
+  intentRouterHardNegativesMinAdded: env.HOUDI_INTENT_ROUTER_HARD_NEGATIVES_MIN_ADDED,
+  intentRouterCanaryGuardEnabled: parseBooleanFlag(env.HOUDI_INTENT_ROUTER_CANARY_GUARD_ENABLED, true),
+  intentRouterCanaryGuardPollMs: env.HOUDI_INTENT_ROUTER_CANARY_GUARD_POLL_MS,
+  intentRouterCanaryGuardMinSamples: env.HOUDI_INTENT_ROUTER_CANARY_GUARD_MIN_SAMPLES,
+  intentRouterCanaryGuardMinAccuracy: env.HOUDI_INTENT_ROUTER_CANARY_GUARD_MIN_ACCURACY,
+  intentRouterCanaryGuardBreachesToDisable: env.HOUDI_INTENT_ROUTER_CANARY_GUARD_BREACHES_TO_DISABLE,
   stateDbFile: env.HOUDI_STATE_DB_FILE,
   idempotencyTtlMs: env.HOUDI_IDEMPOTENCY_TTL_MS,
   agentPolicyFile: env.HOUDI_AGENT_POLICY_FILE,

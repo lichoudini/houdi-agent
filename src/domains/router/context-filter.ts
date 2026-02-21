@@ -48,12 +48,17 @@ export function buildIntentRouterContextFilter(
 
   const pendingDelete = deps.getPendingWorkspaceDelete(params.chatId);
   if (pendingDelete && pendingDelete.expiresAtMs > now) {
-    allowed = narrowCandidates(allowed, ["workspace", "document"]);
-    reasons.push("pending-workspace-delete");
+    if (/^(si|sí|no|confirmo|confirmar|cancelar|cancela)$/i.test(normalized)) {
+      allowed = narrowCandidates(allowed, ["workspace"]);
+      reasons.push("pending-workspace-delete-confirmation-only");
+    } else {
+      allowed = narrowCandidates(allowed, ["workspace", "document"]);
+      reasons.push("pending-workspace-delete");
+    }
   }
   const pendingDeletePath = deps.getPendingWorkspaceDeletePath(params.chatId);
   if (pendingDeletePath && pendingDeletePath.expiresAtMs > now) {
-    allowed = narrowCandidates(allowed, ["workspace", "document"]);
+    allowed = narrowCandidates(allowed, ["workspace"]);
     reasons.push("pending-workspace-delete-path");
   }
 
@@ -106,6 +111,24 @@ export function buildIntentRouterContextFilter(
   if (hasRecentConnectorContext && explicitLimCue && connectorControlVerb && !mentionsOtherDomain) {
     allowed = narrowCandidates(allowed, ["connector"]);
     reasons.push("recent-connector-context");
+  }
+
+  if (explicitLimCue && !mentionsOtherDomain) {
+    allowed = narrowCandidates(allowed, ["connector"]);
+    reasons.push("explicit-lim-route");
+  }
+
+  if (/\b(gmail|correo|email|mail|inbox|bandeja)\b/.test(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {
+    allowed = narrowCandidates(allowed, ["gmail", "gmail-recipients"]);
+    reasons.push("explicit-gmail-route");
+  }
+
+  if (
+    /\b(workspace|archivo|carpeta|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized) &&
+    !/\b(gmail|correo|mail|email|lim|web|internet|noticias)\b/.test(normalized)
+  ) {
+    allowed = narrowCandidates(allowed, ["workspace", "document"]);
+    reasons.push("explicit-workspace-route");
   }
 
   if (params.hasMailContext && !params.hasMemoryRecallCue) {

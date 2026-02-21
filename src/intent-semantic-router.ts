@@ -18,6 +18,7 @@ type SemanticRouteConfig = {
   utterances: string[];
   negativeUtterances?: string[];
   threshold: number;
+  alpha?: number;
 };
 
 type RouteScore = {
@@ -36,6 +37,7 @@ type RouteOptions = {
   allowed?: IntentRouteName[];
   topK?: number;
   boosts?: Partial<Record<IntentRouteName, number>>;
+  alphaOverrides?: Partial<Record<IntentRouteName, number>>;
   minGap?: number;
 };
 
@@ -283,6 +285,9 @@ const DEFAULT_ROUTES: SemanticRouteConfig[] = [
 const DEFAULT_MIN_SCORE_GAP = 0.03;
 const DEFAULT_HYBRID_ALPHA = 0.72;
 const DEFAULT_NEGATIVE_PENALTY_BETA = 0.18;
+const DEFAULT_BM25_K1 = 1.4;
+const DEFAULT_BM25_B = 0.75;
+const DEFAULT_BM25_LAMBDA = 0.35;
 const DECISION_CACHE_MAX_ENTRIES = 5000;
 
 function normalizeText(input: string): string {
@@ -395,12 +400,21 @@ export class IntentSemanticRouter {
   private hybridAlpha: number;
   private minScoreGap: number;
   private readonly negativePenaltyBeta: number;
+  private readonly bm25K1: number;
+  private readonly bm25B: number;
+  private readonly bm25Lambda: number;
   private readonly idfByWordTerm = new Map<string, number>();
   private readonly idfByCharTerm = new Map<string, number>();
+  private readonly wordDocFreq = new Map<string, number>();
+  private totalWordDocs = 0;
+  private avgWordDocLength = 0;
+  private readonly routeWordDocs = new Map<IntentRouteName, Array<string[]>>();
   private readonly routeWordVectors = new Map<IntentRouteName, Map<string, number>>();
   private readonly routeCharVectors = new Map<IntentRouteName, Map<string, number>>();
   private readonly routeNegativeWordVectors = new Map<IntentRouteName, Map<string, number>>();
   private readonly routeNegativeCharVectors = new Map<IntentRouteName, Map<string, number>>();
+  private readonly constructorRouteAlphaOverrides = new Map<IntentRouteName, number>();
+  private readonly routeAlphaByName = new Map<IntentRouteName, number>();
   private readonly decisionCache = new Map<
     string,
     {
@@ -411,27 +425,54 @@ export class IntentSemanticRouter {
   private cacheHits = 0;
   private cacheMisses = 0;
 
-  constructor(params?: { routes?: SemanticRouteConfig[]; hybridAlpha?: number; minScoreGap?: number; negativePenaltyBeta?: number }) {
+  constructor(params?: {
+    routes?: SemanticRouteConfig[];
+    hybridAlpha?: number;
+    minScoreGap?: number;
+    negativePenaltyBeta?: number;
+    bm25K1?: number;
+    bm25B?: number;
+    bm25Lambda?: number;
+    routeAlphaOverrides?: Partial<Record<IntentRouteName, number>>;
+  }) {
     this.routes = (params?.routes ?? DEFAULT_ROUTES).map((route) => ({
       name: route.name,
       threshold: clamp(route.threshold, 0.01, 0.99),
       utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
       negativeUtterances: (route.negativeUtterances ?? []).map((item) => item.trim()).filter(Boolean),
+      ...(typeof route.alpha === "number" ? { alpha: clamp(route.alpha, 0.05, 0.95) } : {}),
     }));
     this.hybridAlpha = clamp(params?.hybridAlpha ?? DEFAULT_HYBRID_ALPHA, 0.05, 0.95);
     this.minScoreGap = clamp(params?.minScoreGap ?? DEFAULT_MIN_SCORE_GAP, 0.0, 0.5);
     this.negativePenaltyBeta = clamp(params?.negativePenaltyBeta ?? DEFAULT_NEGATIVE_PENALTY_BETA, 0, 0.5);
+    this.bm25K1 = clamp(params?.bm25K1 ?? DEFAULT_BM25_K1, 0.2, 3);
+    this.bm25B = clamp(params?.bm25B ?? DEFAULT_BM25_B, 0, 1);
+    this.bm25Lambda = clamp(params?.bm25Lambda ?? DEFAULT_BM25_LAMBDA, 0, 1);
+    if (params?.routeAlphaOverrides) {
+      for (const [route, value] of Object.entries(params.routeAlphaOverrides)) {
+        if (!KNOWN_ROUTE_NAMES.includes(route as IntentRouteName) || typeof value !== "number") {
+          continue;
+        }
+        this.constructorRouteAlphaOverrides.set(route as IntentRouteName, clamp(value, 0.05, 0.95));
+      }
+    }
     this.train();
   }
 
   private train(): void {
     this.idfByWordTerm.clear();
     this.idfByCharTerm.clear();
+    this.wordDocFreq.clear();
+    this.routeWordDocs.clear();
+    this.routeAlphaByName.clear();
     this.routeWordVectors.clear();
     this.routeCharVectors.clear();
     this.routeNegativeWordVectors.clear();
     this.routeNegativeCharVectors.clear();
     this.decisionCache.clear();
+    for (const [route, alpha] of this.constructorRouteAlphaOverrides.entries()) {
+      this.routeAlphaByName.set(route, alpha);
+    }
 
     const wordDocs: Array<{ name: IntentRouteName; terms: string[] }> = [];
     const charDocs: Array<{ name: IntentRouteName; terms: string[] }> = [];
@@ -444,6 +485,9 @@ export class IntentSemanticRouter {
         const charTerms = withCharTrigrams(utterance);
         wordDocs.push({ name: route.name, terms: wordTerms });
         charDocs.push({ name: route.name, terms: charTerms });
+        const routeDocs = this.routeWordDocs.get(route.name) ?? [];
+        routeDocs.push(wordTerms);
+        this.routeWordDocs.set(route.name, routeDocs);
 
         const wordUnique = new Set(wordTerms);
         for (const term of wordUnique) {
@@ -454,6 +498,15 @@ export class IntentSemanticRouter {
           charDocFreq.set(term, (charDocFreq.get(term) ?? 0) + 1);
         }
       }
+    }
+
+    this.totalWordDocs = Math.max(1, wordDocs.length);
+    this.avgWordDocLength =
+      wordDocs.length > 0
+        ? wordDocs.reduce((acc, doc) => acc + Math.max(1, doc.terms.length), 0) / wordDocs.length
+        : 1;
+    for (const [term, df] of wordDocFreq.entries()) {
+      this.wordDocFreq.set(term, df);
     }
 
     const totalWordDocs = Math.max(1, wordDocs.length);
@@ -522,6 +575,9 @@ export class IntentSemanticRouter {
       this.routeCharVectors.set(route.name, this.averageVectors(charBuckets.get(route.name) ?? []));
       this.routeNegativeWordVectors.set(route.name, this.averageVectors(negativeWordBuckets.get(route.name) ?? []));
       this.routeNegativeCharVectors.set(route.name, this.averageVectors(negativeCharBuckets.get(route.name) ?? []));
+      if (typeof route.alpha === "number") {
+        this.routeAlphaByName.set(route.name, clamp(route.alpha, 0.05, 0.95));
+      }
     }
   }
 
@@ -561,15 +617,84 @@ export class IntentSemanticRouter {
     return vector;
   }
 
+  private normalizeBm25Score(raw: number): number {
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return 0;
+    }
+    // Saturating curve to keep BM25 in [0,1] and comparable to cosine.
+    return clamp(1 - Math.exp(-raw / 6), 0, 1);
+  }
+
+  private scoreRouteBm25(routeName: IntentRouteName, queryTermsInput: string[]): number {
+    const queryTerms = Array.from(new Set(queryTermsInput.filter(Boolean)));
+    if (queryTerms.length === 0) {
+      return 0;
+    }
+    const docs = this.routeWordDocs.get(routeName) ?? [];
+    if (docs.length === 0) {
+      return 0;
+    }
+
+    let bestDocScore = 0;
+    for (const docTerms of docs) {
+      const tf = buildTermFrequency(docTerms);
+      const docLen = Math.max(1, docTerms.length);
+      let score = 0;
+      for (const term of queryTerms) {
+        const termFreq = tf.get(term) ?? 0;
+        if (termFreq <= 0) {
+          continue;
+        }
+        const df = this.wordDocFreq.get(term) ?? 0;
+        const idf = Math.log(1 + (this.totalWordDocs - df + 0.5) / (df + 0.5));
+        const denom = termFreq + this.bm25K1 * (1 - this.bm25B + this.bm25B * (docLen / Math.max(1, this.avgWordDocLength)));
+        score += idf * ((termFreq * (this.bm25K1 + 1)) / Math.max(1e-9, denom));
+      }
+      if (score > bestDocScore) {
+        bestDocScore = score;
+      }
+    }
+    return this.normalizeBm25Score(bestDocScore);
+  }
+
+  private computeAdaptiveAlpha(routeName: IntentRouteName, normalizedText: string, override?: number): number {
+    const baseAlpha = clamp(
+      typeof override === "number"
+        ? override
+        : this.routeAlphaByName.get(routeName) ?? this.hybridAlpha,
+      0.05,
+      0.95,
+    );
+    const wordTerms = tokenize(normalizedText);
+    const tokenCount = wordTerms.length;
+    const nonAlphaNumChars = normalizedText.replace(/[a-z0-9\s]/g, "").length;
+    const noiseRatio = normalizedText.length > 0 ? nonAlphaNumChars / normalizedText.length : 0;
+    let adaptive = baseAlpha;
+    if (tokenCount <= 4) {
+      adaptive += 0.08;
+    } else if (tokenCount >= 16) {
+      adaptive -= 0.05;
+    }
+    if (noiseRatio >= 0.22) {
+      adaptive -= 0.06;
+    }
+    if (/\b(gmail|mail|email|lim|workspace|archivo|carpeta|recordatorio|noticias|web)\b/.test(normalizedText)) {
+      adaptive += 0.03;
+    }
+    return clamp(adaptive, 0.05, 0.95);
+  }
+
   private scoreRoutes(
     text: string,
-    options?: Pick<RouteOptions, "allowed" | "boosts">,
+    options?: Pick<RouteOptions, "allowed" | "boosts" | "alphaOverrides">,
   ): RouteScore[] {
     const normalized = normalizeText(text);
     const allowedSet = new Set<IntentRouteName>(options?.allowed ?? this.routes.map((route) => route.name));
     const wordVector = this.embedWordQuery(normalized);
     const charVector = this.embedCharQuery(normalized);
+    const queryTerms = withBigrams(tokenize(normalized));
     const boosts = options?.boosts ?? {};
+    const alphaOverrides = options?.alphaOverrides ?? {};
 
     const scored: RouteScore[] = [];
     for (const route of this.routes) {
@@ -581,12 +706,15 @@ export class IntentSemanticRouter {
       const routeNegativeWordVector = this.routeNegativeWordVectors.get(route.name) ?? new Map<string, number>();
       const routeNegativeCharVector = this.routeNegativeCharVectors.get(route.name) ?? new Map<string, number>();
       const wordScore = cosineSimilarity(wordVector, routeWordVector);
+      const bm25Score = this.scoreRouteBm25(route.name, queryTerms);
+      const lexicalScore = clamp((1 - this.bm25Lambda) * wordScore + this.bm25Lambda * bm25Score, 0, 1);
       const charScore = cosineSimilarity(charVector, routeCharVector);
       const negativeWordScore = cosineSimilarity(wordVector, routeNegativeWordVector);
       const negativeCharScore = cosineSimilarity(charVector, routeNegativeCharVector);
-      const negativePenalty = this.negativePenaltyBeta * (this.hybridAlpha * negativeWordScore + (1 - this.hybridAlpha) * negativeCharScore);
+      const adaptiveAlpha = this.computeAdaptiveAlpha(route.name, normalized, alphaOverrides[route.name]);
+      const negativePenalty = this.negativePenaltyBeta * (adaptiveAlpha * negativeWordScore + (1 - adaptiveAlpha) * negativeCharScore);
       const boost = boosts[route.name] ?? 0;
-      const hybridScore = clamp(this.hybridAlpha * wordScore + (1 - this.hybridAlpha) * charScore + boost - negativePenalty, 0, 1);
+      const hybridScore = clamp(adaptiveAlpha * lexicalScore + (1 - adaptiveAlpha) * charScore + boost - negativePenalty, 0, 1);
       scored.push({ name: route.name, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
@@ -622,6 +750,7 @@ export class IntentSemanticRouter {
       text: normalized,
       allowed: options?.allowed ?? [],
       boosts: options?.boosts ?? {},
+      alphaOverrides: options?.alphaOverrides ?? {},
       topK: options?.topK ?? 3,
       minGap: options?.minGap ?? this.minScoreGap,
     });
@@ -635,6 +764,7 @@ export class IntentSemanticRouter {
     const scored = this.scoreRoutes(normalized, {
       allowed: options?.allowed,
       boosts: options?.boosts,
+      alphaOverrides: options?.alphaOverrides,
     });
     if (scored.length === 0) {
       return null;
@@ -713,6 +843,7 @@ export class IntentSemanticRouter {
       threshold: route.threshold,
       utterances: [...route.utterances],
       negativeUtterances: [...(route.negativeUtterances ?? [])],
+      ...(typeof route.alpha === "number" ? { alpha: route.alpha } : {}),
     }));
   }
 
@@ -761,6 +892,7 @@ export class IntentSemanticRouter {
           threshold: clamp(route.threshold, 0.01, 0.99),
           utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
           negativeUtterances: (route.negativeUtterances ?? []).map((item) => item.trim()).filter(Boolean),
+          ...(typeof route.alpha === "number" ? { alpha: clamp(route.alpha, 0.05, 0.95) } : {}),
         }))
         .filter((route) => route.utterances.length > 0);
       if (validRoutes.length === 0) {

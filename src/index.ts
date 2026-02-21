@@ -54,6 +54,7 @@ import { buildCurationSuggestions } from "./domains/router/curation.js";
 import { DynamicIntentRoutesStore } from "./domains/router/dynamic-routes.js";
 import { rankIntentCandidatesWithEnsemble } from "./domains/router/ensemble.js";
 import { applyIntentRouteLayers, type RouteLayerDecision } from "./domains/router/route-layers.js";
+import { buildHierarchicalIntentDecision, type HierarchicalIntentDecision } from "./domains/router/hierarchical.js";
 import { resolveIntentRouterAbVariant } from "./domains/router/ab-routing.js";
 import { RouterVersionStore } from "./domains/router/router-versioning.js";
 import { detectWorkspaceNaturalIntent as detectWorkspaceNaturalIntentDomain } from "./domains/workspace/intents.js";
@@ -143,6 +144,7 @@ const openAi = new OpenAiService();
 const semanticIntentRouter = new IntentSemanticRouter({
   hybridAlpha: config.intentRouterHybridAlpha,
   minScoreGap: config.intentRouterMinScoreGap,
+  routeAlphaOverrides: config.intentRouterRouteAlphaOverrides,
 });
 const dynamicIntentRoutes = new DynamicIntentRoutesStore();
 const intentConfidenceCalibrator = new IntentConfidenceCalibrator(10);
@@ -308,6 +310,11 @@ let localBridgeServer: Server | null = null;
 let outboxRecoveryTimer: NodeJS.Timeout | null = null;
 let outboxRecoveryInFlight = false;
 let runtimeStatePersistenceTimer: NodeJS.Timeout | null = null;
+let intentHardNegativesTimer: NodeJS.Timeout | null = null;
+let intentHardNegativesInFlight = false;
+let intentCanaryGuardTimer: NodeJS.Timeout | null = null;
+let intentCanaryGuardInFlight = false;
+let intentCanaryGuardConsecutiveBreaches = 0;
 type PendingWorkspaceDeleteConfirmation = {
   paths: string[];
   requestedAtMs: number;
@@ -380,6 +387,7 @@ const SELF_UPDATE_GIT_REMOTE = "origin";
 const SELF_UPDATE_STDIO_MAX_CHARS = 12_000;
 const SELF_UPDATE_SHORT_TIMEOUT_MS = 45_000;
 const SELF_UPDATE_FETCH_TIMEOUT_MS = 120_000;
+const INTENT_HARD_NEGATIVE_SNAPSHOT_LABEL = "auto-hard-negatives";
 const SELF_UPDATE_INSTALL_TIMEOUT_MS = 900_000;
 const SELF_UPDATE_BUILD_TIMEOUT_MS = 900_000;
 const LOCAL_BRIDGE_MESSAGE_PATH = "/internal/cli/message";
@@ -1386,8 +1394,18 @@ type IntentRouterDatasetEntry = {
   routerCanaryVersion?: string;
   routerLayers?: string[];
   routerLayerReason?: string;
+  routerHierarchyDomains?: string[];
+  routerHierarchyReason?: string;
+  routerHierarchyAllowed?: string[];
   routerEnsembleTop?: Array<{ name: string; score: number }>;
-  finalHandler: Exclude<NaturalIntentHandlerName, "none"> | "indexed-list-reference" | "none";
+  routerTypedExtraction?: {
+    route: string;
+    action?: string;
+    missing: string[];
+    required: string[];
+    summary: string;
+  };
+  finalHandler: Exclude<NaturalIntentHandlerName, "none"> | "indexed-list-reference" | "none" | `multi:${string}`;
   handled: boolean;
 };
 
@@ -4806,6 +4824,7 @@ function buildIntentRouterForChat(chatId: number): {
       routes: effectiveRoutes,
       hybridAlpha: effectiveAlpha,
       minScoreGap: effectiveMinGap,
+      routeAlphaOverrides: config.intentRouterRouteAlphaOverrides,
     }),
     abVariant,
     effectiveAlpha,
@@ -4844,6 +4863,7 @@ async function applyRouterSnapshotById(versionId: string): Promise<boolean> {
     routes: snapshot.routes,
     hybridAlpha: snapshot.hybridAlpha,
     minScoreGap: snapshot.minScoreGap,
+    routeAlphaOverrides: config.intentRouterRouteAlphaOverrides,
   });
   await nextRouter.saveToFile(config.intentRouterRoutesFile);
   await semanticIntentRouter.loadFromFile(config.intentRouterRoutesFile, {
@@ -4876,6 +4896,244 @@ function buildIntentClarificationQuestion(alternatives: Array<{ name: string; sc
   return `Estoy entre dos intenciones (${topChoices}). ¿Puedes aclarar en una frase la acción exacta?`;
 }
 
+type TypedRouteExtraction = {
+  route: Exclude<NaturalIntentHandlerName, "none">;
+  action?: string;
+  required: string[];
+  missing: string[];
+  summary: string;
+};
+
+function extractTypedRouteAction(params: {
+  route: Exclude<NaturalIntentHandlerName, "none">;
+  text: string;
+}): TypedRouteExtraction | null {
+  const required: string[] = [];
+  const missing: string[] = [];
+  let action = "";
+  let summary = "";
+
+  if (params.route === "gmail") {
+    const intent = detectGmailNaturalIntent(params.text);
+    if (!intent.shouldHandle || !intent.action) {
+      return null;
+    }
+    action = intent.action;
+    if (intent.action === "send") {
+      required.push("to");
+      const hasTo = Boolean(intent.to?.trim() || intent.recipientName?.trim() || inferDefaultSelfEmailRecipient(params.text));
+      if (!hasTo) {
+        missing.push("to");
+      }
+    }
+    summary = `gmail:${action}`;
+  } else if (params.route === "workspace") {
+    const intent = detectWorkspaceNaturalIntent(params.text);
+    if (!intent.shouldHandle || !intent.action) {
+      return null;
+    }
+    action = intent.action;
+    if (intent.action === "move" || intent.action === "rename") {
+      required.push("source", "target");
+      const hasSource = Boolean(intent.sourcePath?.trim() || intent.selector || intent.fileIndex);
+      const hasTarget = Boolean(intent.targetPath?.trim() || intent.path?.trim());
+      if (!hasSource) {
+        missing.push("source");
+      }
+      if (!hasTarget) {
+        missing.push("target");
+      }
+    } else if (intent.action === "delete") {
+      required.push("target");
+      const hasTarget = Boolean(
+        intent.path?.trim() ||
+          intent.selector ||
+          intent.deleteContentsOfPath?.trim() ||
+          (intent.deleteExtensions?.length ?? 0) > 0 ||
+          intent.fileIndex,
+      );
+      if (!hasTarget) {
+        missing.push("target");
+      }
+    } else if (intent.action === "write") {
+      required.push("path");
+      if (!intent.path?.trim()) {
+        missing.push("path");
+      }
+    }
+    summary = `workspace:${action}`;
+  } else if (params.route === "connector") {
+    const intent = detectConnectorNaturalIntent(params.text);
+    if (!intent.shouldHandle || !intent.action) {
+      return null;
+    }
+    action = intent.action;
+    if (intent.action === "query") {
+      required.push("firstName", "lastName", "sourceName");
+      if (!intent.firstName?.trim()) {
+        missing.push("firstName");
+      }
+      if (!intent.lastName?.trim()) {
+        missing.push("lastName");
+      }
+      if (!intent.sourceName?.trim()) {
+        missing.push("sourceName");
+      }
+    }
+    summary = `connector:${action}`;
+  } else if (params.route === "schedule") {
+    const intent = detectScheduleNaturalIntent(params.text);
+    if (!intent.shouldHandle || !intent.action) {
+      return null;
+    }
+    action = intent.action;
+    if (intent.action === "edit" || intent.action === "delete") {
+      required.push("taskRef");
+      if (!intent.taskRef?.trim()) {
+        missing.push("taskRef");
+      }
+    }
+    summary = `schedule:${action}`;
+  } else if (params.route === "self-maintenance") {
+    const intent = detectSelfMaintenanceIntent(params.text);
+    if (!intent.shouldHandle || !intent.action) {
+      return null;
+    }
+    action = intent.action;
+    if (intent.action === "delete-skill") {
+      required.push("skillIndex");
+      if (!Number.isFinite(intent.skillIndex ?? NaN)) {
+        missing.push("skillIndex");
+      }
+    }
+    summary = `self-maintenance:${action}`;
+  } else if (params.route === "gmail-recipients") {
+    const intent = detectGmailRecipientNaturalIntent(params.text);
+    if (!intent.shouldHandle || !intent.action) {
+      return null;
+    }
+    action = intent.action;
+    if (intent.action === "add" || intent.action === "update") {
+      required.push("name", "email");
+      if (!intent.name?.trim()) {
+        missing.push("name");
+      }
+      if (!intent.email?.trim()) {
+        missing.push("email");
+      }
+    } else if (intent.action === "delete") {
+      required.push("name");
+      if (!intent.name?.trim()) {
+        missing.push("name");
+      }
+    }
+    summary = `gmail-recipients:${action}`;
+  } else {
+    summary = params.route;
+  }
+
+  return {
+    route: params.route,
+    ...(action ? { action } : {}),
+    required,
+    missing,
+    summary,
+  };
+}
+
+function buildTypedRouteClarificationQuestion(extraction: TypedRouteExtraction): string {
+  if (extraction.route === "gmail" && extraction.action === "send") {
+    return "Para enviar el correo necesito destinatario. Indica: enviar correo a <email> asunto:<...> mensaje:<...>.";
+  }
+  if (extraction.route === "workspace" && extraction.action === "move") {
+    return "Para mover necesito origen y destino. Ejemplo: mover archivo <origen> a <destino>.";
+  }
+  if (extraction.route === "workspace" && extraction.action === "rename") {
+    return "Para renombrar necesito nombre actual y nuevo nombre. Ejemplo: renombrar <archivo> a <nuevo_nombre>.";
+  }
+  if (extraction.route === "workspace" && extraction.action === "delete") {
+    return "Para borrar necesito ruta o selector. Ejemplo: eliminar archivo <ruta> o eliminar archivos que contienen \"...\".";
+  }
+  if (extraction.route === "connector" && extraction.action === "query") {
+    return "Para consultar LIM necesito first_name, last_name y fuente. Ejemplo: revisar LIM de Juan Perez en account_demo_b_marylin.";
+  }
+  if (extraction.route === "schedule" && (extraction.action === "edit" || extraction.action === "delete")) {
+    return "Necesito referencia de tarea (id, número o 'última').";
+  }
+  if (extraction.route === "gmail-recipients") {
+    return "Para gestionar destinatarios necesito nombre y/o email según la acción.";
+  }
+  return `Faltan parámetros para ejecutar ${extraction.summary}. ¿Lo reformulas con más detalle?`;
+}
+
+function isSensitiveIntentRoute(route: Exclude<NaturalIntentHandlerName, "none">): boolean {
+  return ["gmail", "workspace", "connector", "self-maintenance", "schedule"].includes(route);
+}
+
+function shouldAbstainByUncertainty(params: {
+  semantic: SemanticRouteDecision | null;
+  calibratedConfidence: number | null;
+  gap: number | null;
+  ensembleTop: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }>;
+}): boolean {
+  const top = params.semantic;
+  if (!top) {
+    return false;
+  }
+  const calibrated = typeof params.calibratedConfidence === "number" ? params.calibratedConfidence : top.score;
+  const gap = typeof params.gap === "number" ? params.gap : 1;
+  const ensembleSecond = params.ensembleTop[1];
+  const ensembleAmbiguous =
+    params.ensembleTop.length >= 2 &&
+    (params.ensembleTop[0]?.score ?? 0) - (ensembleSecond?.score ?? 0) < 0.08;
+  const sensitive = isSensitiveIntentRoute(top.handler as Exclude<NaturalIntentHandlerName, "none">);
+  if (calibrated < 0.52 && gap < 0.1) {
+    return true;
+  }
+  if (sensitive && calibrated < 0.62 && gap < 0.14) {
+    return true;
+  }
+  if (ensembleAmbiguous && calibrated < 0.66) {
+    return true;
+  }
+  return false;
+}
+
+function isLikelyMultiIntentUtterance(text: string): boolean {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) {
+    return false;
+  }
+  return /\b(luego|despues|después|ademas|además|tambien|también|y luego|y despues|y después)\b/.test(normalized);
+}
+
+function handlerLikelyMatchesText(handler: Exclude<NaturalIntentHandlerName, "none">, text: string): boolean {
+  switch (handler) {
+    case "stoic-smalltalk":
+      return detectStoicSmalltalkIntent(text);
+    case "self-maintenance":
+      return detectSelfMaintenanceIntent(text).shouldHandle;
+    case "connector":
+      return detectConnectorNaturalIntent(text).shouldHandle;
+    case "schedule":
+      return detectScheduleNaturalIntent(text).shouldHandle;
+    case "memory":
+      return detectMemoryNaturalIntent(text).shouldHandle;
+    case "gmail-recipients":
+      return detectGmailRecipientNaturalIntent(text).shouldHandle;
+    case "gmail":
+      return detectGmailNaturalIntent(text).shouldHandle;
+    case "workspace":
+      return detectWorkspaceNaturalIntent(text).shouldHandle;
+    case "document":
+      return detectDocumentIntent(text, documentReader.getSupportedFormats()).shouldHandle;
+    case "web":
+      return detectWebIntent(text).shouldHandle;
+    default:
+      return false;
+  }
+}
+
 async function appendIntentRouterDatasetEntry(entry: IntentRouterDatasetEntry): Promise<void> {
   await intentRouterStatsRepository.append(entry);
 }
@@ -4893,6 +5151,151 @@ async function buildIntentRouterStatsReport(limit: number): Promise<string> {
     alertMinPrecision: config.intentRouterAlertPrecisionMin,
     alertMinSamples: config.intentRouterAlertMinSamples,
   });
+}
+
+async function runIntentHardNegativeMining(source: "startup" | "timer" | "manual"): Promise<void> {
+  if (!config.intentRouterHardNegativesEnabled) {
+    return;
+  }
+  if (intentHardNegativesInFlight) {
+    return;
+  }
+  intentHardNegativesInFlight = true;
+  try {
+    const rows = await intentRouterStatsRepository.read(config.intentRouterHardNegativesReadLimit);
+    const routeNames = new Set(semanticIntentRouter.listRoutes().map((route) => route.name));
+    const labeled = rows
+      .filter((entry) => routeNames.has(entry.finalHandler as IntentRouteName))
+      .map((entry) => ({
+        text: entry.text,
+        finalHandler: entry.finalHandler,
+      }));
+    if (labeled.length < Math.max(100, config.intentRouterHardNegativesMaxPerRoute * 20)) {
+      return;
+    }
+    const addedByRoute = semanticIntentRouter.augmentNegativesFromDataset(
+      labeled,
+      config.intentRouterHardNegativesMaxPerRoute,
+    );
+    const totalAdded = Object.values(addedByRoute).reduce((acc, value) => acc + value, 0);
+    if (totalAdded < config.intentRouterHardNegativesMinAdded) {
+      return;
+    }
+    await semanticIntentRouter.saveToFile(config.intentRouterRoutesFile);
+    const versionId = await saveCurrentRouterSnapshot(
+      `${INTENT_HARD_NEGATIVE_SNAPSHOT_LABEL}-${new Date().toISOString()}`,
+    );
+    observability.increment("intent.router.hard_negatives.applied", totalAdded, {
+      source,
+      routes: Object.keys(addedByRoute).length,
+    });
+    await safeAudit({
+      type: "intent.router.hard_negatives_applied",
+      details: {
+        source,
+        totalAdded,
+        perRoute: addedByRoute,
+        versionId,
+      },
+    });
+    logInfo(
+      `Intent hard-negatives (${source}): added=${totalAdded} routes=${Object.keys(addedByRoute).join(",")} version=${versionId}`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    observability.increment("intent.router.hard_negatives.failed", 1, { source });
+    logWarn(`Intent hard-negatives (${source}) falló: ${message}`);
+  } finally {
+    intentHardNegativesInFlight = false;
+  }
+}
+
+function startIntentHardNegativeWorker(): void {
+  if (!config.intentRouterHardNegativesEnabled || intentHardNegativesTimer) {
+    return;
+  }
+  intentHardNegativesTimer = setInterval(() => {
+    void runIntentHardNegativeMining("timer");
+  }, Math.max(60_000, config.intentRouterHardNegativesPollMs));
+  intentHardNegativesTimer.unref?.();
+  void runIntentHardNegativeMining("startup");
+}
+
+async function runIntentCanaryGuard(source: "startup" | "timer"): Promise<void> {
+  if (!config.intentRouterCanaryGuardEnabled) {
+    return;
+  }
+  if (intentCanaryGuardInFlight) {
+    return;
+  }
+  intentCanaryGuardInFlight = true;
+  try {
+    const canary = routerVersionStore.getCanaryStatus();
+    if (!canary.enabled || !canary.versionId) {
+      intentCanaryGuardConsecutiveBreaches = 0;
+      return;
+    }
+    const rows = await intentRouterStatsRepository.read(Math.max(200, config.intentRouterCanaryGuardMinSamples * 8));
+    const scoped = rows.filter(
+      (entry) =>
+        entry.routerCanaryVersion === canary.versionId &&
+        Boolean(entry.semantic?.handler) &&
+        Boolean(entry.finalHandler) &&
+        entry.finalHandler !== "none",
+    );
+    const total = scoped.length;
+    if (total < config.intentRouterCanaryGuardMinSamples) {
+      return;
+    }
+    const correct = scoped.filter((entry) => entry.semantic?.handler === entry.finalHandler).length;
+    const accuracy = total > 0 ? correct / total : 0;
+    observability.increment("intent.router.canary_guard.sampled", total, { source });
+    if (accuracy < config.intentRouterCanaryGuardMinAccuracy) {
+      intentCanaryGuardConsecutiveBreaches += 1;
+      observability.increment("intent.router.canary_guard.breach", 1, {
+        source,
+        version: canary.versionId,
+      });
+      if (intentCanaryGuardConsecutiveBreaches >= config.intentRouterCanaryGuardBreachesToDisable) {
+        routerVersionStore.disableCanary();
+        await routerVersionStore.save(config.intentRouterVersionsFile);
+        await safeAudit({
+          type: "intent.router.canary_auto_disabled",
+          details: {
+            source,
+            versionId: canary.versionId,
+            accuracy,
+            minAccuracy: config.intentRouterCanaryGuardMinAccuracy,
+            samples: total,
+            breaches: intentCanaryGuardConsecutiveBreaches,
+          },
+        });
+        logWarn(
+          `Canary auto-disable: version=${canary.versionId} acc=${(accuracy * 100).toFixed(2)}% samples=${total} (threshold ${(config.intentRouterCanaryGuardMinAccuracy * 100).toFixed(2)}%)`,
+        );
+        intentCanaryGuardConsecutiveBreaches = 0;
+      }
+      return;
+    }
+    intentCanaryGuardConsecutiveBreaches = 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    observability.increment("intent.router.canary_guard.failed", 1, { source });
+    logWarn(`Intent canary guard (${source}) falló: ${message}`);
+  } finally {
+    intentCanaryGuardInFlight = false;
+  }
+}
+
+function startIntentCanaryGuardWorker(): void {
+  if (!config.intentRouterCanaryGuardEnabled || intentCanaryGuardTimer) {
+    return;
+  }
+  intentCanaryGuardTimer = setInterval(() => {
+    void runIntentCanaryGuard("timer");
+  }, Math.max(60_000, config.intentRouterCanaryGuardPollMs));
+  intentCanaryGuardTimer.unref?.();
+  void runIntentCanaryGuard("startup");
 }
 
 function tryParseNaturalRouteDecision(raw: string): {
@@ -12226,6 +12629,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
   let routerAbVariant: "A" | "B" = "A";
   let routerCanaryVersion: string | null = null;
   let routerLayerDecision: RouteLayerDecision | null = null;
+  let hierarchyDecision: HierarchicalIntentDecision | null = null;
   let ensembleTop: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }> = [];
   const routeCandidates = handlers.map((item) => item.name as Exclude<NaturalIntentHandlerName, "none">);
   const indexedListContext = getIndexedListContext(params.ctx.chat.id);
@@ -12242,16 +12646,33 @@ async function maybeHandleNaturalIntentPipeline(params: {
         routerLayerDecision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
       )
     : routeCandidates;
+  hierarchyDecision = buildHierarchicalIntentDecision({
+    normalizedText: normalized,
+    candidates: layerAllowedCandidates,
+    hasMailContext,
+    hasMemoryRecallCue,
+    indexedListKind: indexedListContext?.kind ?? null,
+    hasPendingWorkspaceDelete: hasPendingWorkspaceDeleteConfirmation(params.ctx.chat.id),
+    hasRecentConnectorContext: lastConnectorContextByChat.get(params.ctx.chat.id)
+      ? lastConnectorContextByChat.get(params.ctx.chat.id)! + CONNECTOR_CONTEXT_TTL_MS > Date.now()
+      : false,
+  });
+  const hierarchyAllowedCandidates = hierarchyDecision
+    ? narrowRouteCandidates(
+        layerAllowedCandidates,
+        hierarchyDecision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
+      )
+    : layerAllowedCandidates;
   const routeFilterDecision = buildIntentRouterContextFilter({
     chatId: params.ctx.chat.id,
     text: params.text,
-    candidates: layerAllowedCandidates,
+    candidates: hierarchyAllowedCandidates,
     hasMailContext,
     hasMemoryRecallCue,
   });
   const semanticAllowedCandidates = routeFilterDecision
     ? (routeFilterDecision.allowed as Exclude<NaturalIntentHandlerName, "none">[])
-    : layerAllowedCandidates;
+    : hierarchyAllowedCandidates;
   const routeScoreBoosts = buildIntentRouterScoreBoosts({
     chatId: params.ctx.chat.id,
     text: params.text,
@@ -12265,7 +12686,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
   semanticRouteDecision = chatScopedRouter.router.route(params.text, {
     allowed: semanticAllowedCandidates as IntentRouteName[],
     boosts: routeScoreBoosts,
-    topK: 3,
+    alphaOverrides: config.intentRouterRouteAlphaOverrides,
+    topK: 5,
   });
   if (semanticRouteDecision) {
     const second = semanticRouteDecision.alternatives[1];
@@ -12346,14 +12768,17 @@ async function maybeHandleNaturalIntentPipeline(params: {
     }
   }
 
+  const uncertainSemanticDecision = semanticRouteDecision;
   if (
-    semanticRouteDecision &&
-    typeof semanticCalibratedConfidence === "number" &&
-    semanticCalibratedConfidence < 0.5 &&
-    typeof semanticGap === "number" &&
-    semanticGap < 0.07
+    uncertainSemanticDecision &&
+    shouldAbstainByUncertainty({
+      semantic: uncertainSemanticDecision,
+      calibratedConfidence: semanticCalibratedConfidence,
+      gap: semanticGap,
+      ensembleTop,
+    })
   ) {
-    await params.ctx.reply(buildIntentClarificationQuestion(semanticRouteDecision.alternatives));
+    await params.ctx.reply(buildIntentClarificationQuestion(uncertainSemanticDecision.alternatives));
     await appendIntentRouterDatasetEntry({
       ts: new Date().toISOString(),
       chatId: params.ctx.chat.id,
@@ -12365,6 +12790,13 @@ async function maybeHandleNaturalIntentPipeline(params: {
       routeCandidates,
       ...(routeFilterDecision
         ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed }
+        : {}),
+      ...(hierarchyDecision
+        ? {
+            routerHierarchyDomains: hierarchyDecision.domains,
+            routerHierarchyReason: hierarchyDecision.reason,
+            routerHierarchyAllowed: hierarchyDecision.allowed,
+          }
         : {}),
       ...(semanticRouteDecision
         ? {
@@ -12380,8 +12812,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
           }
         : {}),
       ...(aiRouteDecision ? { ai: aiRouteDecision } : {}),
-      semanticCalibratedConfidence,
-      semanticGap,
+      semanticCalibratedConfidence: semanticCalibratedConfidence ?? undefined,
+      semanticGap: semanticGap ?? undefined,
       routerAbVariant,
       ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
       ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
@@ -12392,7 +12824,154 @@ async function maybeHandleNaturalIntentPipeline(params: {
     return true;
   }
 
+  if (!params.source.includes(":multi-topn-") && isLikelyMultiIntentUtterance(params.text) && ensembleTop.length >= 2) {
+    const topCandidateNames = ensembleTop
+      .slice(0, 3)
+      .map((item) => item.name)
+      .filter((name, idx, arr) => arr.indexOf(name) === idx);
+    const multiHandlers = routedHandlers.filter(
+      (handler) => topCandidateNames.includes(handler.name) && handlerLikelyMatchesText(handler.name, params.text),
+    );
+    if (multiHandlers.length >= 2) {
+      if (params.persistUserTurn) {
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "user",
+          text: params.text,
+          source: params.source,
+        });
+      }
+      await params.ctx.reply(`Detecté pedido multi-intent. Ejecutando ${multiHandlers.length} dominios en secuencia...`);
+      const executed: Array<{ handler: string; ok: boolean }> = [];
+      for (let idx = 0; idx < multiHandlers.length; idx += 1) {
+        const handler = multiHandlers[idx]!;
+        const ok = await handler.fn({
+          ...params,
+          source: `${params.source}:multi-topn-${idx + 1}`,
+          persistUserTurn: false,
+        });
+        executed.push({ handler: handler.name, ok });
+      }
+      const okCount = executed.filter((item) => item.ok).length;
+      if (okCount > 0) {
+        await replyLong(
+          params.ctx,
+          [
+            "Resumen multi-intent:",
+            ...executed.map((item, idx) => `${idx + 1}. ${item.handler} => ${item.ok ? "OK" : "NO"}`),
+          ].join("\n"),
+        );
+        await appendIntentRouterDatasetEntry({
+          ts: new Date().toISOString(),
+          chatId: params.ctx.chat.id,
+          ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
+          source: params.source,
+          text: truncateInline(params.text.trim(), 500),
+          hasMailContext,
+          hasMemoryRecallCue,
+          routeCandidates,
+          ...(routeFilterDecision
+            ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed }
+            : routerLayerDecision
+              ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
+              : {}),
+          ...(hierarchyDecision
+            ? {
+                routerHierarchyDomains: hierarchyDecision.domains,
+                routerHierarchyReason: hierarchyDecision.reason,
+                routerHierarchyAllowed: hierarchyDecision.allowed,
+              }
+            : {}),
+          ...(semanticRouteDecision
+            ? {
+                semantic: {
+                  handler: semanticRouteDecision.handler,
+                  score: semanticRouteDecision.score,
+                  reason: semanticRouteDecision.reason,
+                  alternatives: semanticRouteDecision.alternatives as Array<{
+                    name: Exclude<NaturalIntentHandlerName, "none">;
+                    score: number;
+                  }>,
+                },
+              }
+            : {}),
+          ...(aiRouteDecision ? { ai: aiRouteDecision } : {}),
+          semanticCalibratedConfidence: semanticCalibratedConfidence ?? undefined,
+          semanticGap: semanticGap ?? undefined,
+          routerAbVariant,
+          ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
+          ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
+          routerEnsembleTop: ensembleTop,
+          finalHandler: `multi:${executed.filter((item) => item.ok).map((item) => item.handler).join("+")}`,
+          handled: true,
+        });
+        return true;
+      }
+    }
+  }
+
   for (const handler of routedHandlers) {
+    const typedExtraction = extractTypedRouteAction({
+      route: handler.name,
+      text: params.text,
+    });
+    if (typedExtraction && typedExtraction.missing.length > 0 && isSensitiveIntentRoute(handler.name)) {
+      await params.ctx.reply(buildTypedRouteClarificationQuestion(typedExtraction));
+      await appendIntentRouterDatasetEntry({
+        ts: new Date().toISOString(),
+        chatId: params.ctx.chat.id,
+        ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
+        source: params.source,
+        text: truncateInline(params.text.trim(), 500),
+        hasMailContext,
+        hasMemoryRecallCue,
+        routeCandidates,
+        ...(routeFilterDecision
+          ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed }
+          : routerLayerDecision
+            ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
+            : {}),
+        ...(hierarchyDecision
+          ? {
+              routerHierarchyDomains: hierarchyDecision.domains,
+              routerHierarchyReason: hierarchyDecision.reason,
+              routerHierarchyAllowed: hierarchyDecision.allowed,
+            }
+          : {}),
+        ...(semanticRouteDecision
+          ? {
+              semantic: {
+                handler: semanticRouteDecision.handler,
+                score: semanticRouteDecision.score,
+                reason: semanticRouteDecision.reason,
+                alternatives: semanticRouteDecision.alternatives as Array<{
+                  name: Exclude<NaturalIntentHandlerName, "none">;
+                  score: number;
+                }>,
+              },
+            }
+          : {}),
+        ...(aiRouteDecision ? { ai: aiRouteDecision } : {}),
+        semanticCalibratedConfidence: semanticCalibratedConfidence ?? undefined,
+        semanticGap: semanticGap ?? undefined,
+        routerAbVariant,
+        ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
+        ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
+        routerEnsembleTop: ensembleTop,
+        routerTypedExtraction: {
+          route: typedExtraction.route,
+          action: typedExtraction.action ?? "",
+          missing: typedExtraction.missing,
+          required: typedExtraction.required,
+          summary: typedExtraction.summary,
+        },
+        finalHandler: "none",
+        handled: true,
+      });
+      return true;
+    }
+
     const handled = await handler.fn(params);
     if (handled) {
       await safeAudit({
@@ -12406,6 +12985,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
           memoryRecallCue: hasMemoryRecallCue,
           routeCandidates,
           routeFilterReason: routeFilterDecision?.reason ?? routerLayerDecision?.reason ?? null,
+          routeHierarchyReason: hierarchyDecision?.reason ?? null,
           routeFilterAllowed: routeFilterDecision?.allowed ?? null,
           routeLayers: routerLayerDecision?.layers ?? null,
           semanticRouterSelected: semanticRouteDecision?.handler ?? null,
@@ -12416,6 +12996,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
           routerCanaryVersion,
           ensembleTop,
           aiRouterSelected: aiRouteDecision?.handler ?? null,
+          typedRouteSummary: typedExtraction?.summary ?? null,
           textPreview: truncateInline(params.text, 220),
         },
       });
@@ -12433,6 +13014,13 @@ async function maybeHandleNaturalIntentPipeline(params: {
           : routerLayerDecision
             ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
             : {}),
+        ...(hierarchyDecision
+          ? {
+              routerHierarchyDomains: hierarchyDecision.domains,
+              routerHierarchyReason: hierarchyDecision.reason,
+              routerHierarchyAllowed: hierarchyDecision.allowed,
+            }
+          : {}),
         ...(semanticRouteDecision
           ? {
               semantic: {
@@ -12453,6 +13041,17 @@ async function maybeHandleNaturalIntentPipeline(params: {
         ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
         ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
         routerEnsembleTop: ensembleTop,
+        ...(typedExtraction
+          ? {
+              routerTypedExtraction: {
+                route: typedExtraction.route,
+                action: typedExtraction.action ?? "",
+                missing: typedExtraction.missing,
+                required: typedExtraction.required,
+                summary: typedExtraction.summary,
+              },
+            }
+          : {}),
         finalHandler: handler.name,
         handled: true,
       });
@@ -12472,6 +13071,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
         memoryRecallCue: hasMemoryRecallCue,
         routeCandidates,
         routeFilterReason: routeFilterDecision?.reason ?? routerLayerDecision?.reason ?? null,
+        routeHierarchyReason: hierarchyDecision?.reason ?? null,
         routeFilterAllowed: routeFilterDecision?.allowed ?? null,
         routeLayers: routerLayerDecision?.layers ?? null,
         routerAbVariant,
@@ -12494,6 +13094,13 @@ async function maybeHandleNaturalIntentPipeline(params: {
         : routerLayerDecision
           ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
           : {}),
+      ...(hierarchyDecision
+        ? {
+            routerHierarchyDomains: hierarchyDecision.domains,
+            routerHierarchyReason: hierarchyDecision.reason,
+            routerHierarchyAllowed: hierarchyDecision.allowed,
+          }
+        : {}),
       ...(semanticRouteDecision
         ? {
             semantic: {
@@ -12533,6 +13140,13 @@ async function maybeHandleNaturalIntentPipeline(params: {
       : routerLayerDecision
         ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
         : {}),
+    ...(hierarchyDecision
+      ? {
+          routerHierarchyDomains: hierarchyDecision.domains,
+          routerHierarchyReason: hierarchyDecision.reason,
+          routerHierarchyAllowed: hierarchyDecision.allowed,
+        }
+      : {}),
     ...(semanticRouteDecision
       ? {
           semantic: {
@@ -17357,6 +17971,8 @@ try {
 }
 
 startOutboxRecoveryWorker();
+startIntentHardNegativeWorker();
+startIntentCanaryGuardWorker();
 
 logInfo("Starting Telegram bot...");
 await bot.start();
