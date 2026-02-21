@@ -16,6 +16,7 @@ type IntentRouteName =
 type SemanticRouteConfig = {
   name: IntentRouteName;
   utterances: string[];
+  negativeUtterances?: string[];
   threshold: number;
 };
 
@@ -281,6 +282,8 @@ const DEFAULT_ROUTES: SemanticRouteConfig[] = [
 
 const DEFAULT_MIN_SCORE_GAP = 0.03;
 const DEFAULT_HYBRID_ALPHA = 0.72;
+const DEFAULT_NEGATIVE_PENALTY_BETA = 0.18;
+const DECISION_CACHE_MAX_ENTRIES = 5000;
 
 function normalizeText(input: string): string {
   return input
@@ -391,19 +394,33 @@ export class IntentSemanticRouter {
   private routes: SemanticRouteConfig[];
   private hybridAlpha: number;
   private minScoreGap: number;
+  private readonly negativePenaltyBeta: number;
   private readonly idfByWordTerm = new Map<string, number>();
   private readonly idfByCharTerm = new Map<string, number>();
   private readonly routeWordVectors = new Map<IntentRouteName, Map<string, number>>();
   private readonly routeCharVectors = new Map<IntentRouteName, Map<string, number>>();
+  private readonly routeNegativeWordVectors = new Map<IntentRouteName, Map<string, number>>();
+  private readonly routeNegativeCharVectors = new Map<IntentRouteName, Map<string, number>>();
+  private readonly decisionCache = new Map<
+    string,
+    {
+      cachedAt: number;
+      decision: SemanticRouteDecision | null;
+    }
+  >();
+  private cacheHits = 0;
+  private cacheMisses = 0;
 
-  constructor(params?: { routes?: SemanticRouteConfig[]; hybridAlpha?: number; minScoreGap?: number }) {
+  constructor(params?: { routes?: SemanticRouteConfig[]; hybridAlpha?: number; minScoreGap?: number; negativePenaltyBeta?: number }) {
     this.routes = (params?.routes ?? DEFAULT_ROUTES).map((route) => ({
       name: route.name,
       threshold: clamp(route.threshold, 0.01, 0.99),
       utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
+      negativeUtterances: (route.negativeUtterances ?? []).map((item) => item.trim()).filter(Boolean),
     }));
     this.hybridAlpha = clamp(params?.hybridAlpha ?? DEFAULT_HYBRID_ALPHA, 0.05, 0.95);
     this.minScoreGap = clamp(params?.minScoreGap ?? DEFAULT_MIN_SCORE_GAP, 0.0, 0.5);
+    this.negativePenaltyBeta = clamp(params?.negativePenaltyBeta ?? DEFAULT_NEGATIVE_PENALTY_BETA, 0, 0.5);
     this.train();
   }
 
@@ -412,6 +429,9 @@ export class IntentSemanticRouter {
     this.idfByCharTerm.clear();
     this.routeWordVectors.clear();
     this.routeCharVectors.clear();
+    this.routeNegativeWordVectors.clear();
+    this.routeNegativeCharVectors.clear();
+    this.decisionCache.clear();
 
     const wordDocs: Array<{ name: IntentRouteName; terms: string[] }> = [];
     const charDocs: Array<{ name: IntentRouteName; terms: string[] }> = [];
@@ -472,9 +492,36 @@ export class IntentSemanticRouter {
       charBuckets.set(doc.name, list);
     }
 
+    const negativeWordBuckets = new Map<IntentRouteName, Array<Map<string, number>>>();
+    const negativeCharBuckets = new Map<IntentRouteName, Array<Map<string, number>>>();
+    for (const route of this.routes) {
+      for (const utterance of route.negativeUtterances ?? []) {
+        const wordTerms = withBigrams(tokenize(utterance));
+        const charTerms = withCharTrigrams(utterance);
+        const wordTf = buildTermFrequency(wordTerms);
+        const charTf = buildTermFrequency(charTerms);
+        const wordVector = new Map<string, number>();
+        const charVector = new Map<string, number>();
+        for (const [term, freq] of wordTf.entries()) {
+          wordVector.set(term, freq * (this.idfByWordTerm.get(term) ?? 1));
+        }
+        for (const [term, freq] of charTf.entries()) {
+          charVector.set(term, freq * (this.idfByCharTerm.get(term) ?? 1));
+        }
+        const wordList = negativeWordBuckets.get(route.name) ?? [];
+        wordList.push(wordVector);
+        negativeWordBuckets.set(route.name, wordList);
+        const charList = negativeCharBuckets.get(route.name) ?? [];
+        charList.push(charVector);
+        negativeCharBuckets.set(route.name, charList);
+      }
+    }
+
     for (const route of this.routes) {
       this.routeWordVectors.set(route.name, this.averageVectors(wordBuckets.get(route.name) ?? []));
       this.routeCharVectors.set(route.name, this.averageVectors(charBuckets.get(route.name) ?? []));
+      this.routeNegativeWordVectors.set(route.name, this.averageVectors(negativeWordBuckets.get(route.name) ?? []));
+      this.routeNegativeCharVectors.set(route.name, this.averageVectors(negativeCharBuckets.get(route.name) ?? []));
     }
   }
 
@@ -531,10 +578,15 @@ export class IntentSemanticRouter {
       }
       const routeWordVector = this.routeWordVectors.get(route.name) ?? new Map<string, number>();
       const routeCharVector = this.routeCharVectors.get(route.name) ?? new Map<string, number>();
+      const routeNegativeWordVector = this.routeNegativeWordVectors.get(route.name) ?? new Map<string, number>();
+      const routeNegativeCharVector = this.routeNegativeCharVectors.get(route.name) ?? new Map<string, number>();
       const wordScore = cosineSimilarity(wordVector, routeWordVector);
       const charScore = cosineSimilarity(charVector, routeCharVector);
+      const negativeWordScore = cosineSimilarity(wordVector, routeNegativeWordVector);
+      const negativeCharScore = cosineSimilarity(charVector, routeNegativeCharVector);
+      const negativePenalty = this.negativePenaltyBeta * (this.hybridAlpha * negativeWordScore + (1 - this.hybridAlpha) * negativeCharScore);
       const boost = boosts[route.name] ?? 0;
-      const hybridScore = clamp(this.hybridAlpha * wordScore + (1 - this.hybridAlpha) * charScore + boost, 0, 1);
+      const hybridScore = clamp(this.hybridAlpha * wordScore + (1 - this.hybridAlpha) * charScore + boost - negativePenalty, 0, 1);
       scored.push({ name: route.name, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
@@ -566,6 +618,19 @@ export class IntentSemanticRouter {
     if (!normalized || normalized.length < 3) {
       return null;
     }
+    const cacheKey = JSON.stringify({
+      text: normalized,
+      allowed: options?.allowed ?? [],
+      boosts: options?.boosts ?? {},
+      topK: options?.topK ?? 3,
+      minGap: options?.minGap ?? this.minScoreGap,
+    });
+    const fromCache = this.decisionCache.get(cacheKey);
+    if (fromCache && Date.now() - fromCache.cachedAt < 5 * 60 * 1000) {
+      this.cacheHits += 1;
+      return fromCache.decision ? { ...fromCache.decision, alternatives: [...fromCache.decision.alternatives] } : null;
+    }
+    this.cacheMisses += 1;
 
     const scored = this.scoreRoutes(normalized, {
       allowed: options?.allowed,
@@ -584,14 +649,16 @@ export class IntentSemanticRouter {
 
     const minGap = typeof options?.minGap === "number" ? options.minGap : this.minScoreGap;
     if (best.score < routeConfig.threshold) {
+      this.setDecisionCache(cacheKey, null);
       return null;
     }
     if (second && best.score - second.score < minGap) {
+      this.setDecisionCache(cacheKey, null);
       return null;
     }
 
     const topK = Math.max(1, Math.min(10, Math.floor(options?.topK ?? 3)));
-    return {
+    const decision = {
       handler: best.name,
       score: Number(best.score.toFixed(4)),
       reason: second
@@ -602,6 +669,21 @@ export class IntentSemanticRouter {
         score: Number(item.score.toFixed(4)),
       })),
     };
+    this.setDecisionCache(cacheKey, decision);
+    return decision;
+  }
+
+  private setDecisionCache(cacheKey: string, decision: SemanticRouteDecision | null): void {
+    if (this.decisionCache.size >= DECISION_CACHE_MAX_ENTRIES) {
+      const firstKey = this.decisionCache.keys().next().value;
+      if (typeof firstKey === "string") {
+        this.decisionCache.delete(firstKey);
+      }
+    }
+    this.decisionCache.set(cacheKey, {
+      cachedAt: Date.now(),
+      decision,
+    });
   }
 
   getRouteThreshold(name: IntentRouteName): number | null {
@@ -630,7 +712,22 @@ export class IntentSemanticRouter {
       name: route.name,
       threshold: route.threshold,
       utterances: [...route.utterances],
+      negativeUtterances: [...(route.negativeUtterances ?? [])],
     }));
+  }
+
+  clearDecisionCache(): void {
+    this.decisionCache.clear();
+    this.cacheHits = 0;
+    this.cacheMisses = 0;
+  }
+
+  getDecisionCacheStats(): { size: number; hits: number; misses: number } {
+    return {
+      size: this.decisionCache.size,
+      hits: this.cacheHits,
+      misses: this.cacheMisses,
+    };
   }
 
   getHybridAlpha(): number {
@@ -663,6 +760,7 @@ export class IntentSemanticRouter {
           name: route.name,
           threshold: clamp(route.threshold, 0.01, 0.99),
           utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
+          negativeUtterances: (route.negativeUtterances ?? []).map((item) => item.trim()).filter(Boolean),
         }))
         .filter((route) => route.utterances.length > 0);
       if (validRoutes.length === 0) {
@@ -739,13 +837,80 @@ export class IntentSemanticRouter {
     let best = { ...current };
     let bestAcc = this.evaluateWithThresholds(labeled, best, minGap);
 
+    // Coordinate descent over quantile-based candidates per route.
+    const routeQuantileCandidates = new Map<string, number[]>();
+    for (const route of this.routes) {
+      const positives: number[] = [];
+      for (const sample of labeled) {
+        if (sample.finalHandler !== route.name) {
+          continue;
+        }
+        const scored = this.scoreRoutes(sample.text);
+        const own = scored.find((item) => item.name === route.name);
+        if (own) {
+          positives.push(own.score);
+        }
+      }
+      const sorted = positives.sort((a, b) => a - b);
+      const quantiles = [0.1, 0.2, 0.3, 0.4, 0.5].map((q) => {
+        if (sorted.length === 0) {
+          return route.threshold;
+        }
+        const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))));
+        return sorted[idx] ?? route.threshold;
+      });
+      const aroundCurrent = [
+        route.threshold - searchRange,
+        route.threshold - searchRange / 2,
+        route.threshold,
+        route.threshold + searchRange / 2,
+        route.threshold + searchRange,
+      ];
+      routeQuantileCandidates.set(
+        route.name,
+        Array.from(
+          new Set(
+            [...quantiles, ...aroundCurrent]
+              .map((item) => round3(clamp(item, minThreshold, maxThreshold)))
+              .filter((item) => Number.isFinite(item)),
+          ),
+        ).sort((a, b) => a - b),
+      );
+    }
+
+    const rounds = Math.max(1, Math.min(8, Math.floor(maxIter / Math.max(1, this.routes.length * 10))));
+    for (let round = 0; round < rounds; round += 1) {
+      let improvedRound = false;
+      for (const route of this.routes) {
+        const candidates = routeQuantileCandidates.get(route.name) ?? [route.threshold];
+        let localBestThreshold = best[route.name] ?? route.threshold;
+        let localBestAccuracy = bestAcc;
+        for (const candidateThreshold of candidates) {
+          const candidate = { ...best, [route.name]: candidateThreshold };
+          const acc = this.evaluateWithThresholds(labeled, candidate, minGap);
+          if (acc > localBestAccuracy) {
+            localBestAccuracy = acc;
+            localBestThreshold = candidateThreshold;
+          }
+        }
+        if (localBestAccuracy > bestAcc) {
+          bestAcc = localBestAccuracy;
+          best = { ...best, [route.name]: localBestThreshold };
+          improvedRound = true;
+        }
+      }
+      if (!improvedRound) {
+        break;
+      }
+    }
+
+    // Random refinement around best solution.
     for (let i = 0; i < maxIter; i += 1) {
       const candidate: Record<string, number> = { ...best };
       for (const route of this.routes) {
         const base = best[route.name] ?? route.threshold;
         const jitter = randomInRange(-searchRange, searchRange);
-        const next = clamp(base + jitter, minThreshold, maxThreshold);
-        candidate[route.name] = next;
+        candidate[route.name] = round3(clamp(base + jitter, minThreshold, maxThreshold));
       }
       const acc = this.evaluateWithThresholds(labeled, candidate, minGap);
       if (acc > bestAcc) {
@@ -770,6 +935,55 @@ export class IntentSemanticRouter {
       beforeThresholds,
       afterThresholds,
     };
+  }
+
+  augmentNegativesFromDataset(samples: IntentRouterDatasetSample[], maxPerRoute = 25): Record<string, number> {
+    const perRoute = new Map<string, Set<string>>();
+    for (const sample of samples) {
+      const expected = (sample.finalHandler ?? "").trim();
+      if (!expected || !KNOWN_ROUTE_NAMES.includes(expected as IntentRouteName)) {
+        continue;
+      }
+      const scored = this.scoreRoutes(sample.text);
+      const predicted = scored[0]?.name;
+      if (!predicted || predicted === expected) {
+        continue;
+      }
+      const normalized = normalizeText(sample.text);
+      if (normalized.length < 6 || normalized.length > 220) {
+        continue;
+      }
+      const bucket = perRoute.get(predicted) ?? new Set<string>();
+      if (bucket.size < maxPerRoute) {
+        bucket.add(normalized);
+      }
+      perRoute.set(predicted, bucket);
+    }
+
+    const addedByRoute: Record<string, number> = {};
+    for (const route of this.routes) {
+      const bucket = perRoute.get(route.name);
+      if (!bucket || bucket.size === 0) {
+        continue;
+      }
+      const currentSet = new Set((route.negativeUtterances ?? []).map((item) => normalizeText(item)));
+      let added = 0;
+      for (const phrase of bucket) {
+        if (currentSet.has(phrase)) {
+          continue;
+        }
+        route.negativeUtterances = [...(route.negativeUtterances ?? []), phrase];
+        currentSet.add(phrase);
+        added += 1;
+      }
+      if (added > 0) {
+        addedByRoute[route.name] = added;
+      }
+    }
+    if (Object.keys(addedByRoute).length > 0) {
+      this.train();
+    }
+    return addedByRoute;
   }
 
   private evaluateWithThresholds(

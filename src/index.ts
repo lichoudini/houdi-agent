@@ -49,6 +49,7 @@ import { DynamicIntentRoutesStore } from "./domains/router/dynamic-routes.js";
 import { rankIntentCandidatesWithEnsemble } from "./domains/router/ensemble.js";
 import { applyIntentRouteLayers, type RouteLayerDecision } from "./domains/router/route-layers.js";
 import { resolveIntentRouterAbVariant } from "./domains/router/ab-routing.js";
+import { RouterVersionStore } from "./domains/router/router-versioning.js";
 import { detectWorkspaceNaturalIntent as detectWorkspaceNaturalIntentDomain } from "./domains/workspace/intents.js";
 import {
   detectSimpleTextExtensionHint as detectSimpleTextExtensionHintDomain,
@@ -128,6 +129,7 @@ const semanticIntentRouter = new IntentSemanticRouter({
 });
 const dynamicIntentRoutes = new DynamicIntentRoutesStore();
 const intentConfidenceCalibrator = new IntentConfidenceCalibrator(10);
+const routerVersionStore = new RouterVersionStore();
 try {
   await semanticIntentRouter.loadFromFile(config.intentRouterRoutesFile, {
     createIfMissing: true,
@@ -151,6 +153,23 @@ try {
   if (!/enoent/i.test(message)) {
     logWarn(`No pude cargar calibración de intent router: ${message}`);
   }
+}
+try {
+  await routerVersionStore.load(config.intentRouterVersionsFile);
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/enoent/i.test(message)) {
+    logWarn(`No pude cargar versiones de intent router: ${message}`);
+  }
+}
+if (!routerVersionStore.getActiveSnapshot()) {
+  routerVersionStore.createSnapshot({
+    label: "bootstrap",
+    routes: semanticIntentRouter.listRoutes(),
+    hybridAlpha: semanticIntentRouter.getHybridAlpha(),
+    minScoreGap: semanticIntentRouter.getMinScoreGap(),
+  });
+  await routerVersionStore.save(config.intentRouterVersionsFile);
 }
 const adminSecurity = new AdminSecurityController({
   approvalTtlMs: config.adminApprovalTtlSeconds * 1000,
@@ -380,6 +399,8 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "intentcalibrate",
   "intentcurate",
   "intentab",
+  "intentversion",
+  "intentcanary",
 ]);
 const workspaceFiles = new WorkspaceFilesService(
   config.workspaceDir,
@@ -958,6 +979,7 @@ type IntentRouterDatasetEntry = {
   semanticCalibratedConfidence?: number;
   semanticGap?: number;
   routerAbVariant?: "A" | "B";
+  routerCanaryVersion?: string;
   routerLayers?: string[];
   routerLayerReason?: string;
   routerEnsembleTop?: Array<{ name: string; score: number }>;
@@ -4346,6 +4368,7 @@ function buildIntentRouterForChat(chatId: number): {
   abVariant: "A" | "B";
   effectiveAlpha: number;
   effectiveMinGap: number;
+  canaryVersionId: string | null;
 } {
   const abVariant = resolveIntentRouterAbVariant(chatId, {
     enabled: config.intentRouterAbEnabled,
@@ -4355,7 +4378,15 @@ function buildIntentRouterForChat(chatId: number): {
     variantBThresholdShift: config.intentRouterAbVariantBThresholdShift,
   });
   const baseRoutes = semanticIntentRouter.listRoutes();
-  const effectiveRoutes = dynamicIntentRoutes.buildEffectiveRoutes(chatId, baseRoutes).map((route) => ({
+  const canaryResolvedRoutes = routerVersionStore.resolveRoutesForChat(chatId, baseRoutes);
+  const canaryStatus = routerVersionStore.getCanaryStatus();
+  const canaryVersionId =
+    canaryStatus.enabled &&
+    canaryStatus.versionId &&
+    Math.abs(chatId) % 100 < canaryStatus.splitPercent
+      ? canaryStatus.versionId
+      : null;
+  const effectiveRoutes = dynamicIntentRoutes.buildEffectiveRoutes(chatId, canaryResolvedRoutes).map((route) => ({
     ...route,
     threshold:
       abVariant === "B"
@@ -4373,6 +4404,7 @@ function buildIntentRouterForChat(chatId: number): {
     abVariant,
     effectiveAlpha,
     effectiveMinGap,
+    canaryVersionId,
   };
 }
 
@@ -4384,6 +4416,58 @@ function shouldRunAiJudgeForEnsemble(decision: SemanticRouteDecision | null): bo
   const second = decision.alternatives[1];
   const gap = top && second ? top.score - second.score : 1;
   return decision.score < 0.74 || gap < 0.06;
+}
+
+async function saveCurrentRouterSnapshot(label: string): Promise<string> {
+  const snapshot = routerVersionStore.createSnapshot({
+    label,
+    routes: semanticIntentRouter.listRoutes(),
+    hybridAlpha: semanticIntentRouter.getHybridAlpha(),
+    minScoreGap: semanticIntentRouter.getMinScoreGap(),
+  });
+  await routerVersionStore.save(config.intentRouterVersionsFile);
+  return snapshot.id;
+}
+
+async function applyRouterSnapshotById(versionId: string): Promise<boolean> {
+  const snapshot = routerVersionStore.rollbackTo(versionId);
+  if (!snapshot) {
+    return false;
+  }
+  const nextRouter = new IntentSemanticRouter({
+    routes: snapshot.routes,
+    hybridAlpha: snapshot.hybridAlpha,
+    minScoreGap: snapshot.minScoreGap,
+  });
+  await nextRouter.saveToFile(config.intentRouterRoutesFile);
+  await semanticIntentRouter.loadFromFile(config.intentRouterRoutesFile, {
+    createIfMissing: true,
+  });
+  await routerVersionStore.save(config.intentRouterVersionsFile);
+  return true;
+}
+
+function buildIntentClarificationQuestion(alternatives: Array<{ name: string; score: number }>): string {
+  const top = alternatives[0]?.name ?? "";
+  const second = alternatives[1]?.name ?? "";
+  const pair = [top, second].filter(Boolean).sort().join("|");
+  if (pair === "document|workspace") {
+    return "Necesito precisión: ¿quieres editar/crear archivo en workspace o solo leer/analizar un documento?";
+  }
+  if (pair === "gmail|web") {
+    return "Necesito precisión: ¿quieres enviar/leer un email o buscar información en la web?";
+  }
+  if (pair === "gmail-recipients|gmail") {
+    return "Necesito precisión: ¿quieres gestionar contactos/destinatarios o enviar/leer correos?";
+  }
+  if (pair === "memory|workspace") {
+    return "Necesito precisión: ¿quieres consultar memoria previa o modificar archivos en workspace?";
+  }
+  const topChoices = alternatives
+    .slice(0, 2)
+    .map((item) => item.name)
+    .join(" / ");
+  return `Estoy entre dos intenciones (${topChoices}). ¿Puedes aclarar en una frase la acción exacta?`;
 }
 
 async function appendIntentRouterDatasetEntry(entry: IntentRouterDatasetEntry): Promise<void> {
@@ -11462,6 +11546,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
   let semanticCalibratedConfidence: number | null = null;
   let semanticGap: number | null = null;
   let routerAbVariant: "A" | "B" = "A";
+  let routerCanaryVersion: string | null = null;
   let routerLayerDecision: RouteLayerDecision | null = null;
   let ensembleTop: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }> = [];
   const routeCandidates = handlers.map((item) => item.name as Exclude<NaturalIntentHandlerName, "none">);
@@ -11497,6 +11582,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
   });
   const chatScopedRouter = buildIntentRouterForChat(params.ctx.chat.id);
   routerAbVariant = chatScopedRouter.abVariant;
+  routerCanaryVersion = chatScopedRouter.canaryVersionId;
 
   semanticRouteDecision = chatScopedRouter.router.route(params.text, {
     allowed: semanticAllowedCandidates as IntentRouteName[],
@@ -11535,6 +11621,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
         alternatives: semanticRouteDecision.alternatives,
         boosts: routeScoreBoosts,
         routerAbVariant,
+        routerCanaryVersion,
         alpha: chatScopedRouter.effectiveAlpha,
         minGap: chatScopedRouter.effectiveMinGap,
         textPreview: truncateInline(params.text, 220),
@@ -11551,6 +11638,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
         selected: aiRouteDecision.handler,
         ...(aiRouteDecision.reason ? { reason: aiRouteDecision.reason } : {}),
         routerAbVariant,
+        routerCanaryVersion,
         textPreview: truncateInline(params.text, 220),
       },
     });
@@ -11587,13 +11675,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
     typeof semanticGap === "number" &&
     semanticGap < 0.07
   ) {
-    const topChoices = semanticRouteDecision.alternatives
-      .slice(0, 2)
-      .map((item) => item.name)
-      .join(" / ");
-    await params.ctx.reply(
-      `Estoy entre dos intenciones (${topChoices}). ¿Puedes aclarar en una frase si es Gmail, workspace, web, memoria u otra acción?`,
-    );
+    await params.ctx.reply(buildIntentClarificationQuestion(semanticRouteDecision.alternatives));
     await appendIntentRouterDatasetEntry({
       ts: new Date().toISOString(),
       chatId: params.ctx.chat.id,
@@ -11623,6 +11705,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
       semanticCalibratedConfidence,
       semanticGap,
       routerAbVariant,
+      ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
       ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
       routerEnsembleTop: ensembleTop,
       finalHandler: "none",
@@ -11652,6 +11735,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
           semanticCalibratedConfidence,
           semanticGap,
           routerAbVariant,
+          routerCanaryVersion,
           ensembleTop,
           aiRouterSelected: aiRouteDecision?.handler ?? null,
           textPreview: truncateInline(params.text, 220),
@@ -11688,6 +11772,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
         semanticCalibratedConfidence: semanticCalibratedConfidence ?? undefined,
         semanticGap: semanticGap ?? undefined,
         routerAbVariant,
+        ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
         ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
         routerEnsembleTop: ensembleTop,
         finalHandler: handler.name,
@@ -11712,6 +11797,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
         routeFilterAllowed: routeFilterDecision?.allowed ?? null,
         routeLayers: routerLayerDecision?.layers ?? null,
         routerAbVariant,
+        routerCanaryVersion,
         ensembleTop,
         textPreview: truncateInline(params.text, 220),
       },
@@ -11747,6 +11833,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
       semanticCalibratedConfidence: semanticCalibratedConfidence ?? undefined,
       semanticGap: semanticGap ?? undefined,
       routerAbVariant,
+      ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
       ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
       routerEnsembleTop: ensembleTop,
       finalHandler: "indexed-list-reference",
@@ -11785,6 +11872,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
     semanticCalibratedConfidence: semanticCalibratedConfidence ?? undefined,
     semanticGap: semanticGap ?? undefined,
     routerAbVariant,
+    ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
     ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
     routerEnsembleTop: ensembleTop,
     finalHandler: "none",
@@ -11884,6 +11972,8 @@ bot.command("help", async (ctx) => {
       "/intentcalibrate [n] - Reentrena calibración de confianza por bins",
       "/intentcurate [n] [apply] - Sugiere/promueve utterances desde errores",
       "/intentab - Estado de experimento A/B del router",
+      "/intentversion [list|save [label]|rollback <id>] - Versionado/rollback de rutas",
+      "/intentcanary [status|set <id> <pct>|off] - Canary rollout de versión de router",
       "Enviar nota de voz/audio - Se transcribe y se responde con IA",
       "Enviar archivo (document) - Se guarda en workspace/files/...",
       "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
@@ -12036,8 +12126,10 @@ bot.command("status", async (ctx) => {
       `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
       `Intent router: routes=${semanticIntentRouter.listRoutes().length} | alpha=${semanticIntentRouter.getHybridAlpha().toFixed(2)} | minGap=${semanticIntentRouter.getMinScoreGap().toFixed(3)} | file=${toProjectRelativePath(config.intentRouterRoutesFile)}`,
+      `Intent router versions: file=${toProjectRelativePath(config.intentRouterVersionsFile)} | snapshots=${routerVersionStore.listSnapshots().length} | active=${routerVersionStore.getActiveSnapshot()?.id ?? "n/a"}`,
       `Intent router chat-routes: chats=${dynamicIntentRoutes.listChatIds().length} | file=${toProjectRelativePath(config.intentRouterChatRoutesFile)}`,
       `Intent router calibration: file=${toProjectRelativePath(config.intentRouterCalibrationFile)} | ab=${config.intentRouterAbEnabled ? `on (split=${config.intentRouterAbSplitPercent}%)` : "off"}`,
+      `Intent router cache: ${JSON.stringify(semanticIntentRouter.getDecisionCacheStats())}`,
       `Lector docs: maxFile=${Math.round(config.docMaxFileBytes / (1024 * 1024))}MB | maxText=${config.docMaxTextChars} chars`,
       `Web browse: ${config.enableWebBrowse ? `on (max results ${config.webSearchMaxResults})` : "off"}`,
       `Gmail account: ${gmailSummary}`,
@@ -12083,6 +12175,7 @@ bot.command("intentroutes", async (ctx) => {
     const lines = [
       "Intent router routes",
       `file: ${toProjectRelativePath(config.intentRouterRoutesFile)}`,
+      `versions: ${toProjectRelativePath(config.intentRouterVersionsFile)}`,
       `chat-routes: ${toProjectRelativePath(config.intentRouterChatRoutesFile)}`,
       `alpha: ${semanticIntentRouter.getHybridAlpha().toFixed(3)}`,
       `minGap: ${semanticIntentRouter.getMinScoreGap().toFixed(3)}`,
@@ -12092,7 +12185,7 @@ bot.command("intentroutes", async (ctx) => {
       "",
       ...effective.map(
         (route) =>
-          `- ${route.name} | threshold=${route.threshold.toFixed(3)} | utterances=${route.utterances.length}`,
+          `- ${route.name} | threshold=${route.threshold.toFixed(3)} | utterances=${route.utterances.length} | negatives=${route.negativeUtterances?.length ?? 0}`,
       ),
     ];
     await replyLong(ctx, lines.join("\n"));
@@ -12131,11 +12224,21 @@ bot.command("intentreload", async (ctx) => {
         logWarn(`No pude recargar calibración: ${message}`);
       }
     }
+    try {
+      await routerVersionStore.load(config.intentRouterVersionsFile);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/enoent/i.test(message)) {
+        logWarn(`No pude recargar versiones de router: ${message}`);
+      }
+    }
+    semanticIntentRouter.clearDecisionCache();
     const routes = semanticIntentRouter.listRoutes();
     await ctx.reply(
       [
         "Intent router recargado.",
         `file: ${toProjectRelativePath(config.intentRouterRoutesFile)}`,
+        `versions: ${toProjectRelativePath(config.intentRouterVersionsFile)}`,
         `chat-routes: ${toProjectRelativePath(config.intentRouterChatRoutesFile)}`,
         `calibration: ${toProjectRelativePath(config.intentRouterCalibrationFile)}`,
         `alpha: ${semanticIntentRouter.getHybridAlpha().toFixed(3)}`,
@@ -12188,7 +12291,9 @@ bot.command("intentfit", async (ctx) => {
     const fitResult: FitResult = semanticIntentRouter.fitThresholdsFromDataset(labeled, {
       maxIter,
     });
+    const negativesAdded = semanticIntentRouter.augmentNegativesFromDataset(labeled, 20);
     await semanticIntentRouter.saveToFile(config.intentRouterRoutesFile);
+    const versionId = await saveCurrentRouterSnapshot(`fit-${new Date().toISOString()}`);
 
     const changedRoutes = Object.keys(fitResult.afterThresholds)
       .filter((name) => fitResult.beforeThresholds[name] !== fitResult.afterThresholds[name])
@@ -12211,6 +12316,8 @@ bot.command("intentfit", async (ctx) => {
         `accuracy before: ${(fitResult.beforeAccuracy * 100).toFixed(2)}%`,
         `accuracy after: ${(fitResult.afterAccuracy * 100).toFixed(2)}%`,
         `improved: ${fitResult.improved ? "sí" : "no"}`,
+        `negatives_added: ${Object.keys(negativesAdded).length === 0 ? "0" : JSON.stringify(negativesAdded)}`,
+        `version_id: ${versionId}`,
         ...thresholdLines,
       ].join("\n"),
     );
@@ -12225,6 +12332,8 @@ bot.command("intentfit", async (ctx) => {
         beforeAccuracy: Number(fitResult.beforeAccuracy.toFixed(4)),
         afterAccuracy: Number(fitResult.afterAccuracy.toFixed(4)),
         improved: fitResult.improved,
+        negativesAdded,
+        versionId,
         changedRoutes,
       },
     });
@@ -12376,6 +12485,114 @@ bot.command("intentab", async (ctx) => {
       `variant_B_threshold_shift: ${config.intentRouterAbVariantBThresholdShift.toFixed(3)}`,
     ].join("\n"),
   );
+});
+
+bot.command("intentversion", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim();
+  const [subRaw, ...rest] = raw.split(/\s+/).filter(Boolean);
+  const sub = (subRaw ?? "list").toLowerCase();
+
+  if (!raw || sub === "list" || sub === "status") {
+    const snapshots = routerVersionStore.listSnapshots().slice(0, 12);
+    const active = routerVersionStore.getActiveSnapshot()?.id ?? "n/a";
+    const canary = routerVersionStore.getCanaryStatus();
+    const lines = [
+      "Intent router versions",
+      `file: ${toProjectRelativePath(config.intentRouterVersionsFile)}`,
+      `active: ${active}`,
+      `canary: ${canary.enabled ? `on (${canary.versionId ?? "n/a"} @ ${canary.splitPercent}%)` : "off"}`,
+      `snapshots: ${snapshots.length}`,
+      "",
+      ...snapshots.map((item) => `- ${item.id} | ${item.createdAt} | ${item.label} | routes=${item.routes.length}`),
+    ];
+    await replyLong(ctx, lines.join("\n"));
+    return;
+  }
+
+  if (sub === "save") {
+    const label = rest.join(" ").trim() || `manual-${new Date().toISOString()}`;
+    const versionId = await saveCurrentRouterSnapshot(label);
+    await ctx.reply(`Snapshot guardado.\nid: ${versionId}\nlabel: ${label}`);
+    return;
+  }
+
+  if (sub === "rollback") {
+    const versionId = rest[0]?.trim() ?? "";
+    if (!versionId) {
+      await ctx.reply("Uso: /intentversion rollback <version_id>");
+      return;
+    }
+    const ok = await applyRouterSnapshotById(versionId);
+    if (!ok) {
+      await ctx.reply(`No encontré versión: ${versionId}`);
+      return;
+    }
+    await ctx.reply(`Rollback aplicado a ${versionId}.`);
+    await safeAudit({
+      type: "intent.router.rollback",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: { versionId },
+    });
+    return;
+  }
+
+  await ctx.reply("Uso: /intentversion [list|save [label]|rollback <id>]");
+});
+
+bot.command("intentcanary", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim();
+  const [subRaw, vRaw, pctRaw] = raw.split(/\s+/).filter(Boolean);
+  const sub = (subRaw ?? "status").toLowerCase();
+
+  if (!raw || sub === "status") {
+    const canary = routerVersionStore.getCanaryStatus();
+    await ctx.reply(
+      [
+        "Intent router canary",
+        `enabled: ${canary.enabled ? "sí" : "no"}`,
+        `version: ${canary.versionId ?? "n/a"}`,
+        `split: ${canary.splitPercent}%`,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (sub === "off" || sub === "disable") {
+    routerVersionStore.disableCanary();
+    await routerVersionStore.save(config.intentRouterVersionsFile);
+    await ctx.reply("Canary desactivado.");
+    return;
+  }
+
+  if (sub === "set") {
+    const versionId = (vRaw ?? "").trim();
+    const parsedPct = Number.parseInt(pctRaw ?? "", 10);
+    const splitPercent = Number.isFinite(parsedPct) ? Math.max(1, Math.min(100, parsedPct)) : NaN;
+    if (!versionId || !Number.isFinite(splitPercent)) {
+      await ctx.reply("Uso: /intentcanary set <version_id> <split_percent>");
+      return;
+    }
+    const ok = routerVersionStore.setCanary(versionId, splitPercent);
+    if (!ok) {
+      await ctx.reply(`No encontré versión: ${versionId}`);
+      return;
+    }
+    await routerVersionStore.save(config.intentRouterVersionsFile);
+    await ctx.reply(`Canary activado.\nversion: ${versionId}\nsplit: ${splitPercent}%`);
+    await safeAudit({
+      type: "intent.router.canary",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        versionId,
+        splitPercent,
+      },
+    });
+    return;
+  }
+
+  await ctx.reply("Uso: /intentcanary [status|set <id> <pct>|off]");
 });
 
 bot.command("agent", async (ctx) => {

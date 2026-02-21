@@ -16,6 +16,9 @@ type RouteStats = {
   matchedFinal: number;
   matchedSemantic: number;
   scoreTotal: number;
+  tp: number;
+  fp: number;
+  fn: number;
 };
 
 async function readDataset(filePath: string, limit: number): Promise<DatasetEntry[]> {
@@ -65,7 +68,7 @@ async function main(): Promise<void> {
   } catch {
     // fallback to defaults
   }
-  const routes = router.listRouteThresholds().map((item) => item.name);
+  const routes = router.listRouteThresholds().map((item) => item.name as string);
   const stats = new Map<string, RouteStats>();
   for (const route of routes) {
     stats.set(route, {
@@ -73,8 +76,12 @@ async function main(): Promise<void> {
       matchedFinal: 0,
       matchedSemantic: 0,
       scoreTotal: 0,
+      tp: 0,
+      fp: 0,
+      fn: 0,
     });
   }
+  const confusion = new Map<string, Map<string, number>>();
 
   let entries: DatasetEntry[] = [];
   try {
@@ -113,6 +120,20 @@ async function main(): Promise<void> {
     if (entry.semantic?.handler && decision.handler === entry.semantic.handler) {
       routeStats.matchedSemantic += 1;
     }
+    if (entry.finalHandler && routes.includes(entry.finalHandler)) {
+      if (decision.handler === entry.finalHandler) {
+        routeStats.tp += 1;
+      } else {
+        routeStats.fp += 1;
+        const expectedStats = stats.get(entry.finalHandler);
+        if (expectedStats) {
+          expectedStats.fn += 1;
+        }
+        const row = confusion.get(entry.finalHandler) ?? new Map<string, number>();
+        row.set(decision.handler, (row.get(decision.handler) ?? 0) + 1);
+        confusion.set(entry.finalHandler, row);
+      }
+    }
   }
 
   const lines: string[] = [];
@@ -120,6 +141,8 @@ async function main(): Promise<void> {
   lines.push(`dataset: ${datasetPath}`);
   lines.push(`muestras: ${entries.length}`);
   lines.push(`accuracy_global: ${(globalAcc * 100).toFixed(2)}%`);
+  let f1MacroSum = 0;
+  let f1MacroCount = 0;
   lines.push("");
 
   for (const route of routes) {
@@ -128,15 +151,44 @@ async function main(): Promise<void> {
       continue;
     }
     const avgScore = routeStats.scoreTotal / routeStats.evaluated;
+    const precision = routeStats.tp + routeStats.fp > 0 ? routeStats.tp / (routeStats.tp + routeStats.fp) : 0;
+    const recall = routeStats.tp + routeStats.fn > 0 ? routeStats.tp / (routeStats.tp + routeStats.fn) : 0;
+    const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+    if (routeStats.evaluated > 0) {
+      f1MacroSum += f1;
+      f1MacroCount += 1;
+    }
     lines.push(
       [
         `${route}`,
         `evaluadas=${routeStats.evaluated}`,
         `match_final=${formatPct(routeStats.matchedFinal, routeStats.evaluated)}`,
         `match_semantic=${formatPct(routeStats.matchedSemantic, routeStats.evaluated)}`,
+        `precision=${(precision * 100).toFixed(1)}%`,
+        `recall=${(recall * 100).toFixed(1)}%`,
+        `f1=${(f1 * 100).toFixed(1)}%`,
         `score_prom=${avgScore.toFixed(3)}`,
       ].join(" | "),
     );
+  }
+  lines.push("");
+  lines.push(`f1_macro: ${f1MacroCount > 0 ? ((f1MacroSum / f1MacroCount) * 100).toFixed(2) : "0.00"}%`);
+
+  const topConfusions = Array.from(confusion.entries())
+    .flatMap(([expected, byPredicted]) =>
+      Array.from(byPredicted.entries()).map(([predicted, count]) => ({
+        expected,
+        predicted,
+        count,
+      })),
+    )
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+  if (topConfusions.length > 0) {
+    lines.push("top_confusions:");
+    for (const item of topConfusions) {
+      lines.push(`- expected=${item.expected} predicted=${item.predicted} n=${item.count}`);
+    }
   }
 
   console.log(lines.join("\n"));

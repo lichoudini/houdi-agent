@@ -22,6 +22,7 @@ function mergeRoutes(base: SemanticRouteConfig[], override: SemanticRouteConfig[
     name: route.name,
     threshold: route.threshold,
     utterances: [...route.utterances],
+    negativeUtterances: [...(route.negativeUtterances ?? [])],
   }));
 }
 
@@ -37,6 +38,7 @@ export class DynamicIntentRoutesStore {
       name: route.name,
       threshold: route.threshold,
       utterances: [...route.utterances],
+      negativeUtterances: [...(route.negativeUtterances ?? [])],
     }));
   }
 
@@ -51,6 +53,7 @@ export class DynamicIntentRoutesStore {
         name: route.name,
         threshold: route.threshold,
         utterances: [...route.utterances],
+        negativeUtterances: [...(route.negativeUtterances ?? [])],
       }));
     }
     return mergeRoutes(baseRoutes, override);
@@ -107,6 +110,7 @@ export class DynamicIntentRoutesStore {
           name: route.name as IntentRouteName,
           threshold: Math.max(0.01, Math.min(0.99, Number(route.threshold) || 0.25)),
           utterances: route.utterances.map((item) => String(item).trim()).filter(Boolean),
+          negativeUtterances: (route.negativeUtterances ?? []).map((item) => String(item).trim()).filter(Boolean),
         }))
         .filter((route) => route.utterances.length > 0);
       if (routes.length === 0) {
@@ -131,6 +135,7 @@ export class DynamicIntentRoutesStore {
           name: route.name,
           threshold: route.threshold,
           utterances: [...route.utterances],
+          negativeUtterances: [...(route.negativeUtterances ?? [])],
         })),
       })),
     };

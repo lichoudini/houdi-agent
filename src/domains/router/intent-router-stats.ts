@@ -25,6 +25,7 @@ export type IntentRouterDatasetEntry = {
   semanticCalibratedConfidence?: number;
   semanticGap?: number;
   routerAbVariant?: "A" | "B";
+  routerCanaryVersion?: string;
   routerLayers?: string[];
   routerLayerReason?: string;
   routerEnsembleTop?: Array<{ name: string; score: number }>;
@@ -175,6 +176,7 @@ export async function buildIntentRouterStatsReport(params: {
   let semanticHit = 0;
   const confusion = new Map<string, Map<string, number>>();
   const byVariant = new Map<string, { total: number; hit: number }>();
+  const byCanaryVersion = new Map<string, { total: number; hit: number }>();
   for (const entry of entries) {
     if ((entry.routeFilterAllowed?.length ?? 0) > 0 && (entry.routeFilterAllowed?.length ?? 0) < entry.routeCandidates.length) {
       filteredCount += 1;
@@ -186,6 +188,14 @@ export async function buildIntentRouterStatsReport(params: {
         variantStats.hit += 1;
       }
       byVariant.set(entry.routerAbVariant, variantStats);
+    }
+    if (entry.routerCanaryVersion) {
+      const canaryStats = byCanaryVersion.get(entry.routerCanaryVersion) ?? { total: 0, hit: 0 };
+      canaryStats.total += 1;
+      if (entry.semantic && entry.semantic.handler === entry.finalHandler) {
+        canaryStats.hit += 1;
+      }
+      byCanaryVersion.set(entry.routerCanaryVersion, canaryStats);
     }
     if (!entry.semantic) {
       continue;
@@ -217,6 +227,12 @@ export async function buildIntentRouterStatsReport(params: {
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([name, stats]) => `${name}=${stats.total > 0 ? ((stats.hit / stats.total) * 100).toFixed(2) : "0.00"}% (${stats.hit}/${stats.total})`);
     lines.push(`ab_variants: ${chunks.join(" | ")}`);
+  }
+  if (byCanaryVersion.size > 0) {
+    const chunks = Array.from(byCanaryVersion.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([name, stats]) => `${name}=${stats.total > 0 ? ((stats.hit / stats.total) * 100).toFixed(2) : "0.00"}% (${stats.hit}/${stats.total})`);
+    lines.push(`canary_versions: ${chunks.join(" | ")}`);
   }
   lines.push("");
   lines.push("Por ruta:");

@@ -100,6 +100,7 @@ cp .env.example .env
 - `HOUDI_SCHEDULE_POLL_MS` (default: `15000`)
 - `HOUDI_INTENT_ROUTER_DATASET_FILE` (default: `./houdi-intent-router-dataset.jsonl`)
 - `HOUDI_INTENT_ROUTER_ROUTES_FILE` (default: `./workspace/state/intent-routes.json`)
+- `HOUDI_INTENT_ROUTER_VERSIONS_FILE` (default: `./workspace/state/intent-router-versions.json`)
 - `HOUDI_INTENT_ROUTER_CHAT_ROUTES_FILE` (default: `./workspace/state/intent-routes-by-chat.json`)
 - `HOUDI_INTENT_ROUTER_CALIBRATION_FILE` (default: `./workspace/state/intent-calibration.json`)
 - `HOUDI_INTENT_ROUTER_HYBRID_ALPHA` (default: `0.72`, balance léxico vs char n-gram)
@@ -213,6 +214,8 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/intentcalibrate [n]`
 - `/intentcurate [n] [apply]`
 - `/intentab`
+- `/intentversion [list|save [label]|rollback <id>]`
+- `/intentcanary [status|set <id> <pct>|off]`
 - `/safe on|off|status`
 - `/shell <instrucción>`
 - `/shellmode on|off`
