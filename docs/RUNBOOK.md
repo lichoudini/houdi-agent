@@ -42,11 +42,15 @@ Alternativa desde Telegram:
 2. `/doctor`
 3. `/usage`
 4. `/domains`
-5. `/agent`
-6. `/adminmode on`
-7. `/exec date` -> debe pedir aprobación
-8. `/approve <id>`
-9. `/reboot status`
+5. `/policy`
+6. `/agenticcanary status`
+7. Probar acción sensible y confirmar con `/confirm <plan_id>`
+8. `/outbox status`
+9. `/agent`
+10. `/adminmode on`
+11. `/exec date` -> debe pedir aprobación
+12. `/approve <id>`
+13. `/reboot status`
 
 ## 6. Incidentes frecuentes
 - Bot no responde:

@@ -54,6 +54,11 @@
 - `src/domains/domain-registry.ts`
   - Registro explícito de dominios cargados (router/workspace/gmail)
   - Inventario de capacidades por dominio (`/domains`)
+- `src/agent-policy.ts`
+  - Política declarativa de capacidades sensibles (`preview`, `approval`, `safe-block`)
+  - Config por archivo (`HOUDI_AGENT_POLICY_FILE`)
+- `src/agentic-canary.ts`
+  - Rollout determinista por chat para controles agénticos (`/agenticcanary`)
 - `src/selfskill-drafts.ts`
   - Borrador persistente de habilidades en múltiples mensajes por chat
   - Soporte start/add/show/apply/cancel
@@ -76,8 +81,12 @@
   - Healthchecks operativos de runtime/config/permisos (`/doctor`)
 - `src/openai-usage.ts`
   - Agregación de tokens y costo estimado por modelo/fuente (`/usage`, `/status`)
+- `src/run-trace.ts`
+  - Trazas por ejecución con `run_id` y métricas de duración/estado
 - `src/single-instance-lock.ts`
   - Bloqueo de instancia única para evitar conflicto de polling
+- `src/sqlite-state-store.ts`
+  - Cola durable de outbox para respuestas fallidas y reintentos (`/outbox`)
 
 ## Flujo de ejecución
 1. Mensaje llega por Telegram.

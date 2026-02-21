@@ -119,6 +119,8 @@ cp .env.example .env
 - `HOUDI_SUGGESTIONS_MIN_INTERVAL_MINUTES` (default: `90`)
 - `HOUDI_SUGGESTIONS_MIN_OBSERVATIONS` (default: `10`)
 - `HOUDI_SUGGESTIONS_POLL_MS` (default: `600000`)
+- `HOUDI_AGENT_POLICY_FILE` (default: `./workspace/state/agent-policy.json`)
+- `HOUDI_AGENTIC_CANARY_PERCENT` (default: `100`, rollout por chat de controles agénticos)
 - `OPENAI_API_KEY` (opcional, necesaria para `/ask`)
 - `OPENAI_MODEL` (default: `gpt-4o-mini`)
 - `OPENAI_MAX_OUTPUT_TOKENS` (default: `800`)
@@ -183,6 +185,8 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/usage [topN|reset]`
 - `/model [show|list|set <modelo>|reset]`
 - `/domains`
+- `/policy`
+- `/agenticcanary [status|<0-100>]`
 - `/agent`
 - `/agent set <nombre>`
 - `/ask <pregunta>`
@@ -228,6 +232,9 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/approvals`
 - `/approve <id>`
 - `/deny <id>`
+- `/confirm <plan_id>`
+- `/cancelplan <plan_id>`
+- `/outbox [status|flush]`
 - `/panic on|off|status`
 - `/tasks`
 - `/kill <taskId>`
@@ -240,6 +247,7 @@ También puedes enviar nota de voz/audio: el bot lo transcribe y responde sobre 
 Si envías un archivo por Telegram (document), lo guarda automáticamente en `workspace/files/...`.
 Si envías una imagen/foto, la guarda en `workspace/images/...` y además puede analizarla con OpenAI Vision.
 También puedes pedir en lenguaje natural operaciones sobre `workspace` (listar, crear carpeta, crear archivo simple, mover, renombrar, eliminar y enviar archivos).
+Para acciones sensibles (exec, send de Gmail y borrado en workspace), puede requerir `Plan Preview` y confirmación explícita con `/confirm`.
 
 ## Seleccion de modelo OpenAI por chat
 

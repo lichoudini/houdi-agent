@@ -27,7 +27,10 @@ import { OpenAiService } from "./openai-client.js";
 import { formatDoctorReport, runDoctor } from "./doctor.js";
 import { OpenMeteoApiTool } from "./open-meteo-api.js";
 import { formatUsd as formatUsageUsd } from "./openai-usage.js";
+import { AgenticCanary } from "./agentic-canary.js";
+import { AgentPolicyEngine, type AgentCapability } from "./agent-policy.js";
 import { RedditApiTool, type RedditPostResult } from "./reddit-api.js";
+import { finishRunTrace, startRunTrace } from "./run-trace.js";
 import { type SavedEmailRecipient, EmailRecipientsSqliteService } from "./email-recipients-sqlite.js";
 import { ScheduledTaskSqliteService } from "./scheduled-tasks-sqlite.js";
 import { GmailRecipientsManager, isValidEmailAddress, normalizeRecipientEmail, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
@@ -201,6 +204,9 @@ const observability = new ObservabilityService();
 const sqliteState = new SqliteStateStore(config.stateDbFile);
 await sqliteState.init();
 const idempotency = new RequestIdempotencyService(sqliteState, config.idempotencyTtlMs);
+const policyEngine = new AgentPolicyEngine(config.agentPolicyFile);
+await policyEngine.load();
+const agenticCanary = new AgenticCanary(config.agenticCanaryPercent);
 const domainRegistry = new DomainRegistry();
 domainRegistry.register({
   id: "router",
@@ -308,9 +314,21 @@ type WorkspaceClipboardState = {
   source: string;
   selector?: WorkspaceNameSelector;
 };
+type PlannedActionKind = "exec" | "gmail-send" | "workspace-delete";
+type PendingPlannedAction = {
+  id: string;
+  kind: PlannedActionKind;
+  chatId: number;
+  userId?: number;
+  requestedAtMs: number;
+  expiresAtMs: number;
+  summary: string;
+  payload: Record<string, unknown>;
+};
 const pendingWorkspaceDeleteByChat = new Map<number, PendingWorkspaceDeleteConfirmation>();
 const pendingWorkspaceDeletePathByChat = new Map<number, PendingWorkspaceDeletePathRequest>();
 const workspaceClipboardByChat = new Map<number, WorkspaceClipboardState>();
+const pendingPlannedActionsById = new Map<string, PendingPlannedAction>();
 const lastTaskActivityByChat = new Map<number, { text: string; atMs: number }>();
 type StoicSmalltalkSession = {
   expiresAtMs: number;
@@ -334,6 +352,7 @@ const RECENT_CONVERSATION_TURN_LIMIT = 40;
 const NATURAL_INTENT_ROUTER_MIN_TEXT_CHARS = 12;
 const AI_SEQUENCE_ROUTER_MAX_STEPS = 6;
 const WORKSPACE_DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
+const PLANNED_ACTION_TTL_MS = 5 * 60 * 1000;
 const WORKSPACE_DELETE_PATH_PROMPT_TTL_MS = 5 * 60 * 1000;
 const INDEXED_LIST_CONTEXT_TTL_MS = 2 * 60 * 60 * 1000;
 const INDEXED_LIST_ACTION_MAX_ITEMS = 5;
@@ -376,6 +395,11 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "version",
   "model",
   "status",
+  "doctor",
+  "usage",
+  "domains",
+  "policy",
+  "agenticcanary",
   "agent",
   "tasks",
   "kill",
@@ -413,6 +437,9 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "approvals",
   "approve",
   "deny",
+  "confirm",
+  "cancelplan",
+  "outbox",
   "panic",
   "intentstats",
   "intentfit",
@@ -6019,6 +6046,185 @@ async function safeAudit(event: {
   }
 }
 
+function isAgenticCanaryEnabled(chatId: number, feature = "agentic-controls"): boolean {
+  return agenticCanary.isEnabledForChat(chatId, feature);
+}
+
+function getPolicyCapabilityBlockReason(chatId: number, capability: AgentCapability): string | null {
+  if (isSafeModeEnabled(chatId) && policyEngine.isBlockedInSafeMode(capability)) {
+    return `Bloqueado por SAFE mode para capacidad ${capability}.`;
+  }
+  return null;
+}
+
+function purgeExpiredPlannedActions(): void {
+  const now = Date.now();
+  for (const [id, item] of pendingPlannedActionsById.entries()) {
+    if (item.expiresAtMs <= now) {
+      pendingPlannedActionsById.delete(id);
+    }
+  }
+}
+
+function randomPlannedActionId(): string {
+  return Math.floor(Math.random() * 1_000_000)
+    .toString()
+    .padStart(6, "0");
+}
+
+function createPlannedAction(params: {
+  kind: PlannedActionKind;
+  chatId: number;
+  userId?: number;
+  summary: string;
+  payload: Record<string, unknown>;
+}): PendingPlannedAction {
+  purgeExpiredPlannedActions();
+  let id = "";
+  for (let i = 0; i < 30; i += 1) {
+    id = randomPlannedActionId();
+    if (!pendingPlannedActionsById.has(id)) {
+      break;
+    }
+  }
+  if (!id || pendingPlannedActionsById.has(id)) {
+    throw new Error("No pude generar ID para acción planificada.");
+  }
+  const now = Date.now();
+  const item: PendingPlannedAction = {
+    id,
+    kind: params.kind,
+    chatId: params.chatId,
+    userId: params.userId,
+    requestedAtMs: now,
+    expiresAtMs: now + PLANNED_ACTION_TTL_MS,
+    summary: truncateInline(params.summary, 1000),
+    payload: params.payload,
+  };
+  pendingPlannedActionsById.set(id, item);
+  return item;
+}
+
+function consumePlannedAction(id: string, chatId: number): PendingPlannedAction | null {
+  purgeExpiredPlannedActions();
+  const item = pendingPlannedActionsById.get(id.trim());
+  if (!item || item.chatId !== chatId) {
+    return null;
+  }
+  pendingPlannedActionsById.delete(item.id);
+  return item;
+}
+
+function denyPlannedAction(id: string, chatId: number): PendingPlannedAction | null {
+  purgeExpiredPlannedActions();
+  const item = pendingPlannedActionsById.get(id.trim());
+  if (!item || item.chatId !== chatId) {
+    return null;
+  }
+  pendingPlannedActionsById.delete(item.id);
+  return item;
+}
+
+function plannedActionRemainingSeconds(item: PendingPlannedAction): number {
+  return Math.max(0, Math.round((item.expiresAtMs - Date.now()) / 1000));
+}
+
+async function maybeRequirePlannedConfirmation(params: {
+  ctx: ChatReplyContext;
+  kind: PlannedActionKind;
+  capability: AgentCapability;
+  summary: string;
+  payload: Record<string, unknown>;
+  source: string;
+  userId?: number;
+}): Promise<boolean> {
+  const canaryEnabled = isAgenticCanaryEnabled(params.ctx.chat.id, "plan-preview");
+  if (!canaryEnabled || !policyEngine.isPreviewRequired(params.capability)) {
+    return false;
+  }
+  const planned = createPlannedAction({
+    kind: params.kind,
+    chatId: params.ctx.chat.id,
+    userId: params.userId,
+    summary: params.summary,
+    payload: params.payload,
+  });
+  await reliableReply(
+    params.ctx,
+    [
+      "Plan Preview (acción sensible):",
+      planned.summary,
+      `plan_id: ${planned.id}`,
+      `expira en: ${plannedActionRemainingSeconds(planned)}s`,
+      "Confirma con /confirm <plan_id> o cancela con /cancelplan <plan_id>.",
+    ].join("\n"),
+    { source: params.source },
+  );
+  await safeAudit({
+    type: "plan.preview.created",
+    chatId: params.ctx.chat.id,
+    userId: params.userId,
+    details: {
+      planId: planned.id,
+      kind: planned.kind,
+      capability: params.capability,
+      summary: truncateInline(params.summary, 300),
+      source: params.source,
+    },
+  });
+  return true;
+}
+
+async function reliableReply(
+  ctx: ChatReplyContext,
+  text: string,
+  options?: {
+    source?: string;
+    allowOutbox?: boolean;
+  },
+): Promise<void> {
+  try {
+    await ctx.reply(text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const allowOutbox = options?.allowOutbox ?? true;
+    if (allowOutbox) {
+      try {
+        sqliteState.enqueueOutboxMessage({
+          chatId: ctx.chat.id,
+          text,
+          source: options?.source ?? "reply",
+          createdAtMs: Date.now(),
+          attempts: 1,
+          lastError: truncateInline(message, 300),
+        });
+      } catch (enqueueError) {
+        const enqueueMessage = enqueueError instanceof Error ? enqueueError.message : String(enqueueError);
+        logWarn(`No pude encolar outbox: ${enqueueMessage}`);
+      }
+    }
+    throw error;
+  }
+}
+
+async function flushOutboxForChat(ctx: ChatReplyContext, maxItems = 10): Promise<{ delivered: number; pending: number }> {
+  const list = sqliteState.listOutboxMessages(ctx.chat.id, maxItems);
+  let delivered = 0;
+  for (const entry of list) {
+    try {
+      await ctx.reply(entry.text);
+      sqliteState.ackOutboxMessage(entry.id);
+      delivered += 1;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sqliteState.markOutboxAttempt(entry.id, truncateInline(message, 300));
+      break;
+    }
+  }
+  const pending = sqliteState.listOutboxMessages(ctx.chat.id, 200).length;
+  return { delivered, pending };
+}
+
 async function buildPromptContextForQuery(query: string, options?: { chatId?: number }) {
   const text = query.trim();
   if (!text) {
@@ -6147,7 +6353,7 @@ async function appendConversationTurn(params: {
 async function replyLong(ctx: { reply: (text: string) => Promise<unknown> }, text: string) {
   const chunks = splitForTelegram(text);
   for (const chunk of chunks) {
-    await ctx.reply(chunk);
+    await reliableReply(ctx as ChatReplyContext, chunk, { source: "replyLong" });
   }
 }
 
@@ -6826,6 +7032,12 @@ async function runCommandForProfile(params: {
   note?: string;
 }): Promise<void> {
   const actor = getActor(params.ctx);
+  const trace = startRunTrace({
+    chatId: actor.chatId,
+    userId: actor.userId,
+    action: "exec",
+    source: params.source,
+  });
 
   let started;
   try {
@@ -6838,6 +7050,11 @@ async function runCommandForProfile(params: {
       chatId: actor.chatId,
       userId: actor.userId,
       details: {
+        ...finishRunTrace({
+          trace,
+          status: "error",
+          error: message,
+        }),
         source: params.source,
         agent: params.profile.name,
         commandLine: params.commandLine,
@@ -6850,6 +7067,7 @@ async function runCommandForProfile(params: {
   await params.ctx.reply(
     [
       `Tarea iniciada: ${started.task.id}`,
+      `run_id: ${trace.id}`,
       `Agente: ${started.task.agent}`,
       `Comando: ${started.task.command} ${started.task.args.join(" ")}`,
       `PID: ${started.task.pid ?? "n/a"}`,
@@ -6862,6 +7080,7 @@ async function runCommandForProfile(params: {
     chatId: actor.chatId,
     userId: actor.userId,
     details: {
+      runId: trace.id,
       source: params.source,
       agent: started.task.agent,
       taskId: started.task.id,
@@ -6892,6 +7111,7 @@ async function runCommandForProfile(params: {
     chatId: actor.chatId,
     userId: actor.userId,
     details: {
+      ...finishRunTrace({ trace, status: result.task.status === "completed" ? "ok" : "error" }),
       source: params.source,
       taskId: result.task.id,
       status: result.task.status,
@@ -7235,7 +7455,7 @@ async function queueApproval(params: {
     },
   });
 
-  await params.ctx.reply(
+  await reliableReply(params.ctx, 
     [
       `Aprobación requerida: ${approval.id}`,
       `Tipo: ${approval.kind}`,
@@ -7243,8 +7463,96 @@ async function queueApproval(params: {
       `Comando: ${formatApprovalCommandLabel(approval.commandLine)}`,
       `Expira en: ${approvalRemainingSeconds(approval)}s`,
       "Usa /approve <id> para ejecutar o /deny <id> para cancelar.",
-    ].join("\n"),
-  );
+    ].join("\n"), { source: "approval.request" });
+}
+
+async function executePlannedAction(params: { ctx: ChatReplyContext; planned: PendingPlannedAction }): Promise<void> {
+  if (params.planned.kind === "exec") {
+    const commandLine = String(params.planned.payload.commandLine ?? "").trim();
+    const profileName = String(params.planned.payload.profileName ?? "").trim();
+    if (!commandLine || !profileName) {
+      await params.ctx.reply("Plan inválido: faltan datos de ejecución.");
+      return;
+    }
+    const profile = agentRegistry.get(profileName);
+    if (!profile) {
+      await params.ctx.reply(`El agente ${profileName} ya no existe.`);
+      return;
+    }
+    if (policyEngine.isApprovalRequired("exec") || isAdminApprovalRequired(params.ctx.chat.id)) {
+      await queueApproval({
+        ctx: params.ctx,
+        profile,
+        commandLine,
+        kind: "exec",
+        note: "confirmed via /confirm",
+      });
+      return;
+    }
+    await runCommandForProfile({
+      ctx: params.ctx,
+      profile,
+      commandLine,
+      source: "planned-confirmed",
+    });
+    return;
+  }
+
+  if (params.planned.kind === "gmail-send") {
+    const to = String(params.planned.payload.to ?? "").trim();
+    const subject = String(params.planned.payload.subject ?? "").trim();
+    const body = String(params.planned.payload.body ?? "").trim();
+    const ccRaw = String(params.planned.payload.cc ?? "").trim();
+    const bccRaw = String(params.planned.payload.bcc ?? "").trim();
+    const sent = await gmailAccount.sendMessage({
+      to,
+      subject,
+      body,
+      ...(ccRaw ? { cc: ccRaw } : {}),
+      ...(bccRaw ? { bcc: bccRaw } : {}),
+    });
+    rememberGmailMessage(params.ctx.chat.id, sent.id);
+    await reliableReply(
+      params.ctx,
+      [`Email enviado (confirmado).`, `to: ${to}`, `subject: ${subject}`, `messageId: ${sent.id}`].join("\n"),
+      { source: "planned.gmail.send" },
+    );
+    await safeAudit({
+      type: "gmail.send.confirmed",
+      chatId: params.ctx.chat.id,
+      userId: params.ctx.from?.id,
+      details: {
+        to,
+        subjectLength: subject.length,
+        bodyLength: body.length,
+        messageId: sent.id,
+      },
+    });
+    return;
+  }
+
+  if (params.planned.kind === "workspace-delete") {
+    const targetPath = String(params.planned.payload.path ?? "").trim();
+    if (!targetPath) {
+      await params.ctx.reply("Plan inválido: falta ruta a eliminar.");
+      return;
+    }
+    const deleted = await deleteWorkspacePath(targetPath);
+    await reliableReply(
+      params.ctx,
+      [`Eliminado (confirmado).`, `ruta: ${deleted.relPath}`, `tipo: ${deleted.kind}`].join("\n"),
+      { source: "planned.workspace.delete" },
+    );
+    await safeAudit({
+      type: "workspace.delete.confirmed",
+      chatId: params.ctx.chat.id,
+      userId: params.ctx.from?.id,
+      details: {
+        path: deleted.relPath,
+        kind: deleted.kind,
+      },
+    });
+  }
 }
 
 async function requestAgentServiceRestart(params: {
@@ -10735,6 +11043,11 @@ async function maybeHandleNaturalGmailInstruction(params: {
     }
 
     if (intent.action === "send") {
+      const blockReason = getPolicyCapabilityBlockReason(params.ctx.chat.id, "gmail.send");
+      if (blockReason) {
+        await params.ctx.reply(blockReason);
+        return true;
+      }
       let to = intent.to?.trim() ?? "";
       if (!to && intent.recipientName?.trim()) {
         const resolvedRecipient = resolveEmailRecipient(params.ctx.chat.id, intent.recipientName.trim());
@@ -10840,6 +11153,25 @@ async function maybeHandleNaturalGmailInstruction(params: {
       }
       if (!body) {
         body = "Mensaje enviado desde Houdi Agent.";
+      }
+      if (
+        await maybeRequirePlannedConfirmation({
+          ctx: params.ctx,
+          kind: "gmail-send",
+          capability: "gmail.send",
+          summary: [`to: ${to}`, `subject: ${subject}`, `body_chars: ${body.length}`].join("\n"),
+          payload: {
+            to,
+            subject,
+            body,
+            cc: intent.cc ?? "",
+            bcc: intent.bcc ?? "",
+          },
+          source: `${params.source}:gmail-intent-send`,
+          userId: params.userId,
+        })
+      ) {
+        return true;
       }
       await replyProgress(params.ctx, `Enviando email a ${to}...`);
       const sent = await gmailAccount.sendMessage({
@@ -11978,6 +12310,8 @@ bot.command("help", async (ctx) => {
       "/doctor - Diagnóstico operativo rápido del agente",
       "/usage [topN|reset] - Métricas de tokens/costo OpenAI desde el arranque",
       "/domains - Estado de dominios modulares cargados",
+      "/policy - Política agéntica activa (preview/approval/safe blocks)",
+      "/agenticcanary [status|<0-100>] - Rollout runtime de controles agénticos",
       "/agent - Ver agente activo y lista",
       "/agent set <nombre> - Cambiar agente activo para este chat",
       "/ask <pregunta> - Consultar IA de OpenAI",
@@ -12031,6 +12365,9 @@ bot.command("help", async (ctx) => {
       "/approvals - Ver aprobaciones pendientes",
       "/approve <id> - Aprobar ejecución pendiente",
       "/deny <id> - Rechazar ejecución pendiente",
+      "/confirm <plan_id> - Confirmar plan preview sensible",
+      "/cancelplan <plan_id> - Cancelar plan preview sensible",
+      "/outbox [status|flush] - Estado/reintento de respuestas pendientes",
       "/panic on|off|status - Bloqueo global de ejecución",
       "/tasks - Ver tareas activas",
       "/kill <taskId> - Terminar tarea activa",
@@ -12114,6 +12451,7 @@ bot.command("status", async (ctx) => {
   const usedMemMb = Math.round((os.totalmem() - os.freemem()) / (1024 * 1024));
   const totalMemMb = Math.round(os.totalmem() / (1024 * 1024));
   const pendingCount = adminSecurity.listApprovals(ctx.chat.id).length;
+  const pendingOutboxCount = sqliteState.listOutboxMessages(ctx.chat.id, 500).length;
   const activeProfile = agentRegistry.require(getActiveAgent(ctx.chat.id));
   let memoryStatusLine = "Memoria: n/d";
   try {
@@ -12164,11 +12502,13 @@ bot.command("status", async (ctx) => {
       `Shell IA: ${isAiShellModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `ECO mode: ${isEcoModeEnabled(ctx.chat.id) ? `on (max ${config.openAiEcoMaxOutputTokens} tok)` : "off"}`,
       `SAFE mode: ${isSafeModeEnabled(ctx.chat.id) ? "on" : "off"}`,
+      `Agentic canary: ${agenticCanary.getRolloutPercent()}% (chat=${isAgenticCanaryEnabled(ctx.chat.id) ? "on" : "off"})`,
       `Admin mode: ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
       `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"} (${rebootAllowedInAgent ? "permitido en agente actual" : "no permitido en agente actual"})`,
       `Aprobaciones pendientes (chat): ${pendingCount}`,
+      `Outbox pendiente (chat): ${pendingOutboxCount}`,
       `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
       ...buildOpenAiUsageLines(3),
@@ -12937,10 +13277,33 @@ bot.command("exec", async (ctx) => {
     await ctx.reply("Panic mode está activo: ejecución bloqueada.");
     return;
   }
+  const capability = "exec" as const;
+  const blockReason = getPolicyCapabilityBlockReason(ctx.chat.id, capability);
+  if (blockReason) {
+    await ctx.reply(blockReason);
+    return;
+  }
 
   const profile = agentRegistry.require(getActiveAgent(ctx.chat.id));
 
-  if (isAdminApprovalRequired(ctx.chat.id)) {
+  if (
+    await maybeRequirePlannedConfirmation({
+      ctx,
+      kind: "exec",
+      capability,
+      summary: [`Comando: ${input}`, `Agente: ${profile.name}`].join("\n"),
+      payload: {
+        commandLine: input,
+        profileName: profile.name,
+      },
+      source: "telegram:/exec",
+      userId: ctx.from?.id,
+    })
+  ) {
+    return;
+  }
+
+  if (policyEngine.isApprovalRequired(capability) || isAdminApprovalRequired(ctx.chat.id)) {
     await queueApproval({
       ctx,
       profile,
@@ -12960,6 +13323,11 @@ bot.command("exec", async (ctx) => {
 });
 
 bot.command("reboot", async (ctx) => {
+  const blockReason = getPolicyCapabilityBlockReason(ctx.chat.id, "reboot");
+  if (blockReason) {
+    await ctx.reply(blockReason);
+    return;
+  }
   const raw = String(ctx.match ?? "").trim().toLowerCase();
 
   if (raw === "status") {
@@ -13385,6 +13753,11 @@ bot.command("workspace", async (ctx) => {
     }
 
     if (["rm", "del", "delete", "remove"].includes(subcommand)) {
+      const blockReason = getPolicyCapabilityBlockReason(actor.chatId, "workspace.delete");
+      if (blockReason) {
+        await ctx.reply(blockReason);
+        return;
+      }
       const targetPath = tokens.join(" ").trim();
       if (!targetPath) {
         const pendingPath = queueWorkspaceDeletePathRequest({
@@ -13403,6 +13776,21 @@ bot.command("workspace", async (ctx) => {
         return;
       }
       pendingWorkspaceDeletePathByChat.delete(actor.chatId);
+      if (
+        await maybeRequirePlannedConfirmation({
+          ctx,
+          kind: "workspace-delete",
+          capability: "workspace.delete",
+          summary: `Eliminar en workspace: ${normalizeWorkspaceRelativePath(targetPath)}`,
+          payload: {
+            path: targetPath,
+          },
+          source: "telegram:/workspace-rm",
+          userId: actor.userId,
+        })
+      ) {
+        return;
+      }
       const pending = queueWorkspaceDeleteConfirmation({
         chatId: actor.chatId,
         paths: [targetPath],
@@ -14753,6 +15141,11 @@ bot.command("gmail", async (ctx) => {
     }
 
     if (subcommand === "send") {
+      const blockReason = getPolicyCapabilityBlockReason(actor.chatId, "gmail.send");
+      if (blockReason) {
+        await ctx.reply(blockReason);
+        return;
+      }
       const parsed = parseKeyValueOptions(tokens);
       if (parsed.args.length < 3) {
         await ctx.reply(`Faltan argumentos para send.\n\n${usage}`);
@@ -14763,6 +15156,25 @@ bot.command("gmail", async (ctx) => {
       const body = parsed.args.slice(2).join(" ").trim();
       if (!body) {
         await ctx.reply(`Falta body para send.\n\n${usage}`);
+        return;
+      }
+      if (
+        await maybeRequirePlannedConfirmation({
+          ctx,
+          kind: "gmail-send",
+          capability: "gmail.send",
+          summary: [`to: ${to}`, `subject: ${subject}`, `body_chars: ${body.length}`].join("\n"),
+          payload: {
+            to,
+            subject,
+            body,
+            cc: parsed.options.cc ?? "",
+            bcc: parsed.options.bcc ?? "",
+          },
+          source: "telegram:/gmail-send",
+          userId: actor.userId,
+        })
+      ) {
         return;
       }
       const sent = await gmailAccount.sendMessage({
@@ -15307,6 +15719,11 @@ bot.command("selfrestart", async (ctx) => {
 });
 
 bot.command("selfupdate", async (ctx) => {
+  const blockReason = getPolicyCapabilityBlockReason(ctx.chat.id, "selfupdate");
+  if (blockReason) {
+    await ctx.reply(blockReason);
+    return;
+  }
   const input = String(ctx.match ?? "").trim().toLowerCase();
   const checkOnly = input === "check" || input === "status";
   if (input && !checkOnly && input !== "apply" && input !== "run" && input !== "now") {
@@ -15423,6 +15840,11 @@ bot.command("shellmode", async (ctx) => {
 });
 
 bot.command("shell", async (ctx) => {
+  const blockReason = getPolicyCapabilityBlockReason(ctx.chat.id, "ai-shell");
+  if (blockReason) {
+    await ctx.reply(blockReason);
+    return;
+  }
   if (!config.securityProfile.allowAiShell) {
     await ctx.reply(
       `El perfil de seguridad actual (${config.securityProfile.name}) bloquea /shell. Usa HOUDI_SECURITY_PROFILE=full-control para habilitarlo.`,
@@ -15572,6 +15994,121 @@ bot.command("deny", async (ctx) => {
       commandLine: approval.commandLine,
     },
   });
+});
+
+bot.command("confirm", async (ctx) => {
+  const id = String(ctx.match ?? "").trim();
+  if (!id) {
+    await ctx.reply("Uso: /confirm <plan_id>");
+    return;
+  }
+  const planned = consumePlannedAction(id, ctx.chat.id);
+  if (!planned) {
+    await ctx.reply(`No encontré plan pendiente con id ${id} en este chat.`);
+    return;
+  }
+  const trace = startRunTrace({
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    action: `confirm:${planned.kind}`,
+    source: "telegram:/confirm",
+  });
+  await ctx.reply(`Plan ${planned.id} confirmado. Ejecutando...\nrun_id: ${trace.id}`);
+  try {
+    await executePlannedAction({ ctx, planned });
+    await safeAudit({
+      type: "plan.confirmed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        ...finishRunTrace({ trace, status: "ok" }),
+        planId: planned.id,
+        kind: planned.kind,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await safeAudit({
+      type: "plan.confirmed.failed",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        ...finishRunTrace({ trace, status: "error", error: message }),
+        planId: planned.id,
+        kind: planned.kind,
+      },
+    });
+    await ctx.reply(`Falló la ejecución del plan ${planned.id}: ${message}`);
+  }
+});
+
+bot.command("cancelplan", async (ctx) => {
+  const id = String(ctx.match ?? "").trim();
+  if (!id) {
+    await ctx.reply("Uso: /cancelplan <plan_id>");
+    return;
+  }
+  const planned = denyPlannedAction(id, ctx.chat.id);
+  if (!planned) {
+    await ctx.reply(`No encontré plan pendiente con id ${id} en este chat.`);
+    return;
+  }
+  await ctx.reply(`Plan ${planned.id} cancelado.`);
+  await safeAudit({
+    type: "plan.canceled",
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    details: {
+      planId: planned.id,
+      kind: planned.kind,
+    },
+  });
+});
+
+bot.command("outbox", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim().toLowerCase();
+  if (!raw || raw === "status") {
+    const pending = sqliteState.listOutboxMessages(ctx.chat.id, 200).length;
+    await ctx.reply(`Outbox pending (chat): ${pending}`);
+    return;
+  }
+  if (raw === "flush") {
+    const result = await flushOutboxForChat(ctx, 30);
+    await ctx.reply(`Outbox flush: delivered=${result.delivered} pending=${result.pending}`);
+    return;
+  }
+  await ctx.reply("Uso: /outbox status|flush");
+});
+
+bot.command("policy", async (ctx) => {
+  const policy = policyEngine.getPolicy();
+  await replyLong(
+    ctx,
+    [
+      `Policy file: ${toProjectRelativePath(policyEngine.getPath())}`,
+      `version: ${policy.version}`,
+      `previewRequired: ${policy.previewRequired.join(", ")}`,
+      `approvalRequired: ${policy.approvalRequired.join(", ")}`,
+      `blockInSafeMode: ${policy.blockInSafeMode.join(", ")}`,
+    ].join("\n"),
+  );
+});
+
+bot.command("agenticcanary", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim().toLowerCase();
+  if (!raw || raw === "status") {
+    await ctx.reply(
+      `Agentic canary: ${agenticCanary.getRolloutPercent()}% | enabled_chat=${isAgenticCanaryEnabled(ctx.chat.id) ? "sí" : "no"}`,
+    );
+    return;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    await ctx.reply("Uso: /agenticcanary <0-100> | /agenticcanary status");
+    return;
+  }
+  const next = agenticCanary.setRolloutPercent(parsed);
+  await ctx.reply(`Agentic canary actualizado a ${next}% (runtime).`);
 });
 
 bot.command("panic", async (ctx) => {

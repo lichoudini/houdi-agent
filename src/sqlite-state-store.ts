@@ -27,6 +27,16 @@ export type StoredIdempotencyHit = {
   createdAtMs: number;
 };
 
+export type StoredOutboxMessage = {
+  id: number;
+  chatId: number;
+  text: string;
+  source: string;
+  createdAtMs: number;
+  attempts: number;
+  lastError?: string;
+};
+
 export class SqliteStateStore {
   private readonly dbPath: string;
   private db: DatabaseSync | null = null;
@@ -71,6 +81,17 @@ export class SqliteStateStore {
         PRIMARY KEY(chat_id, request_id)
       );
       CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency_requests(created_at_ms);
+
+      CREATE TABLE IF NOT EXISTS outbound_message_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_outbound_message_queue_chat ON outbound_message_queue(chat_id, created_at_ms ASC);
     `);
   }
 
@@ -192,5 +213,86 @@ export class SqliteStateStore {
       changes?: number;
     };
     return Number(result.changes ?? 0);
+  }
+
+  enqueueOutboxMessage(params: {
+    chatId: number;
+    text: string;
+    source: string;
+    createdAtMs: number;
+    attempts?: number;
+    lastError?: string;
+  }): number {
+    const db = this.ensureDb();
+    const result = db
+      .prepare(
+        `
+      INSERT INTO outbound_message_queue (chat_id, text, source, created_at_ms, attempts, last_error)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `,
+      )
+      .run(
+        params.chatId,
+        params.text,
+        params.source,
+        params.createdAtMs,
+        params.attempts ?? 0,
+        params.lastError ?? null,
+      ) as { lastInsertRowid?: number | bigint };
+    return Number(result.lastInsertRowid ?? 0);
+  }
+
+  listOutboxMessages(chatId?: number, limit = 50): StoredOutboxMessage[] {
+    const db = this.ensureDb();
+    const cappedLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows =
+      typeof chatId === "number"
+        ? (db
+            .prepare(
+              `
+          SELECT id, chat_id, text, source, created_at_ms, attempts, last_error
+          FROM outbound_message_queue
+          WHERE chat_id = ?
+          ORDER BY created_at_ms ASC, id ASC
+          LIMIT ?
+        `,
+            )
+            .all(chatId, cappedLimit) as Array<Record<string, unknown>>)
+        : (db
+            .prepare(
+              `
+          SELECT id, chat_id, text, source, created_at_ms, attempts, last_error
+          FROM outbound_message_queue
+          ORDER BY created_at_ms ASC, id ASC
+          LIMIT ?
+        `,
+            )
+            .all(cappedLimit) as Array<Record<string, unknown>>);
+
+    return rows.map((row) => ({
+      id: Number(row.id),
+      chatId: Number(row.chat_id),
+      text: String(row.text ?? ""),
+      source: String(row.source ?? ""),
+      createdAtMs: Number(row.created_at_ms ?? 0),
+      attempts: Number(row.attempts ?? 0),
+      lastError: typeof row.last_error === "string" ? row.last_error : undefined,
+    }));
+  }
+
+  markOutboxAttempt(id: number, lastError?: string): void {
+    const db = this.ensureDb();
+    db.prepare(
+      `
+      UPDATE outbound_message_queue
+      SET attempts = attempts + 1, last_error = ?
+      WHERE id = ?
+    `,
+    ).run(lastError ?? null, id);
+  }
+
+  ackOutboxMessage(id: number): void {
+    const db = this.ensureDb();
+    db.prepare("DELETE FROM outbound_message_queue WHERE id = ?").run(id);
   }
 }
