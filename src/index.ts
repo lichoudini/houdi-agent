@@ -184,6 +184,15 @@ const activeAgentByChat = new Map<number, string>();
 const aiShellModeByChat = new Map<number, boolean>();
 const ecoModeByChat = new Map<number, boolean>();
 const openAiModelByChat = new Map<number, string>();
+const OPENAI_MODELS_BY_COST: Array<{ model: string; tier: "bajo" | "medio" | "alto"; notes: string }> = [
+  { model: "gpt-4o-mini", tier: "bajo", notes: "rápido y económico, recomendado para uso general" },
+  { model: "gpt-4.1-mini", tier: "bajo", notes: "económico con buen razonamiento general" },
+  { model: "gpt-4.1", tier: "medio", notes: "mejor calidad para tareas exigentes" },
+  { model: "gpt-4o", tier: "medio", notes: "muy buen balance multimodal" },
+  { model: "o3-mini", tier: "medio", notes: "razonamiento fuerte en costo intermedio" },
+  { model: "o3", tier: "alto", notes: "máximo razonamiento, mayor costo" },
+  { model: "o1", tier: "alto", notes: "razonamiento profundo, alto costo" },
+];
 const lastWebResultsByChat = new Map<number, WebSearchResult[]>();
 type LastDocumentSnapshot = {
   path: string;
@@ -453,6 +462,13 @@ function setOpenAiModelForChat(chatId: number, model: string): void {
 
 function resetOpenAiModelForChat(chatId: number): void {
   openAiModelByChat.delete(chatId);
+}
+
+function buildOpenAiModelListText(): string {
+  const lines = OPENAI_MODELS_BY_COST.map((item, index) => {
+    return `${index + 1}. ${item.model} | costo ${item.tier} | ${item.notes}`;
+  });
+  return ["Modelos sugeridos (menor -> mayor costo):", ...lines].join("\n");
 }
 
 function isAdminApprovalRequired(chatId: number): boolean {
@@ -11690,7 +11706,7 @@ bot.command("help", async (ctx) => {
     [
       "Comandos:",
       "/version - Ver versión del agente",
-      "/model [show|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
+      "/model [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
       "/status - Estado del host y tareas en ejecución",
       "/agent - Ver agente activo y lista",
       "/agent set <nombre> - Cambiar agente activo para este chat",
@@ -11782,9 +11798,15 @@ bot.command("model", async (ctx) => {
         `Modelo OpenAI actual (chat): ${current}`,
         `Modelo OpenAI default (.env): ${config.openAiModel}`,
         `Origen: ${isDefault ? "default" : "override por chat"}`,
-        "Uso: /model set <modelo> | /model reset",
+        buildOpenAiModelListText(),
+        "Uso: /model list | /model set <modelo> | /model reset",
       ].join("\n"),
     );
+    return;
+  }
+
+  if (["list", "models"].includes(sub)) {
+    await ctx.reply(buildOpenAiModelListText());
     return;
   }
 
@@ -11811,7 +11833,7 @@ bot.command("model", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Uso: /model [show|set <modelo>|reset]");
+  await ctx.reply("Uso: /model [show|list|set <modelo>|reset]");
 });
 
 bot.command("status", async (ctx) => {

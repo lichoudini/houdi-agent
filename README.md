@@ -178,7 +178,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 ## Comandos Telegram
 
 - `/status`
-- `/model [show|set <modelo>|reset]`
+- `/model [show|list|set <modelo>|reset]`
 - `/agent`
 - `/agent set <nombre>`
 - `/ask <pregunta>`
@@ -238,7 +238,8 @@ También puedes pedir en lenguaje natural operaciones sobre `workspace` (listar,
 
 Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo en runtime para un chat especifico:
 
-- `/model` o `/model show`: muestra modelo actual del chat y default global.
+- `/model` o `/model show`: muestra modelo actual del chat, default global y lista sugerida por costo.
+- `/model list`: muestra solo la lista sugerida (menor -> mayor costo).
 - `/model set <modelo>`: fija override por chat (ej. `gpt-4o-mini`).
 - `/model reset`: vuelve al default de `.env`.
 
