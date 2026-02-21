@@ -4988,6 +4988,95 @@ async function buildGmailAutoContent(params: {
   };
 }
 
+function detectWorkspaceAutoContentKind(textNormalized: string):
+  | "poem"
+  | "joke"
+  | "stoic"
+  | "summary"
+  | "generic"
+  | undefined {
+  if (/\b(poema|poesia|poes[ií]a)\b/.test(textNormalized)) {
+    return "poem";
+  }
+  if (/\b(chiste|broma)\b/.test(textNormalized)) {
+    return "joke";
+  }
+  if (/\b(reflexion|estoic|marco\s+aurelio)\b/.test(textNormalized)) {
+    return "stoic";
+  }
+  if (/\b(resumen|resumir|sintesis|síntesis)\b/.test(textNormalized)) {
+    return "summary";
+  }
+  if (/\b(escrib\w*|redact\w*|contenido|texto)\b/.test(textNormalized)) {
+    return "generic";
+  }
+  return undefined;
+}
+
+function extractWorkspaceInlineWritePrompt(text: string): string {
+  const fromWriteVerb =
+    text.match(/\b(?:escrib\w*|redact\w*|poner|pon)\s+([\s\S]+)$/i)?.[1] ??
+    text.match(/\b(?:contenido|texto)\s*(?::|=)\s*([\s\S]+)$/i)?.[1] ??
+    "";
+  return fromWriteVerb
+    .replace(/^(?:un|una|el|la|los|las)\s+/i, "")
+    .replace(/\s+(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?(?:archivo|documento|file)\b[\s\S]*$/i, "")
+    .trim();
+}
+
+async function buildWorkspaceAutoContent(params: {
+  chatId: number;
+  userText: string;
+  pathHint?: string;
+}): Promise<string | null> {
+  const normalized = normalizeIntentText(params.userText);
+  const kind = detectWorkspaceAutoContentKind(normalized);
+  if (!kind) {
+    return null;
+  }
+  const inlinePrompt = extractWorkspaceInlineWritePrompt(params.userText);
+  if (
+    inlinePrompt &&
+    !/\b(poema|poesia|poes[ií]a|chiste|broma|resumen|reflexion|estoic)\b/.test(normalizeIntentText(inlinePrompt))
+  ) {
+    return inlinePrompt;
+  }
+
+  if (!openAi.isConfigured()) {
+    return inlinePrompt || null;
+  }
+
+  try {
+    let prompt = "Escribe texto breve en español, claro y sin markdown.";
+    if (kind === "poem") {
+      prompt = "Escribe un poema breve en español (8-12 versos), tono elegante, sin markdown.";
+    } else if (kind === "joke") {
+      prompt = "Escribe un chiste breve en español, apto para todo público, sin markdown.";
+    } else if (kind === "stoic") {
+      prompt = "Escribe una reflexión estoica breve en español, práctica y concreta, sin markdown.";
+    } else if (kind === "summary") {
+      prompt = "Escribe un resumen breve y claro en español, sin markdown.";
+    } else if (inlinePrompt) {
+      prompt = `Redacta un texto breve en español sobre: ${inlinePrompt}\nSin markdown.`;
+    }
+    const promptContext = await buildPromptContextForQuery(params.userText, { chatId: params.chatId });
+    const content = await askOpenAiForChat({
+      chatId: params.chatId,
+      prompt: [
+        prompt,
+        params.pathHint ? `Destino sugerido: ${params.pathHint}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      context: promptContext,
+    });
+    const trimmed = content.trim();
+    return trimmed || null;
+  } catch {
+    return inlinePrompt || null;
+  }
+}
+
 function detectGmailNaturalIntent(text: string): GmailNaturalIntent {
   return detectGmailNaturalIntentDomain(text, {
     normalizeIntentText,
@@ -8784,6 +8873,10 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
       let filePath = intent.path?.trim() ?? "";
       const formatHint = intent.formatHint ?? detectSimpleTextExtensionHint(params.text);
       const normalizedWriteRequest = normalizeIntentText(params.text);
+      const explicitWriteContentCue =
+        /\b(escrib\w*|redact\w*|contenido|texto|poema|poesia|poes[ií]a|chiste|broma|resumen|reflexion|estoic)\b/.test(
+          normalizedWriteRequest,
+        );
       const explicitCreationCue =
         /\b(crea|crear|nuevo|nueva|genera|generar|escrib\w*|guard\w*|redact\w*|arm\w*)\b/.test(
           normalizedWriteRequest,
@@ -8826,12 +8919,22 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         content = buildContentFromNumber(extForContent, numberValue);
       }
 
+      if ((!content || !content.trim()) && explicitWriteContentCue) {
+        const autoContent = await buildWorkspaceAutoContent({
+          chatId: params.ctx.chat.id,
+          userText: params.text,
+          ...(filePath ? { pathHint: filePath } : {}),
+        });
+        if (autoContent?.trim()) {
+          content = autoContent.trim();
+        }
+      }
+
       const autoPathGenerated = !filePath;
       const appendMode = Boolean(intent.append);
       const explicitOverwriteCue =
         /\b(sobrescrib\w*|reemplaz\w*|actualiz\w*|modific\w*|edit\w*|dibuj\w*|traz\w*)\b/.test(normalizedWriteRequest) &&
         !/\b(no\s+sobrescrib\w*|sin\s+sobrescrib\w*)\b/.test(normalizedWriteRequest);
-      const overwriteMode = !appendMode && (explicitOverwriteCue || !explicitCreationCue);
       if (!filePath && !explicitCreationCue) {
         await params.ctx.reply(
           [
@@ -8844,6 +8947,11 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
       if (!filePath) {
         filePath = buildAutoWorkspaceFilePath(formatHint);
       }
+      const resolvedWritePath = resolveWorkspacePath(filePath);
+      const targetFileExists = await safePathExists(resolvedWritePath.fullPath);
+      const overwriteMode =
+        !appendMode &&
+        (explicitOverwriteCue || (!explicitCreationCue && targetFileExists) || (targetFileExists && explicitWriteContentCue));
       const written = await writeWorkspaceTextFile({
         relativePath: filePath,
         ...(typeof content === "string" ? { content } : {}),
