@@ -185,6 +185,8 @@ const aiShellModeByChat = new Map<number, boolean>();
 const ecoModeByChat = new Map<number, boolean>();
 const openAiModelByChat = new Map<number, string>();
 const OPENAI_MODELS_BY_COST: Array<{ model: string; tier: "bajo" | "medio" | "alto"; notes: string }> = [
+  { model: "gpt-5-nano", tier: "bajo", notes: "ultra económico para tareas simples y alto volumen" },
+  { model: "gpt-4.1-nano", tier: "bajo", notes: "muy económico para clasificación/automatizaciones ligeras" },
   { model: "gpt-4o-mini", tier: "bajo", notes: "rápido y económico, recomendado para uso general" },
   { model: "gpt-4.1-mini", tier: "bajo", notes: "económico con buen razonamiento general" },
   { model: "gpt-4.1", tier: "medio", notes: "mejor calidad para tareas exigentes" },
