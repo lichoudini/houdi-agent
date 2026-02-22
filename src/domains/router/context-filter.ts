@@ -193,7 +193,7 @@ export function buildIntentRouterContextFilter(
       applyNarrow(["gmail", "gmail-recipients"], "mail-lexical-cue");
     }
   } else if (params.hasMemoryRecallCue) {
-    applyNarrow(["memory", "stoic-smalltalk"], "memory-recall-cue", { strict: true });
+    applyNarrow(["memory"], "memory-recall-cue", { strict: true });
   }
 
   const base = uniqueCandidates(params.candidates);

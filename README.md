@@ -60,6 +60,19 @@ Wizard recomendado (paso a paso por CLI):
 npm run onboard
 ```
 
+Instalador recomendado (entrypoint único):
+
+```bash
+./scripts/install-houdi-agent.sh
+```
+
+Modo automatizado (sin preguntas, ideal para provisionado):
+
+```bash
+TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
+./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build
+```
+
 Alias:
 
 ```bash
@@ -70,6 +83,20 @@ Si ejecutas onboarding en modo no interactivo parcial, puedes omitir la confirma
 
 ```bash
 npm run onboard -- --accept-risk
+```
+
+Si querés omitir preflight del instalador (no recomendado):
+
+```bash
+npm run onboard -- --skip-preflight
+```
+
+Flags útiles para automatización:
+
+```bash
+npm run onboard -- --yes --accept-risk --service-mode none
+npm run onboard -- --yes --accept-risk --service-mode user --install-deps --build
+npm run onboard -- --yes --accept-risk --service-mode system --force-system-install
 ```
 
 Configuración manual:
@@ -166,6 +193,22 @@ cp .env.example .env
 - `HOUDI_LOCAL_API_HOST` (default: `127.0.0.1`)
 - `HOUDI_LOCAL_API_PORT` (default: `3210`)
 - `HOUDI_LOCAL_API_TOKEN` (opcional, exige `Authorization: Bearer`)
+- `SLACK_BOT_TOKEN` (opcional, bridge Slack Socket Mode)
+- `SLACK_APP_TOKEN` (opcional, `xapp-...`, requerido para Socket Mode)
+- `SLACK_BRIDGE_USER_ID` (opcional, userId autorizado de Houdi; si falta usa el primer `TELEGRAM_ALLOWED_USER_IDS`)
+- `SLACK_ALLOWED_USER_IDS` (opcional, CSV de user IDs de Slack autorizados)
+- `SLACK_ALLOWED_CHANNEL_IDS` (opcional, CSV de channel IDs autorizados)
+- `SLACK_REQUIRE_MENTION_IN_CHANNELS` (default: `true`, en canales solo responde con mención `@app`)
+- `SLACK_BRIDGE_TIMEOUT_MS` (default: `90000`)
+- `SLACK_BRIDGE_RETRY_COUNT` (default: `2`)
+- `SLACK_BRIDGE_RETRY_DELAY_MS` (default: `500`)
+- `SLACK_REPLY_CHUNK_MAX_CHARS` (default: `3500`)
+- `SLACK_ENABLE_STATUS_REACTIONS` (default: `true`, usa reacciones ⏳✅❌)
+- `SLACK_ENABLE_FILE_SNIPPET_FALLBACK` (default: `true`, sube respuesta larga como archivo)
+- `SLACK_SNIPPET_THRESHOLD_CHARS` (default: `12000`)
+- `SLACK_EVENT_DEDUPE_TTL_MS` (default: `120000`, evita duplicados)
+- `SLACK_SLASH_COMMAND` (default: `houdi`)
+- `SLACK_SLASH_EPHEMERAL` (default: `true`)
 - `ADMIN_APPROVAL_TTL_SECONDS` (default: `300`)
 - `AUDIT_LOG_PATH` (default: `./houdi-audit.log`)
 - `ENABLE_REBOOT_COMMAND` (default: `false`)
@@ -185,6 +228,35 @@ Build + run:
 npm run build
 npm start
 ```
+
+Bridge Slack (opcional):
+
+```bash
+npm run slack:bridge
+```
+
+Persistir bridge Slack con systemd --user:
+
+```bash
+./scripts/install-systemd-user-slack-bridge.sh
+```
+
+Requisitos Slack (Socket Mode, inspirado en flujo OpenClaw):
+1. Crear Slack App.
+2. Activar **Socket Mode**.
+3. Crear `App Token` (`xapp-...`) con scope `connections:write`.
+4. Instalar app y obtener `Bot Token` (`xoxb-...`).
+5. En Event Subscriptions, habilitar eventos bot:
+   - `app_mention`
+   - `message.channels`
+   - `message.groups`
+   - `message.im`
+   - `message.mpim`
+6. Invitar el bot a los canales donde quieras usarlo.
+
+Scopes recomendados:
+- Mínimos: `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `chat:write`
+- Avanzados (robustez/capacidades): `commands`, `reactions:write`, `files:write`, `users:read`, `channels:read`, `groups:read`
 
 Importante: ejecuta solo **una instancia** del bot a la vez.
 Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de Telegram polling.
@@ -425,7 +497,7 @@ Permite consultar y operar una cuenta Gmail conectada por OAuth2 (sin requerir W
 Setup mínimo:
 
 1. Crear credenciales OAuth en Google Cloud (Gmail API habilitada).
-2. Obtener `refresh_token` del usuario (scope recomendado: `gmail.readonly gmail.send gmail.modify`).
+2. Obtener `refresh_token` del usuario (scope recomendado: `gmail.readonly gmail.send gmail.modify https://www.googleapis.com/auth/gmail.compose`).
 3. Completar en `.env`:
    - `ENABLE_GMAIL_ACCOUNT=true`
    - `GMAIL_CLIENT_ID=...`
@@ -434,13 +506,28 @@ Setup mínimo:
    - `GMAIL_ACCOUNT_EMAIL=tu_cuenta@gmail.com` (opcional)
 4. Reiniciar el bot.
 
+Rotación de credenciales (sin cambiar código):
+
+1. Generar un nuevo `refresh_token` en Google OAuth con los scopes anteriores.
+2. Reemplazar en `.env`: `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`.
+3. Verificar con `/gmail status` y `/gmail profile`.
+4. Si falla autenticación, revocar token viejo en Google Account Security y repetir paso 1.
+
 Comandos:
 
 - `/gmail status`
 - `/gmail profile`
 - `/gmail list [query ...] [limit=10]`
 - `/gmail read <messageId>`
-- `/gmail send <to> "<subject>" "<body>" [cc=a@x.com,b@y.com] [bcc=z@x.com]`
+- `/gmail send <to> "<subject>" "<body>" [cc=a@x.com,b@y.com] [bcc=z@x.com] [attach=./file.pdf,./otro.csv]`
+- `/gmail reply <messageId> "<body>" [all=true] [cc=a@x.com] [bcc=b@x.com] [attach=./file.pdf]`
+- `/gmail forward <messageId> <to> "<body>" [cc=a@x.com] [bcc=b@x.com] [attach=./file.pdf]`
+- `/gmail thread <threadId> [limit=10]`
+- `/gmail draft create <to> "<subject>" "<body>" [cc=a@x.com] [bcc=b@x.com] [attach=./file.pdf]`
+- `/gmail draft list [limit=10]`
+- `/gmail draft read <draftId>`
+- `/gmail draft send <draftId>`
+- `/gmail draft delete <draftId>`
 - `/gmail markread <messageId>`
 - `/gmail markunread <messageId>`
 - `/gmail trash <messageId>`

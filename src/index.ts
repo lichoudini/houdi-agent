@@ -32,12 +32,13 @@ import { AgentPolicyEngine, type AgentCapability } from "./agent-policy.js";
 import { finishRunTrace, startRunTrace } from "./run-trace.js";
 import { type SavedEmailRecipient, EmailRecipientsSqliteService } from "./email-recipients-sqlite.js";
 import { ScheduledTaskSqliteService } from "./scheduled-tasks-sqlite.js";
-import { GmailRecipientsManager, isValidEmailAddress, normalizeRecipientEmail, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
+import { GmailRecipientsManager, normalizeRecipientEmail, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
 import { DomainRegistry } from "./domains/domain-registry.js";
 import {
   detectGmailNaturalIntent as detectGmailNaturalIntentDomain,
   detectGmailRecipientNaturalIntent as detectGmailRecipientNaturalIntentDomain,
 } from "./domains/gmail/intents.js";
+import { runGmailCommand } from "./domains/gmail/command-handler.js";
 import { createGmailTextParsers } from "./domains/gmail/text-parsers.js";
 import { shouldBypassGmailRecipientsAmbiguity } from "./domains/gmail/uncertainty.js";
 import { buildIntentRouterContextFilter as buildIntentRouterContextFilterDomain } from "./domains/router/context-filter.js";
@@ -60,6 +61,12 @@ import { shouldBypassAmbiguousPair } from "./domains/router/conflict-resolution.
 import { resolveIntentRouterAbVariant } from "./domains/router/ab-routing.js";
 import { RouterVersionStore } from "./domains/router/router-versioning.js";
 import { countNewsTopicMatches, extractNewsTopicTokens } from "./domains/web/news-topic-relevance.js";
+import {
+  runWebSlashAskCommand,
+  runWebSlashOpenCommand,
+  runWebSlashSearchCommand,
+} from "./domains/web/command-handler.js";
+import { normalizeWebCommandQuery } from "./domains/web/command-parser.js";
 import {
   detectSelfMaintenanceIntent,
   type SelfMaintenanceIntent,
@@ -367,14 +374,6 @@ const pendingPlannedActionsById = new Map<string, PendingPlannedAction>();
 const incomingMessageQueue = new ChatMessageQueue();
 const conversationLoopDetector = new ConversationLoopDetector();
 const progressNoticeService = new ProgressNoticeService();
-const lastTaskActivityByChat = new Map<number, { text: string; atMs: number }>();
-type StoicSmalltalkSession = {
-  expiresAtMs: number;
-  turnsRemaining: number;
-  lastUserText: string;
-  lastReplyText: string;
-};
-const stoicSmalltalkByChat = new Map<number, StoicSmalltalkSession>();
 const DOCUMENT_SEARCH_MAX_DEPTH = 6;
 const DOCUMENT_SEARCH_MAX_DIRS = 2000;
 const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
@@ -392,9 +391,6 @@ const PLANNED_ACTION_TTL_MS = 5 * 60 * 1000;
 const WORKSPACE_DELETE_PATH_PROMPT_TTL_MS = 5 * 60 * 1000;
 const INDEXED_LIST_CONTEXT_TTL_MS = 2 * 60 * 60 * 1000;
 const INDEXED_LIST_ACTION_MAX_ITEMS = 5;
-const TASK_ACTIVITY_TTL_MS = 2 * 60 * 1000;
-const STOIC_SMALLTALK_TTL_MS = 20 * 60 * 1000;
-const STOIC_SMALLTALK_MAX_TURNS = 12;
 const ASSISTANT_REPLY_HISTORY_LIMIT = 30;
 const SELF_UPDATE_GIT_REMOTE = "origin";
 const SELF_UPDATE_STDIO_MAX_CHARS = 12_000;
@@ -1111,6 +1107,7 @@ type WebIntent = {
   mode: "search" | "open";
   query: string;
   url?: string;
+  sourceIndex?: number;
   analysisRequested: boolean;
   listRequested: boolean;
   newsRequested: boolean;
@@ -1233,7 +1230,6 @@ type GmailRecipientNaturalIntent = {
 };
 
 type NaturalIntentHandlerName =
-  | "stoic-smalltalk"
   | "self-maintenance"
   | "lim"
   | "schedule"
@@ -2347,20 +2343,56 @@ function parseWebOpenTarget(
   input: string,
   lastResults: WebSearchResult[] | undefined,
 ): { url: string; question: string; sourceIndex?: number } {
-  const raw = input.trim();
-  if (!raw) {
-    throw new Error("Uso: /webopen <n|url> [pregunta]");
-  }
-
-  const [targetRaw, ...rest] = raw.split(/\s+/);
-  const target = targetRaw?.trim() ?? "";
-  if (!target) {
-    throw new Error("Uso: /webopen <n|url> [pregunta]");
-  }
-
-  const question = rest.join(" ").trim();
-  if (/^\d+$/.test(target)) {
-    const index = Number.parseInt(target, 10);
+  const parseOrdinalIndex = (raw: string, maxIndex: number): number | null => {
+    const normalized = normalizeIntentText(raw);
+    if (!normalized) {
+      return null;
+    }
+    const ordinalMap: Record<string, number> = {
+      primer: 1,
+      primero: 1,
+      primera: 1,
+      segundo: 2,
+      segunda: 2,
+      tercer: 3,
+      tercero: 3,
+      tercera: 3,
+      cuarto: 4,
+      cuarta: 4,
+      quinto: 5,
+      quinta: 5,
+      sexto: 6,
+      sexta: 6,
+      septimo: 7,
+      septima: 7,
+      octavo: 8,
+      octava: 8,
+      noveno: 9,
+      novena: 9,
+      decimo: 10,
+      decima: 10,
+    };
+    for (const [token, index] of Object.entries(ordinalMap)) {
+      const expression = new RegExp(`\\b${token}\\b`, "i");
+      if (expression.test(normalized)) {
+        return index;
+      }
+    }
+    if (/\b(ultimo|ultima)\b/i.test(normalized)) {
+      return maxIndex >= 1 ? maxIndex : null;
+    }
+    return null;
+  };
+  const removeOpenLead = (raw: string): string =>
+    raw
+      .replace(
+        /\b(?:abri|abrí|abre|abrir|open|revisa|revisa|lee|leer|analiza|analizar|resumi|resumir|resumime|resumime|explica|explicame|explicame)\b/gi,
+        " ",
+      )
+      .replace(/\b(?:el|la|los|las|resultado|resultados|link|links|enlace|enlaces|fuente|fuentes|nota|articulo|artículo)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const resolveIndex = (index: number, questionText: string): { url: string; question: string; sourceIndex: number } => {
     if (!lastResults || lastResults.length === 0) {
       throw new Error("No hay resultados web previos en este chat. Ejecuta /web primero.");
     }
@@ -2370,15 +2402,55 @@ function parseWebOpenTarget(
     const hit = lastResults[index - 1]!;
     return {
       url: hit.url,
-      question,
+      question: questionText,
       sourceIndex: index,
+    };
+  };
+
+  const raw = input.trim();
+  if (!raw) {
+    throw new Error("Uso: /webopen <n|url> [pregunta]");
+  }
+
+  const url = extractFirstHttpUrl(raw);
+  if (url) {
+    const question = removeOpenLead(raw.replace(url, " "));
+    return {
+      url,
+      question,
     };
   }
 
-  return {
-    url: target,
-    question,
-  };
+  const [targetRaw, ...rest] = raw.split(/\s+/);
+  const target = targetRaw?.trim() ?? "";
+  if (target && /^\d+$/.test(target)) {
+    const index = Number.parseInt(target, 10);
+    return resolveIndex(index, rest.join(" ").trim());
+  }
+
+  const maxIndex = lastResults?.length ?? 0;
+  const explicitMatch = raw.match(
+    /\b(?:resultado|resultados|link|links|enlace|enlaces|fuente|fuentes|nota|articulo|artículo)?\s*(?:n(?:ro|úmero|umero)?\.?\s*)?(\d{1,2})\b/i,
+  );
+  if (explicitMatch?.[1]) {
+    const index = Number.parseInt(explicitMatch[1], 10);
+    const remainder = removeOpenLead(raw.replace(explicitMatch[0], " "));
+    return resolveIndex(index, remainder);
+  }
+
+  const ordinalIndex = parseOrdinalIndex(raw, maxIndex);
+  if (ordinalIndex) {
+    return resolveIndex(ordinalIndex, removeOpenLead(raw));
+  }
+
+  if (target && /^https?:\/\//i.test(target)) {
+    return {
+      url: target,
+      question: rest.join(" ").trim(),
+    };
+  }
+
+  throw new Error("No pude interpretar el destino. Uso: /webopen <n|url> [pregunta]");
 }
 
 function stripTrailingPunctuation(raw: string): string {
@@ -3488,17 +3560,31 @@ function prioritizeNewsResults(params: {
   return combined.slice(0, params.limit).map((item) => item.hit);
 }
 
-function sanitizeNaturalWebQuery(raw: string): string {
-  return raw
-    .replace(/\b(por favor|porfa|gracias)\b/gi, " ")
-    .replace(/\b(dime|decime|contame|cuentame|cuéntame|mostrame|muestrame|muéstrame)\b/gi, " ")
-    .replace(
-      /\b(busca(?:me)?|buscar|investiga(?:r)?|averigua(?:r)?|googlea(?:r)?|navega(?:r)?|consulta(?:r)?|abre|abrir|abr[ií]|lee|leer|revisa(?:r)?|analiza(?:r)?|resum[ií](?:r)?|explica(?:r)?|muestra(?:r)?)\b/gi,
-      " ",
-    )
-    .replace(/\b(en la web|en internet|por internet|online|en google)\b/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function extractNaturalWebSourceIndex(text: string): number | null {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) {
+    return null;
+  }
+  const numeric = normalized.match(
+    /\b(?:resultado|resultados|link|links|enlace|enlaces|fuente|fuentes|nota|articulo|artículos?)?\s*(?:n(?:ro|úmero|umero)?\.?\s*)?(\d{1,2})\b/i,
+  );
+  if (numeric?.[1]) {
+    return Number.parseInt(numeric[1], 10);
+  }
+  const ordinalMap: Array<{ pattern: RegExp; index: number }> = [
+    { pattern: /\b(primer|primero|primera)\b/i, index: 1 },
+    { pattern: /\b(segundo|segunda)\b/i, index: 2 },
+    { pattern: /\b(tercer|tercero|tercera)\b/i, index: 3 },
+    { pattern: /\b(cuarto|cuarta)\b/i, index: 4 },
+    { pattern: /\b(quinto|quinta)\b/i, index: 5 },
+    { pattern: /\b(sexto|sexta)\b/i, index: 6 },
+  ];
+  for (const candidate of ordinalMap) {
+    if (candidate.pattern.test(normalized)) {
+      return candidate.index;
+    }
+  }
+  return null;
 }
 
 function buildFreshNewsSearchQuery(rawQuery: string): string {
@@ -3548,14 +3634,18 @@ function detectWebIntent(text: string): WebIntent {
     );
   const newsRequested = newsNoun || (topicNoun && /\b(ultim[oa]s?|actual(?:es)?|hoy|reciente)\b/.test(normalized));
   const openVerb = /\b(abre|abrir|abrí|lee|leer|revisa|revisa|analiza|analizar)\b/.test(normalized);
+  const sourceIndex = extractNaturalWebSourceIndex(original) ?? undefined;
   const analysisRequested = /\?|analiza|analizar|resum|explica|compar|conclusion|conclusión|riesgo|que dice|qué dice|hoy|ultimo|último|actual|reciente|noticia|precio/.test(
     normalized,
   );
-  const listRequested = /\b(lista|listame|listáme|links|enlaces|resultados|fuentes|solo links|solo enlaces)\b/.test(
-    normalized,
-  );
+  const listRequested =
+    /\b(lista|listame|listáme|links|enlaces|resultados|fuentes|solo links|solo enlaces)\b/.test(normalized) ||
+    /\b(sin resumen|solo resultados|pasame links|pasame enlaces)\b/.test(normalized);
   const onlyUrlShared = Boolean(url && original.replace(url, "").trim().length === 0);
-  const shouldOpen = Boolean(url && (openVerb || analysisRequested || requestTone || webQualifier || onlyUrlShared));
+  const shouldOpen = Boolean(
+    (url && (openVerb || analysisRequested || requestTone || webQualifier || onlyUrlShared)) ||
+      (!url && sourceIndex && (openVerb || analysisRequested || webQualifier)),
+  );
   const shouldSearch =
     !url &&
     (searchVerb ||
@@ -3565,7 +3655,7 @@ function detectWebIntent(text: string): WebIntent {
   const shouldHandle = shouldOpen || shouldSearch;
 
   const rawQuery = url ? original.replace(url, " ") : original;
-  const cleanedQuery = sanitizeNaturalWebQuery(rawQuery);
+  const cleanedQuery = normalizeWebCommandQuery(rawQuery);
   const query = cleanedQuery || (url ? "" : original);
 
   return {
@@ -3573,6 +3663,7 @@ function detectWebIntent(text: string): WebIntent {
     mode: shouldOpen ? "open" : "search",
     query,
     url: url ?? undefined,
+    sourceIndex,
     analysisRequested,
     listRequested,
     newsRequested,
@@ -5303,8 +5394,6 @@ function isLikelyMultiIntentUtterance(text: string): boolean {
 
 function handlerLikelyMatchesText(handler: Exclude<NaturalIntentHandlerName, "none">, text: string): boolean {
   switch (handler) {
-    case "stoic-smalltalk":
-      return detectStoicSmalltalkIntent(text);
     case "self-maintenance":
       return detectSelfMaintenanceIntent(text).shouldHandle;
     case "lim":
@@ -5584,7 +5673,6 @@ function tryParseNaturalRouteDecision(raw: string): {
     };
     const handler = typeof parsed.handler === "string" ? parsed.handler.trim().toLowerCase() : "";
     const allowed = new Set<NaturalIntentHandlerName>([
-      "stoic-smalltalk",
       "self-maintenance",
       "lim",
       "schedule",
@@ -5628,7 +5716,6 @@ async function classifyNaturalIntentRouteWithAi(params: {
     "Devuelve SOLO JSON valido.",
     "",
     "Handlers disponibles:",
-    "- stoic-smalltalk: charla corta estoica/motivacional.",
     "- self-maintenance: tareas del propio agente (skills, update, restart).",
     "- lim: estado/start/stop/restart de LIM/tunnel y consulta de mensajes LIM (first_name, last_name, fuente).",
     "- schedule: crear/listar/editar/eliminar tareas o recordatorios.",
@@ -5727,7 +5814,7 @@ async function classifySequencedIntentPlanWithAi(params: {
     "Si es sequence, devuelve pasos concretos en orden de ejecucion.",
     "Devuelve SOLO JSON valido.",
     "",
-    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, lim, self-maintenance, stoic-smalltalk.",
+    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, lim, self-maintenance.",
     "",
     "Reglas:",
     "- Usa mode=sequence solo si hay 2 o mas acciones distintas o dependientes.",
@@ -6007,7 +6094,7 @@ function buildEmailNewsQueryFromText(text: string): string {
     return explicitTopic;
   }
 
-  const cleaned = sanitizeNaturalWebQuery(text)
+  const cleaned = normalizeWebCommandQuery(text)
     .replace(/\b(?:a|para)\s+[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
     .replace(/\b(?:a|para)\s+[A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ.-]{1,40}\b/g, " ")
     .replace(/\b(envi\w*|mand\w*)\s+(?:un\s+)?(?:correo|mail|email|gmail)\b/gi, " ")
@@ -7591,12 +7678,6 @@ async function replyProgress(ctx: { reply: (text: string) => Promise<unknown>; c
   if (!config.progressNotices) {
     return;
   }
-  if (typeof ctx.chat?.id === "number") {
-    lastTaskActivityByChat.set(ctx.chat.id, {
-      text: truncateInline(text, 240),
-      atMs: Date.now(),
-    });
-  }
   const notice = progressNoticeService.build(text, ctx.chat?.id);
   await ctx.reply(notice);
 }
@@ -8913,7 +8994,7 @@ async function buildScheduledEmailBody(params: { chatId: number; instruction: st
   const asksNews = /\b(noticias?|novedades?|titulares?|actualidad|news)\b/.test(normalized);
   if (asksNews && config.enableWebBrowse) {
     const rawTopic = instruction || "futbol";
-    const rawQuery = sanitizeNaturalWebQuery(rawTopic) || rawTopic;
+    const rawQuery = normalizeWebCommandQuery(rawTopic) || rawTopic;
     const searchResult = await runWebSearchQuery({
       rawQuery,
       newsRequested: true,
@@ -11703,10 +11784,26 @@ async function maybeHandleNaturalWebInstruction(params: {
     return true;
   }
 
-  if (intent.mode === "open" && intent.url) {
-    await replyProgress(params.ctx, `Abriendo ${intent.url}...`);
+  if (intent.mode === "open") {
+    let targetUrl = intent.url;
+    if (!targetUrl && typeof intent.sourceIndex === "number") {
+      const lastResults = lastWebResultsByChat.get(params.ctx.chat.id) ?? [];
+      if (intent.sourceIndex >= 1 && intent.sourceIndex <= lastResults.length) {
+        targetUrl = lastResults[intent.sourceIndex - 1]?.url;
+      } else if (lastResults.length === 0) {
+        await params.ctx.reply("No hay resultados web previos en este chat. Ejecuta una búsqueda primero.");
+        return true;
+      } else {
+        await params.ctx.reply(`Índice fuera de rango. Usa 1..${lastResults.length}.`);
+        return true;
+      }
+    }
+    if (!targetUrl) {
+      return false;
+    }
+    await replyProgress(params.ctx, `Abriendo ${targetUrl}...`);
     try {
-      const page = await webBrowser.open(intent.url);
+      const page = await webBrowser.open(targetUrl);
       const header = [
         `URL: ${page.finalUrl}`,
         `Título: ${page.title}`,
@@ -11740,9 +11837,10 @@ async function maybeHandleNaturalWebInstruction(params: {
           userId: params.userId,
           details: {
             source: params.source,
-            url: intent.url,
+            url: targetUrl,
             finalUrl: page.finalUrl,
             analyzed: false,
+            sourceIndex: intent.sourceIndex ?? null,
           },
         });
         return true;
@@ -11794,9 +11892,10 @@ async function maybeHandleNaturalWebInstruction(params: {
         userId: params.userId,
         details: {
           source: params.source,
-          url: intent.url,
+          url: targetUrl,
           finalUrl: page.finalUrl,
           analyzed: true,
+          sourceIndex: intent.sourceIndex ?? null,
         },
       });
       return true;
@@ -11809,15 +11908,16 @@ async function maybeHandleNaturalWebInstruction(params: {
         userId: params.userId,
         details: {
           source: params.source,
-          url: intent.url,
+          url: targetUrl,
           error: message,
+          sourceIndex: intent.sourceIndex ?? null,
         },
       });
       return true;
     }
   }
 
-  const rawQuery = intent.query || params.text;
+  const rawQuery = normalizeWebCommandQuery(intent.query || params.text);
   const query = intent.newsRequested ? buildFreshNewsSearchQuery(rawQuery) : rawQuery;
   await replyProgress(
     params.ctx,
@@ -12536,24 +12636,6 @@ async function maybeHandleNaturalGmailInstruction(params: {
   }
 }
 
-function detectStoicSmalltalkIntent(text: string): boolean {
-  const normalized = normalizeIntentText(text);
-  if (!normalized) {
-    return false;
-  }
-  const askedThinking =
-    /\b(en que estas pensando|en que andas|en que estas|en que andas ahora|que andas haciendo|que estas haciendo)\b/.test(
-      normalized,
-    ) || /\bque pensas\b/.test(normalized);
-  const askedBeautiful =
-    /\b(dime|decime|contame|cuentame)\s+algo\s+(bonito|lindo|linda|inspirador|inspiradora)\b/.test(normalized);
-  const askedStoic =
-    /\b(dame|decime|dime|contame)\s+(una\s+)?(frase|reflexion|idea)\s+(estoica|estoico|de marco aurelio)\b/.test(
-      normalized,
-    );
-  return askedThinking || askedBeautiful || askedStoic;
-}
-
 function isLikelyOperationalInstruction(text: string): boolean {
   const normalized = normalizeIntentText(text);
   return /\b(crea|crear|arma|guardar|guarda|archivo|workspace|carpeta|mueve|elimina|borra|lista|gmail|correo|email|mail|agenda|recordatorio|tarea|web|busca|abrir|readfile|mkfile|selfupdate|selfrestart|shell)\b/.test(
@@ -12566,128 +12648,6 @@ function isLikelyConversationalNarrative(text: string): boolean {
     normalizedText: normalizeIntentText(text),
     hasOperationalCue: isLikelyOperationalInstruction(text),
   });
-}
-
-function hasActiveStoicSmalltalkSession(chatId: number): boolean {
-  const session = stoicSmalltalkByChat.get(chatId);
-  if (!session) {
-    return false;
-  }
-  if (Date.now() > session.expiresAtMs || session.turnsRemaining <= 0) {
-    stoicSmalltalkByChat.delete(chatId);
-    return false;
-  }
-  return true;
-}
-
-function shouldContinueStoicSmalltalk(chatId: number, text: string): boolean {
-  if (!hasActiveStoicSmalltalkSession(chatId)) {
-    return false;
-  }
-  if (isLikelyOperationalInstruction(text)) {
-    stoicSmalltalkByChat.delete(chatId);
-    return false;
-  }
-  const normalized = normalizeIntentText(text);
-  if (!normalized) {
-    return false;
-  }
-  const shortFollowUp = normalized.split(/\s+/).length <= 18;
-  const conversationalCue = /\?|^\b(y|ok|dale|sigue|segui|contame|dime|decime|mas|más|por que|porque|como|cómo|y eso)\b/.test(
-    normalized,
-  );
-  const assistantReferenceFollowup =
-    hasAssistantReferenceCue(normalized) &&
-    /\b(cuenta|conta|contame|dime|decime|mas|más|explica|amplia|amplía)\b/.test(normalized);
-  return shortFollowUp || conversationalCue || assistantReferenceFollowup;
-}
-
-async function buildStoicSmalltalkReply(chatId: number, userText: string): Promise<string> {
-  const activity = lastTaskActivityByChat.get(chatId);
-  const hasRecentActivity = Boolean(activity && Date.now() - activity.atMs <= TASK_ACTIVITY_TTL_MS);
-  if (hasRecentActivity) {
-    return [
-      "Estoy enfocado en una tarea concreta ahora mismo.",
-      `Contexto: ${activity?.text ?? "procesando"}`,
-      "Como diría un estoico: primero el deber, luego el resto.",
-    ].join("\n");
-  }
-
-  const previous = stoicSmalltalkByChat.get(chatId);
-  const referencedAssistant = hasAssistantReferenceCue(normalizeIntentText(userText))
-    ? resolveAssistantReplyByReference(chatId, userText)
-    : null;
-  if (openAi.isConfigured()) {
-    try {
-      const prompt = [
-        "Responde en español con tono estoico, cálido y concreto.",
-        "Debe sonar conversacional y natural, no como cita académica.",
-        "Extensión máxima: 4 líneas.",
-        "Incluye una idea accionable.",
-        referencedAssistant?.text ? `Respuesta referenciada por el usuario: ${referencedAssistant.text}` : "",
-        previous?.lastReplyText ? `Respuesta previa del asistente: ${previous.lastReplyText}` : "",
-        `Mensaje actual del usuario: ${userText}`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-      const promptContext = await buildPromptContextForQuery(userText, { chatId });
-      const answer = await askOpenAiForChat({ chatId, prompt, context: promptContext });
-      if (answer.trim()) {
-        return truncateInline(answer.trim(), 800);
-      }
-    } catch {
-      // fallback below
-    }
-  }
-
-  const variants = [
-    "Ahora mismo practico algo simple: foco en lo que puedo controlar y calma frente a lo demás.",
-    "Ando en modo estoico: menos ruido, más criterio, un paso útil a la vez.",
-    "Algo bonito: el obstáculo no frena el camino, a veces lo revela.",
-    "Hoy me quedo con esta: no gobiernas el viento, pero sí tu forma de remar.",
-    "Pienso en esto: la serenidad no es pasividad, es disciplina con dirección.",
-  ];
-  return variants[Math.floor(Math.random() * variants.length)] ?? variants[0]!;
-}
-
-async function maybeHandleNaturalStoicSmalltalk(params: {
-  ctx: ChatReplyContext;
-  text: string;
-  source: string;
-  userId?: number;
-  persistUserTurn: boolean;
-}): Promise<boolean> {
-  const explicit = detectStoicSmalltalkIntent(params.text);
-  const followUp = shouldContinueStoicSmalltalk(params.ctx.chat.id, params.text);
-  if (!explicit && !followUp) {
-    return false;
-  }
-  if (params.persistUserTurn) {
-    await appendConversationTurn({
-      chatId: params.ctx.chat.id,
-      userId: params.userId,
-      role: "user",
-      text: params.text,
-      source: params.source,
-    });
-  }
-  const responseText = await buildStoicSmalltalkReply(params.ctx.chat.id, params.text);
-  const prev = stoicSmalltalkByChat.get(params.ctx.chat.id);
-  stoicSmalltalkByChat.set(params.ctx.chat.id, {
-    expiresAtMs: Date.now() + STOIC_SMALLTALK_TTL_MS,
-    turnsRemaining: Math.max(0, (prev?.turnsRemaining ?? STOIC_SMALLTALK_MAX_TURNS) - 1),
-    lastUserText: truncateInline(params.text, 400),
-    lastReplyText: truncateInline(responseText, 700),
-  });
-  await params.ctx.reply(responseText);
-  await appendConversationTurn({
-    chatId: params.ctx.chat.id,
-    userId: params.userId,
-    role: "assistant",
-    text: responseText,
-    source: `${params.source}:stoic-smalltalk`,
-  });
-  return true;
 }
 
 async function maybeHandleNaturalIndexedListReference(params: {
@@ -13108,7 +13068,6 @@ async function maybeHandleNaturalIntentPipeline(params: {
       persistUserTurn: boolean;
     }) => Promise<boolean>;
   }> = [
-    { name: "stoic-smalltalk", fn: maybeHandleNaturalStoicSmalltalk },
     { name: "self-maintenance", fn: maybeHandleNaturalSelfMaintenanceInstruction },
     { name: "lim", fn: maybeHandleNaturalConnectorInstruction },
     { name: "schedule", fn: maybeHandleNaturalScheduleInstruction },
@@ -13120,21 +13079,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
     { name: "web", fn: maybeHandleNaturalWebInstruction },
   ];
 
-  const handlers =
-    hasMailContext && !hasMemoryRecallCue
-      ? [
-          baseHandlers[0]!,
-          baseHandlers[1]!,
-          baseHandlers[2]!,
-          baseHandlers[3]!,
-          baseHandlers[4]!,
-          baseHandlers[5]!,
-          baseHandlers[6]!,
-          baseHandlers[7]!,
-          baseHandlers[8]!,
-          baseHandlers[9]!,
-        ]
-      : baseHandlers;
+  const handlers = baseHandlers;
 
   let routedHandlers = handlers;
   let semanticRouteDecision: SemanticRouteDecision | null = null;
@@ -15674,79 +15619,34 @@ bot.command("askfile", async (ctx) => {
 });
 
 bot.command("web", async (ctx) => {
-  if (!config.enableWebBrowse) {
-    await ctx.reply("Navegación web deshabilitada por configuración (ENABLE_WEB_BROWSE=false).");
-    return;
-  }
-
-  const rawQuery = String(ctx.match ?? "").trim();
-  if (!rawQuery) {
-    await ctx.reply("Uso: /web <consulta>");
-    return;
-  }
-
-  const newsRequested = isLikelyNewsQuery(rawQuery);
-  const searchQuery = newsRequested ? buildFreshNewsSearchQuery(rawQuery) : rawQuery;
-  await replyProgress(
+  await runWebSlashSearchCommand({
     ctx,
-    newsRequested
-      ? `Buscando noticias recientes: ${searchQuery}`
-      : `Buscando en web: ${searchQuery}`,
-  );
-  try {
-    const searchResult = await runWebSearchQuery({
-      rawQuery,
-      newsRequested,
-    });
-    const hits = searchResult.hits;
-    const usedFallbackQuery = searchResult.usedFallbackQuery;
-    if (hits.length === 0) {
-      await ctx.reply(newsRequested ? "No encontré noticias recientes relevantes sobre ese tema." : "Sin resultados relevantes.");
-      return;
-    }
-
-    lastWebResultsByChat.set(ctx.chat.id, hits);
-    rememberWebResultsListContext({
-      chatId: ctx.chat.id,
-      title: `Resultados web: ${rawQuery}`,
-      hits,
-      source: "telegram:/web",
-    });
-    const responseText = [
-      buildWebResultsListText({
-        query: rawQuery,
-        hits,
-        newsRequested,
-      }),
-      "Tip: usa /webopen <n> para abrir uno (ej: /webopen 1).",
-    ].join("\n\n");
-    await replyLong(
-      ctx,
-      responseText,
-    );
-
-    await safeAudit({
-      type: "web.search",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query: searchResult.query,
-        rawQuery,
-        usedFallbackQuery,
-        newsRequested,
-        results: hits.length,
+    rawInput: String(ctx.match ?? ""),
+    deps: {
+      enableWebBrowse: config.enableWebBrowse,
+      newsMaxAgeDays: NEWS_MAX_AGE_DAYS,
+      isLikelyNewsQuery,
+      buildFreshNewsSearchQuery,
+      runWebSearchQuery,
+      buildWebResultsListText,
+      rememberWebResultsListContext,
+      setLastWebResults: (chatId, hits) => {
+        lastWebResultsByChat.set(chatId, hits);
       },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`No pude buscar en web: ${message}`);
-    await safeAudit({
-      type: "web.search_failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: { query: rawQuery, error: message },
-    });
-  }
+      getLastWebResults: (chatId) => lastWebResultsByChat.get(chatId),
+      parseWebOpenTarget,
+      openWebPage: (url) => webBrowser.open(url),
+      truncateInline,
+      replyLong,
+      replyProgress,
+      safeAudit,
+      appendConversationTurn,
+      isOpenAiConfigured: () => openAi.isConfigured(),
+      isEcoModeEnabled,
+      buildPromptContextForQuery,
+      askOpenAiForChat,
+    },
+  });
 });
 
 bot.command("lim", async (ctx) => {
@@ -15906,285 +15806,65 @@ bot.command("weather", async (ctx) => {
 });
 
 bot.command("webopen", async (ctx) => {
-  if (!config.enableWebBrowse) {
-    await ctx.reply("Navegación web deshabilitada por configuración (ENABLE_WEB_BROWSE=false).");
-    return;
-  }
-
-  const input = String(ctx.match ?? "").trim();
-  let parsed;
-  try {
-    parsed = parseWebOpenTarget(input, lastWebResultsByChat.get(ctx.chat.id));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(message);
-    return;
-  }
-
-  await replyProgress(ctx, `Abriendo ${parsed.url}...`);
-  try {
-    const page = await webBrowser.open(parsed.url);
-    const header = [
-      `URL: ${page.finalUrl}`,
-      `Título: ${page.title}`,
-      `Tipo: ${page.contentType || "desconocido"}`,
-      `Truncado: ${page.truncated ? "sí" : "no"}`,
-    ].join("\n");
-
-    if (!parsed.question) {
-      const preview = truncateInline(page.text, 3500);
-      await replyLong(
-        ctx,
-        [
-          header,
-          "",
-          preview || "(sin contenido textual útil)",
-          "",
-          "Tip: /webopen <n|url> <pregunta> para analizar con IA.",
-        ].join("\n"),
-      );
-      return;
-    }
-
-    if (!openAi.isConfigured()) {
-      await replyLong(
-        ctx,
-        [header, "", "OpenAI no está configurado para análisis. Usa /webopen sin pregunta para ver contenido."].join(
-          "\n",
-        ),
-      );
-      return;
-    }
-
-    const ecoEnabled = isEcoModeEnabled(ctx.chat.id);
-    const prompt = [
-      "Analiza este contenido web y responde la pregunta del usuario.",
-      `URL: ${page.finalUrl}`,
-      `Título: ${page.title}`,
-      `Tipo: ${page.contentType}`,
-      "",
-      "Contenido:",
-      page.text,
-      "",
-      `Pregunta: ${parsed.question}`,
-      "",
-      ...(ecoEnabled
-        ? [
-            "MODO ECO: respuesta ultra-concisa.",
-            "Usa 3 bullets máximos + 1 acción recomendada.",
-          ]
-        : ["Al final, incluye una línea de fuente con la URL usada."]),
-    ].join("\n");
-
-    const promptContext = await buildPromptContextForQuery(`${parsed.question}\n${page.title}`, {
-      chatId: ctx.chat.id,
-    });
-    const answerRaw = await askOpenAiForChat({ chatId: ctx.chat.id, prompt, context: promptContext });
-    const answer = ecoEnabled ? truncateInline(answerRaw, 900) : answerRaw;
-    await replyLong(ctx, answer);
-    await ctx.reply(`Fuente: ${page.finalUrl}`);
-
-    await appendConversationTurn({
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      role: "user",
-      text: `[WEBOPEN] ${parsed.url} | ${parsed.question}`,
-      source: "telegram:/webopen",
-    });
-    await appendConversationTurn({
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      role: "assistant",
-      text: `${answer}\nFuente: ${page.finalUrl}`,
-      source: "telegram:/webopen",
-    });
-
-    await safeAudit({
-      type: "web.open",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        url: parsed.url,
-        finalUrl: page.finalUrl,
-        withQuestion: true,
+  await runWebSlashOpenCommand({
+    ctx,
+    rawInput: String(ctx.match ?? ""),
+    deps: {
+      enableWebBrowse: config.enableWebBrowse,
+      newsMaxAgeDays: NEWS_MAX_AGE_DAYS,
+      isLikelyNewsQuery,
+      buildFreshNewsSearchQuery,
+      runWebSearchQuery,
+      buildWebResultsListText,
+      rememberWebResultsListContext,
+      setLastWebResults: (chatId, hits) => {
+        lastWebResultsByChat.set(chatId, hits);
       },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`No pude abrir esa URL: ${message}`);
-    await safeAudit({
-      type: "web.open_failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: { url: parsed.url, error: message },
-    });
-  }
+      getLastWebResults: (chatId) => lastWebResultsByChat.get(chatId),
+      parseWebOpenTarget,
+      openWebPage: (url) => webBrowser.open(url),
+      truncateInline,
+      replyLong,
+      replyProgress,
+      safeAudit,
+      appendConversationTurn,
+      isOpenAiConfigured: () => openAi.isConfigured(),
+      isEcoModeEnabled,
+      buildPromptContextForQuery,
+      askOpenAiForChat,
+    },
+  });
 });
 
 bot.command("webask", async (ctx) => {
-  if (!config.enableWebBrowse) {
-    await ctx.reply("Navegación web deshabilitada por configuración (ENABLE_WEB_BROWSE=false).");
-    return;
-  }
-
-  const rawQuery = String(ctx.match ?? "").trim();
-  if (!rawQuery) {
-    await ctx.reply("Uso: /webask <consulta>");
-    return;
-  }
-  if (!openAi.isConfigured()) {
-    await ctx.reply("OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.");
-    return;
-  }
-
-  const newsRequested = isLikelyNewsQuery(rawQuery);
-  const searchQuery = newsRequested ? buildFreshNewsSearchQuery(rawQuery) : rawQuery;
-  await replyProgress(
+  await runWebSlashAskCommand({
     ctx,
-    newsRequested
-      ? `Buscando y sintetizando noticias recientes: ${searchQuery}`
-      : `Buscando y sintetizando en web: ${searchQuery}`,
-  );
-  try {
-    const searchResult = await runWebSearchQuery({
-      rawQuery,
-      newsRequested,
-    });
-    const hits = searchResult.hits;
-    const usedFallbackQuery = searchResult.usedFallbackQuery;
-    if (hits.length === 0) {
-      await ctx.reply(
-        newsRequested ? "No encontré noticias recientes relevantes para sintetizar." : "Sin resultados relevantes para sintetizar.",
-      );
-      return;
-    }
-    lastWebResultsByChat.set(ctx.chat.id, hits);
-    rememberWebResultsListContext({
-      chatId: ctx.chat.id,
-      title: `Resultados web: ${rawQuery}`,
-      hits,
-      source: "telegram:/webask",
-    });
-
-    const top = hits.slice(0, newsRequested ? 5 : 3);
-    const pages = await Promise.allSettled(top.map(async (hit) => ({ hit, page: await webBrowser.open(hit.url) })));
-    const sources: Array<{ title: string; url: string; text: string }> = [];
-
-    for (const item of pages) {
-      if (item.status !== "fulfilled") {
-        continue;
-      }
-      const excerpt = truncateInline(item.value.page.text, 5000);
-      if (!excerpt) {
-        continue;
-      }
-      sources.push({
-        title: item.value.page.title || item.value.hit.title,
-        url: item.value.page.finalUrl || item.value.hit.url,
-        text: excerpt,
-      });
-    }
-
-    if (sources.length === 0) {
-      await ctx.reply("Encontré resultados, pero no pude extraer contenido utilizable.");
-      return;
-    }
-
-    const sourceBlocks = sources
-      .map(
-        (source, index) =>
-          [
-            `Fuente ${index + 1}: ${source.title}`,
-            `URL: ${source.url}`,
-            source.text,
-          ].join("\n"),
-      )
-      .join("\n\n---\n\n");
-
-    const ecoEnabled = isEcoModeEnabled(ctx.chat.id);
-    const prompt = [
-      "Responde la consulta del usuario usando SOLO la evidencia de las fuentes provistas.",
-      newsRequested
-        ? `El pedido es de noticias: prioriza hechos de los ultimos ${NEWS_MAX_AGE_DAYS} dias y menciona fechas concretas (dia/mes/ano) cuando esten disponibles.`
-        : "Si la evidencia no alcanza, dilo explicitamente.",
-      newsRequested
-        ? "Prioriza fuentes web especializadas y marca que puntos requieren validacion adicional."
-        : "Se claro y breve.",
-      newsRequested
-        ? `No uses como base noticias de mas de ${NEWS_MAX_AGE_DAYS} dias; si no hay suficiente evidencia reciente, dilo explicitamente.`
-        : "Evita suposiciones.",
-      "No devuelvas JSON, YAML ni bloques de codigo.",
-      ...(ecoEnabled
-        ? [
-            "MODO ECO: salida mínima en español.",
-            "Formato exacto y único:",
-            "1) 3 bullets máximos con lo más reciente/relevante.",
-            "2) 1 acción recomendada.",
-            "3) Fuentes usadas: máximo 3 links.",
-            "No agregues texto extra.",
-          ]
-        : [
-            "Entrega una respuesta natural en espanol con este formato:",
-            "1) Resumen breve (3-5 viñetas).",
-            "2) Lecturas recomendadas: hasta 5 items con titulo, mini-resumen y link.",
-            "Si no tienes evidencia suficiente, dilo explicitamente.",
-          ]),
-      `Consulta del usuario: ${rawQuery}`,
-      `Consulta web ejecutada: ${usedFallbackQuery ? `${searchResult.query} (fallback: ${rawQuery})` : searchResult.query}`,
-      "",
-      "Fuentes:",
-      sourceBlocks,
-      "",
-      ...(ecoEnabled ? [] : ["Incluye al final una sección 'Fuentes usadas:' con las URLs en viñetas."]),
-    ].join("\n");
-
-    const promptContext = await buildPromptContextForQuery(rawQuery, {
-      chatId: ctx.chat.id,
-    });
-    const answerRaw = await askOpenAiForChat({ chatId: ctx.chat.id, prompt, context: promptContext });
-    const answer = ecoEnabled ? truncateInline(answerRaw, 1200) : answerRaw;
-    await replyLong(ctx, answer);
-
-    await appendConversationTurn({
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      role: "user",
-      text: `[WEBASK] ${rawQuery}`,
-      source: "telegram:/webask",
-    });
-    await appendConversationTurn({
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      role: "assistant",
-      text: answer,
-      source: "telegram:/webask",
-    });
-
-    await safeAudit({
-      type: "web.ask",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query: searchResult.query,
-        rawQuery,
-        usedFallbackQuery,
-        newsRequested,
-        sources: sources.length,
+    rawInput: String(ctx.match ?? ""),
+    deps: {
+      enableWebBrowse: config.enableWebBrowse,
+      newsMaxAgeDays: NEWS_MAX_AGE_DAYS,
+      isLikelyNewsQuery,
+      buildFreshNewsSearchQuery,
+      runWebSearchQuery,
+      buildWebResultsListText,
+      rememberWebResultsListContext,
+      setLastWebResults: (chatId, hits) => {
+        lastWebResultsByChat.set(chatId, hits);
       },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`No pude completar /webask: ${message}`);
-    await safeAudit({
-      type: "web.ask_failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query: rawQuery,
-        error: message,
-      },
-    });
-  }
+      getLastWebResults: (chatId) => lastWebResultsByChat.get(chatId),
+      parseWebOpenTarget,
+      openWebPage: (url) => webBrowser.open(url),
+      truncateInline,
+      replyLong,
+      replyProgress,
+      safeAudit,
+      appendConversationTurn,
+      isOpenAiConfigured: () => openAi.isConfigured(),
+      isEcoModeEnabled,
+      buildPromptContextForQuery,
+      askOpenAiForChat,
+    },
+  });
 });
 
 bot.command("gmail", async (ctx) => {
@@ -16194,7 +15874,15 @@ bot.command("gmail", async (ctx) => {
     "/gmail profile",
     "/gmail list [query ...] [limit=10]",
     "/gmail read <messageId>",
-    '/gmail send <to> "<subject>" "<body>" [cc=a@x.com,b@y.com] [bcc=z@x.com]',
+    '/gmail send <to> "<subject>" "<body>" [cc=a@x.com,b@y.com] [bcc=z@x.com] [attach=./file.pdf,./otro.csv]',
+    '/gmail reply <messageId> "<body>" [all=true] [cc=a@x.com] [bcc=b@x.com] [attach=./file.pdf]',
+    '/gmail forward <messageId> <to> "<body>" [cc=a@x.com] [bcc=b@x.com] [attach=./file.pdf]',
+    "/gmail thread <threadId> [limit=10]",
+    '/gmail draft create <to> "<subject>" "<body>" [cc=a@x.com] [bcc=b@x.com] [attach=./file.pdf]',
+    "/gmail draft list [limit=10]",
+    "/gmail draft read <draftId>",
+    "/gmail draft send <draftId>",
+    "/gmail draft delete <draftId>",
     "/gmail markread <messageId>",
     "/gmail markunread <messageId>",
     "/gmail trash <messageId>",
@@ -16225,422 +15913,37 @@ bot.command("gmail", async (ctx) => {
     await ctx.reply(`${message}\n\n${usage}`);
     return;
   }
-
   if (tokens.length === 0) {
     await ctx.reply(usage);
     return;
   }
 
-  const subcommand = (tokens.shift() ?? "").toLowerCase();
-  const actor = getActor(ctx);
-
-  if (subcommand === "status") {
-    const status = gmailAccount.getStatus();
-    await ctx.reply(
-      [
-        `Habilitado: ${status.enabled ? "sí" : "no"}`,
-        `Configurado: ${status.configured ? "sí" : "no"}`,
-        `Cuenta: ${status.accountEmail || "n/d"}`,
-        `Max resultados: ${status.maxResults}`,
-        status.missing.length > 0 ? `Faltan: ${status.missing.join(", ")}` : "Faltan: ninguno",
-      ].join("\n"),
-    );
-    return;
-  }
-
-  if (subcommand === "recipients" || subcommand === "recipient" || subcommand === "destinatarios") {
-    const sub = (tokens.shift() ?? "list").toLowerCase();
-    const parsed = parseKeyValueOptions(tokens);
-
-    try {
-      if (["list", "ls", "status"].includes(sub)) {
-        const list = listEmailRecipients(actor.chatId);
-        if (list.length === 0) {
-          await ctx.reply("No hay destinatarios guardados.");
-          return;
-        }
-        const lines = list.map((item, idx) => `${idx + 1}. ${item.name} <${item.email}>`);
-        await replyLong(ctx, [`Destinatarios guardados (${list.length}):`, ...lines].join("\n"));
-        return;
-      }
-
-      if (["add", "new", "create", "alta"].includes(sub)) {
-        const optionEmail = parsed.options.email?.trim() ?? "";
-        const email = normalizeRecipientEmail(optionEmail || (parsed.args[parsed.args.length - 1] ?? ""));
-        const nameRaw = parsed.options.name?.trim() || parsed.args.slice(0, optionEmail ? parsed.args.length : -1).join(" ");
-        const name = normalizeRecipientName(nameRaw);
-        if (!name || !email) {
-          await ctx.reply(`Faltan datos.\n\n${recipientsUsage}`);
-          return;
-        }
-        const result = await upsertEmailRecipient({
-          chatId: actor.chatId,
-          name,
-          email,
-        });
-        await ctx.reply(
-          result.created
-            ? `Destinatario agregado: ${result.row.name} <${result.row.email}>`
-            : `Destinatario actualizado: ${result.row.name} <${result.row.email}>`,
-        );
-        await safeAudit({
-          type: "gmail.recipients_upsert",
-          chatId: actor.chatId,
-          userId: actor.userId,
-          details: {
-            created: result.created,
-            name: result.row.name,
-            email: result.row.email,
-          },
-        });
-        return;
-      }
-
-      if (["edit", "set", "update", "mod", "modificar"].includes(sub)) {
-        const selector = parsed.args[0]?.trim() || parsed.options.id?.trim() || parsed.options.selector?.trim() || "";
-        const tailArgs = parsed.args.slice(1);
-        let nextName = parsed.options.name?.trim() || "";
-        let nextEmail = parsed.options.email?.trim() || "";
-        if (!nextName && !nextEmail && tailArgs.length > 0) {
-          if (tailArgs.length === 1) {
-            if (isValidEmailAddress(tailArgs[0] ?? "")) {
-              nextEmail = tailArgs[0] ?? "";
-            } else {
-              nextName = tailArgs[0] ?? "";
-            }
-          } else {
-            const last = tailArgs[tailArgs.length - 1] ?? "";
-            if (isValidEmailAddress(last)) {
-              nextEmail = last;
-              nextName = tailArgs.slice(0, -1).join(" ");
-            } else {
-              nextName = tailArgs.join(" ");
-            }
-          }
-        }
-        if (!selector || (!nextName && !nextEmail)) {
-          await ctx.reply(`Faltan datos para editar.\n\n${recipientsUsage}`);
-          return;
-        }
-        const updated = await updateEmailRecipientBySelector({
-          chatId: actor.chatId,
-          selector,
-          ...(nextName ? { nextName } : {}),
-          ...(nextEmail ? { nextEmail } : {}),
-        });
-        if (!updated) {
-          await ctx.reply(`No encontré destinatario "${selector}".`);
-          return;
-        }
-        await ctx.reply(
-          [
-            "Destinatario modificado:",
-            `antes: ${updated.previous.name} <${updated.previous.email}>`,
-            `ahora: ${updated.row.name} <${updated.row.email}>`,
-          ].join("\n"),
-        );
-        await safeAudit({
-          type: "gmail.recipients_update",
-          chatId: actor.chatId,
-          userId: actor.userId,
-          details: {
-            selector,
-            previousName: updated.previous.name,
-            previousEmail: updated.previous.email,
-            currentName: updated.row.name,
-            currentEmail: updated.row.email,
-          },
-        });
-        return;
-      }
-
-      if (["del", "delete", "rm", "remove", "baja", "eliminar", "borra"].includes(sub)) {
-        const selector =
-          parsed.args.join(" ").trim() ||
-          parsed.options.id?.trim() ||
-          parsed.options.selector?.trim() ||
-          parsed.options.name?.trim() ||
-          "";
-        if (!selector) {
-          await ctx.reply(`Indica el destinatario a eliminar.\n\n${recipientsUsage}`);
-          return;
-        }
-        const removed = await deleteEmailRecipientBySelector(actor.chatId, selector);
-        if (!removed) {
-          await ctx.reply(`No encontré destinatario "${selector}".`);
-          return;
-        }
-        await ctx.reply(`Destinatario eliminado: ${removed.name} <${removed.email}>`);
-        await safeAudit({
-          type: "gmail.recipients_delete",
-          chatId: actor.chatId,
-          userId: actor.userId,
-          details: {
-            selector,
-            name: removed.name,
-            email: removed.email,
-          },
-        });
-        return;
-      }
-
-      if (["clear", "wipe", "reset"].includes(sub)) {
-        const removedCount = await clearEmailRecipients(actor.chatId);
-        await ctx.reply(`Destinatarios eliminados: ${removedCount}`);
-        await safeAudit({
-          type: "gmail.recipients_clear",
-          chatId: actor.chatId,
-          userId: actor.userId,
-          details: {
-            removedCount,
-          },
-        });
-        return;
-      }
-
-      await ctx.reply(`Subcomando recipients no reconocido: ${sub}\n\n${recipientsUsage}`);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await ctx.reply(`No pude operar destinatarios: ${message}`);
-      await safeAudit({
-        type: "gmail.recipients_failed",
-        chatId: actor.chatId,
-        userId: actor.userId,
-        details: {
-          sub,
-          error: message,
-        },
-      });
-      return;
-    }
-  }
-
-  const accessIssue = getGmailAccessIssue(ctx);
-  if (accessIssue) {
-    await ctx.reply(accessIssue);
-    return;
-  }
-
-  try {
-    if (subcommand === "profile") {
-      const profile = await gmailAccount.getProfile();
-      await ctx.reply(
-        [
-          `Email: ${profile.emailAddress || "n/d"}`,
-          `Mensajes: ${profile.messagesTotal}`,
-          `Threads: ${profile.threadsTotal}`,
-          `HistoryId: ${profile.historyId || "n/d"}`,
-        ].join("\n"),
-      );
-      await safeAudit({
-        type: "gmail.profile",
-        chatId: actor.chatId,
-        userId: actor.userId,
-      });
-      return;
-    }
-
-    if (subcommand === "list") {
-      const parsed = parseKeyValueOptions(tokens);
-      let limit: number | undefined;
-      if (parsed.options.limit) {
-        const candidate = Number.parseInt(parsed.options.limit, 10);
-        if (!Number.isFinite(candidate) || candidate <= 0) {
-          await ctx.reply("limit inválido. Usa por ejemplo: limit=10");
-          return;
-        }
-        limit = candidate;
-      }
-      const query = parsed.args.join(" ").trim() || undefined;
-      await replyProgress(ctx, `Consultando Gmail${query ? ` (query: ${query})` : ""}...`);
-      const messages = await gmailAccount.listMessages(query, limit);
-      if (messages.length === 0) {
-        await ctx.reply("Sin mensajes para ese filtro.");
-        return;
-      }
-      rememberGmailListResults(ctx.chat.id, messages);
-      rememberGmailListContext({
-        chatId: ctx.chat.id,
-        title: `Gmail: ${query || "inbox"}`,
-        messages,
-        source: "telegram:/gmail",
-      });
-      const lines = messages.map((message, index) =>
-        [
-          `${index + 1}. ${message.subject || "(sin asunto)"}`,
-          `id: ${message.id}`,
-          `from: ${message.from || "-"}`,
-          `date: ${message.date || "-"}`,
-          message.snippet ? `snippet: ${truncateInline(message.snippet, 220)}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      );
-      await replyLong(ctx, [`Mensajes (${messages.length}):`, ...lines].join("\n\n"));
-      await safeAudit({
-        type: "gmail.list",
-        chatId: actor.chatId,
-        userId: actor.userId,
-        details: {
-          count: messages.length,
-          query: query ?? "",
-        },
-      });
-      return;
-    }
-
-    if (subcommand === "read") {
-      const messageId = tokens[0]?.trim();
-      if (!messageId) {
-        await ctx.reply(`Falta messageId.\n\n${usage}`);
-        return;
-      }
-      const detail = await gmailAccount.readMessage(messageId);
-      rememberGmailMessage(ctx.chat.id, detail.id);
-      await replyLong(
-        ctx,
-        [
-          `Subject: ${detail.subject || "(sin asunto)"}`,
-          `From: ${detail.from || "-"}`,
-          `To: ${detail.to || "-"}`,
-          `Date: ${detail.date || "-"}`,
-          `Labels: ${detail.labelIds.join(", ") || "-"}`,
-          `MessageId: ${detail.id}`,
-          "",
-          detail.bodyText || detail.snippet || "(sin cuerpo legible)",
-        ].join("\n"),
-      );
-      await safeAudit({
-        type: "gmail.read",
-        chatId: actor.chatId,
-        userId: actor.userId,
-        details: {
-          messageId,
-        },
-      });
-      return;
-    }
-
-    if (subcommand === "send") {
-      const blockReason = getPolicyCapabilityBlockReason(actor.chatId, "gmail.send");
-      if (blockReason) {
-        await ctx.reply(blockReason);
-        return;
-      }
-      const parsed = parseKeyValueOptions(tokens);
-      if (parsed.args.length < 3) {
-        await ctx.reply(`Faltan argumentos para send.\n\n${usage}`);
-        return;
-      }
-      const to = parsed.args[0] ?? "";
-      const subject = parsed.args[1] ?? "";
-      const body = parsed.args.slice(2).join(" ").trim();
-      if (!body) {
-        await ctx.reply(`Falta body para send.\n\n${usage}`);
-        return;
-      }
-      if (
-        await maybeRequirePlannedConfirmation({
-          ctx,
-          kind: "gmail-send",
-          capability: "gmail.send",
-          summary: [`to: ${to}`, `subject: ${subject}`, `body_chars: ${body.length}`].join("\n"),
-          payload: {
-            to,
-            subject,
-            body,
-            cc: parsed.options.cc ?? "",
-            bcc: parsed.options.bcc ?? "",
-          },
-          source: "telegram:/gmail-send",
-          userId: actor.userId,
-        })
-      ) {
-        return;
-      }
-      const sent = await gmailAccount.sendMessage({
-        to,
-        subject,
-        body,
-        cc: parsed.options.cc,
-        bcc: parsed.options.bcc,
-      });
-      rememberGmailMessage(ctx.chat.id, sent.id);
-      await ctx.reply(`Email enviado.\nmessageId=${sent.id}\nthreadId=${sent.threadId}`);
-      await safeAudit({
-        type: "gmail.send",
-        chatId: actor.chatId,
-        userId: actor.userId,
-        details: {
-          to,
-          subjectLength: subject.length,
-          bodyLength: body.length,
-          cc: parsed.options.cc ?? "",
-          bcc: parsed.options.bcc ? "[set]" : "",
-          messageId: sent.id,
-          threadId: sent.threadId,
-        },
-      });
-      return;
-    }
-
-    const messageId = tokens[0]?.trim();
-    if (
-      subcommand === "markread" ||
-      subcommand === "markunread" ||
-      subcommand === "trash" ||
-      subcommand === "untrash" ||
-      subcommand === "star" ||
-      subcommand === "unstar"
-    ) {
-      if (!messageId) {
-        await ctx.reply(`Falta messageId.\n\n${usage}`);
-        return;
-      }
-
-      if (subcommand === "markread") {
-        await gmailAccount.markRead(messageId);
-      } else if (subcommand === "markunread") {
-        await gmailAccount.markUnread(messageId);
-      } else if (subcommand === "trash") {
-        await gmailAccount.trashMessage(messageId);
-      } else if (subcommand === "untrash") {
-        await gmailAccount.untrashMessage(messageId);
-      } else if (subcommand === "star") {
-        await gmailAccount.star(messageId);
-      } else if (subcommand === "unstar") {
-        await gmailAccount.unstar(messageId);
-      }
-
-      rememberGmailMessage(ctx.chat.id, messageId);
-      await ctx.reply(`OK: ${subcommand} aplicado a ${messageId}`);
-      await safeAudit({
-        type: "gmail.modify",
-        chatId: actor.chatId,
-        userId: actor.userId,
-        details: {
-          action: subcommand,
-          messageId,
-        },
-      });
-      return;
-    }
-
-    await ctx.reply(`Subcomando no reconocido: ${subcommand}\n\n${usage}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`Error Gmail: ${message}`);
-    await safeAudit({
-      type: "gmail.failed",
-      chatId: actor.chatId,
-      userId: actor.userId,
-      details: {
-        subcommand,
-        error: message,
-      },
-    });
-  }
+  await runGmailCommand({
+    ctx,
+    tokens,
+    actor: getActor(ctx),
+    usage,
+    recipientsUsage,
+    deps: {
+      gmailAccount,
+      parseKeyValueOptions,
+      listEmailRecipients,
+      upsertEmailRecipient,
+      updateEmailRecipientBySelector,
+      deleteEmailRecipientBySelector,
+      clearEmailRecipients,
+      rememberGmailListResults,
+      rememberGmailListContext,
+      rememberGmailMessage,
+      getGmailAccessIssue,
+      getPolicyCapabilityBlockReason,
+      maybeRequirePlannedConfirmation,
+      safeAudit,
+      replyLong,
+      replyProgress,
+      truncateInline,
+    },
+  });
 });
 
 bot.command("remember", async (ctx) => {

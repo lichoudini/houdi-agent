@@ -3,8 +3,7 @@ export type IntentCoarseDomain =
   | "files"
   | "operations"
   | "planning-memory"
-  | "knowledge"
-  | "social";
+  | "knowledge";
 
 export type HierarchicalIntentDecision = {
   allowed: string[];
@@ -31,7 +30,6 @@ const DOMAIN_TO_HANDLERS: Record<IntentCoarseDomain, string[]> = {
   operations: ["lim", "self-maintenance"],
   "planning-memory": ["schedule", "memory"],
   knowledge: ["web"],
-  social: ["stoic-smalltalk"],
 };
 
 function narrow(
@@ -58,7 +56,6 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
     ["operations", 0],
     ["planning-memory", 0],
     ["knowledge", 0],
-    ["social", 0],
   ]);
   const add = (domain: IntentCoarseDomain, value: number) => {
     scores.set(domain, (scores.get(domain) ?? 0) + value);
@@ -86,10 +83,6 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
   ) {
     add("operations", 0.68);
   }
-  if (/\b(reflexion|estoic|marco aurelio|en que andas|dime algo bonito)\b/.test(t)) {
-    add("social", 0.58);
-  }
-
   if (params.indexedListKind === "gmail-list") {
     add("communication", 0.3);
   } else if (params.indexedListKind === "web-results") {

@@ -11,30 +11,23 @@ NPM_BIN="${NPM_BIN:-$(command -v npm || true)}"
 TUNNEL_BIN="${TUNNEL_BIN:-$(command -v cloudflared || true)}"
 TUNNEL_CONFIG="${LIM_TUNNEL_CONFIG:-${CONNECTOR_TUNNEL_CONFIG:-${APP_DIR}/cloudflared/config.yml}}"
 
-if [[ -z "${NPM_BIN}" ]]; then
-  echo "No se encontro npm en PATH."
-  exit 1
-fi
+log() { echo "[install-lim] $*"; }
+fail() { echo "[install-lim][error] $*" >&2; exit 1; }
 
-if [[ -z "${TUNNEL_BIN}" ]]; then
-  echo "No se encontro binario de tunel en PATH (default: cloudflared)."
-  exit 1
-fi
+log "Instalador stack LIM (app + tunnel, systemd --user)"
+log "Objetivo: servicios separados y persistentes por usuario."
 
-if [[ ! -d "${APP_DIR}" ]]; then
-  echo "No existe LIM_APP_DIR: ${APP_DIR}"
-  exit 1
-fi
+[[ -n "${NPM_BIN}" ]] || fail "No se encontró npm en PATH."
+[[ -n "${TUNNEL_BIN}" ]] || fail "No se encontró binario de túnel en PATH (default: cloudflared)."
+command -v systemctl >/dev/null 2>&1 || fail "No se encontró systemctl. Este instalador requiere systemd."
+[[ -d "${APP_DIR}" ]] || fail "No existe LIM_APP_DIR: ${APP_DIR}"
+[[ -f "${APP_DIR}/package.json" ]] || fail "No existe package.json en ${APP_DIR}."
+[[ -f "${TUNNEL_CONFIG}" ]] || fail "No existe config de túnel: ${TUNNEL_CONFIG}"
 
-if [[ ! -f "${APP_DIR}/package.json" ]]; then
-  echo "No existe package.json en ${APP_DIR}."
-  exit 1
-fi
-
-if [[ ! -f "${TUNNEL_CONFIG}" ]]; then
-  echo "No existe config de tunel: ${TUNNEL_CONFIG}"
-  exit 1
-fi
+log "App dir: ${APP_DIR}"
+log "App service: ${APP_SERVICE}"
+log "Tunnel service: ${TUNNEL_SERVICE}"
+log "Tunnel config: ${TUNNEL_CONFIG}"
 
 mkdir -p "${SERVICE_DIR}"
 
@@ -95,21 +88,33 @@ After=${APP_SERVICE} ${TUNNEL_SERVICE}
 WantedBy=default.target
 UNIT
 
-echo "[1/4] Recargando systemd --user..."
+log "[1/5] Recargando systemd --user..."
 systemctl --user daemon-reload
 
-echo "[2/4] Habilitando stack..."
+log "[2/5] Habilitando stack..."
 systemctl --user enable ${APP_SERVICE} ${TUNNEL_SERVICE} ${STACK_TARGET} >/dev/null
 
-echo "[3/4] Reiniciando stack..."
-systemctl --user restart ${APP_SERVICE} ${TUNNEL_SERVICE} || true
+log "[3/5] Reiniciando stack..."
+systemctl --user restart ${APP_SERVICE} ${TUNNEL_SERVICE}
 systemctl --user start ${STACK_TARGET}
 
-echo "[4/4] Estado final:"
+log "[4/5] Verificando estado final..."
 systemctl --user status "${APP_SERVICE}" --no-pager --lines=20 || true
 systemctl --user status "${TUNNEL_SERVICE}" --no-pager --lines=20 || true
 
+if ! systemctl --user is-active --quiet "${APP_SERVICE}"; then
+  fail "El servicio de app (${APP_SERVICE}) no quedó activo."
+fi
+if ! systemctl --user is-active --quiet "${TUNNEL_SERVICE}"; then
+  fail "El servicio de túnel (${TUNNEL_SERVICE}) no quedó activo."
+fi
+
+log "[5/5] Stack activo."
 echo
-echo "Instalacion completada."
-echo "Si quieres que arranque aun sin sesion grafica luego de reboot, habilita linger:"
-echo "  sudo loginctl enable-linger ${USER}"
+log "Instalación completada."
+log "Próximos pasos:"
+echo "  1) Estado app:    systemctl --user status ${APP_SERVICE} --no-pager"
+echo "  2) Estado túnel:  systemctl --user status ${TUNNEL_SERVICE} --no-pager"
+echo "  3) Logs app:      journalctl --user -u ${APP_SERVICE} -f"
+echo "  4) Logs túnel:    journalctl --user -u ${TUNNEL_SERVICE} -f"
+echo "  5) Arranque tras reboot sin sesión: sudo loginctl enable-linger ${USER}"

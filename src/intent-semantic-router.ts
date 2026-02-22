@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 type IntentRouteName =
-  | "stoic-smalltalk"
   | "self-maintenance"
   | "lim"
   | "schedule"
@@ -74,7 +73,6 @@ type PersistedIntentRouterConfig = {
 type LegacyIntentRouteName = IntentRouteName | "connector";
 
 const KNOWN_ROUTE_NAMES: IntentRouteName[] = [
-  "stoic-smalltalk",
   "self-maintenance",
   "lim",
   "schedule",
@@ -163,18 +161,6 @@ const SPANISH_STOPWORDS = new Set([
 ]);
 
 const DEFAULT_ROUTES: SemanticRouteConfig[] = [
-  {
-    name: "stoic-smalltalk",
-    threshold: 0.2,
-    utterances: [
-      "en que estas pensando",
-      "en que andas",
-      "dime algo bonito",
-      "decime algo lindo",
-      "dame una reflexion",
-      "frase estoica",
-    ],
-  },
   {
     name: "self-maintenance",
     threshold: 0.3,

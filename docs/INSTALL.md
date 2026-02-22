@@ -26,6 +26,21 @@ npm install
 
 ## 4. Configurar entorno (wizard recomendado)
 
+Instalador recomendado:
+
+```bash
+./scripts/install-houdi-agent.sh
+```
+
+Automatizado (sin preguntas):
+
+```bash
+TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
+./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build
+```
+
+Alternativa directa al wizard:
+
 ```bash
 npm run onboard
 ```
@@ -37,6 +52,10 @@ Alias:
 ```
 
 Esto genera/actualiza `.env` con todas las variables necesarias.
+El wizard ahora incluye preflight (Node/npm/systemd/proyecto), resumen de riesgos y checklist final con próximos pasos.
+Si usas `--yes`, toma valores desde:
+1) variables de entorno del proceso, 2) `.env` actual, 3) `.env.example` como fallback.
+Si falta un valor obligatorio, falla con mensaje explícito indicando qué variable definir.
 
 ## 5. Ejecutar en local (smoke test)
 
@@ -96,6 +115,43 @@ Servicio de usuario:
 systemctl --user status houdi-agent.service --no-pager
 journalctl --user -u houdi-agent.service -n 100 --no-pager
 ```
+
+## 7.1 Slack (opcional)
+
+Houdi puede recibir mensajes desde Slack usando bridge Socket Mode (proceso separado).
+
+1. Configurar tokens en `.env`:
+   - `SLACK_BOT_TOKEN=xoxb-...`
+   - `SLACK_APP_TOKEN=xapp-...`
+2. Verificar que el bridge local de Houdi esté activo (`HOUDI_LOCAL_API_ENABLED=true`).
+3. Levantar bridge Slack:
+
+```bash
+npm run slack:bridge
+```
+
+Para dejarlo persistente:
+
+```bash
+./scripts/install-systemd-user-slack-bridge.sh
+```
+
+Eventos Slack recomendados en la app:
+- `app_mention`
+- `message.channels`
+- `message.groups`
+- `message.im`
+- `message.mpim`
+
+Scopes recomendados:
+- Mínimos: `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `chat:write`
+- Avanzados: `commands`, `reactions:write`, `files:write`, `users:read`, `channels:read`, `groups:read`
+
+Capacidades avanzadas habilitadas en el bridge:
+- Deduplicación de eventos + reintentos al bridge local.
+- Reacciones de estado (⏳ mientras procesa, ✅ ok, ❌ error).
+- Fallback a archivo para respuestas largas.
+- Slash command configurable (`SLACK_SLASH_COMMAND`, default `/houdi`).
 
 ## 8. Actualización de versión
 

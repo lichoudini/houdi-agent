@@ -11,9 +11,11 @@
     "bench:intent-router": "tsx scripts/intent-router-benchmark.ts",
     "start": "node dist/index.js",
     "cli": "tsx src/cli.ts",
-    "onboard": "tsx src/onboard.ts"
+    "onboard": "tsx src/onboard.ts",
+    "slack:bridge": "tsx src/slack-bridge.ts"
   },
   "dependencies": {
+    "@slack/bolt": "^4.6.0",
     "cheerio": "^1.2.0",
     "dotenv": "^16.5.0",
     "googleapis": "^171.4.0",

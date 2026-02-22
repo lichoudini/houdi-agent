@@ -166,7 +166,6 @@ function parseIntentRouteAlphaMapJson(value: string | undefined): Record<string,
       return {};
     }
     const allowed = new Set([
-      "stoic-smalltalk",
       "self-maintenance",
       "lim",
       "schedule",
