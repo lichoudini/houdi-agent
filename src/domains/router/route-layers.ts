@@ -1,3 +1,5 @@
+import { classifyInteractionMode } from "./interaction-mode.js";
+
 export type RouteLayerContext = {
   normalizedText: string;
   hasMailContext: boolean;
@@ -43,6 +45,17 @@ function hasIndexedListReferenceCue(normalizedText: string): boolean {
 
 function hasMailCue(normalizedText: string): boolean {
   return /\b(gmail|correo|correos|mail|mails|email|emails|inbox|bandeja)\b/.test(normalizedText);
+}
+
+function hasSelfSkillCue(normalizedText: string): boolean {
+  const hasSkillNoun = /\b(habilidad(?:es)?|skill(?:s)?|regla(?:s)?|capacidad(?:es)?)\b/.test(normalizedText);
+  if (!hasSkillNoun) {
+    return false;
+  }
+  const hasVerb = /\b(crea|crear|agrega|agregar|suma|sumar|incorpora|incorporar|define|definir|configura|configurar|elimina|eliminar|borra|borrar|lista|listar|muestra|mostrar)\b/.test(
+    normalizedText,
+  );
+  return hasVerb;
 }
 
 function hasMailSendCue(normalizedText: string): boolean {
@@ -92,6 +105,8 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
   const layers: string[] = [];
   let strict = false;
   let exhausted = false;
+  const interactionMode = classifyInteractionMode(ctx.normalizedText);
+  const conversationalOnly = interactionMode === "conversational";
   const listReferenceCue = hasIndexedListReferenceCue(ctx.normalizedText);
   const scheduledMailCue = hasScheduledMailCue(ctx.normalizedText);
   const applyNarrow = (subset: string[], reason: string, layer: string, options?: { strict?: boolean }) => {
@@ -119,7 +134,7 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
     applyNarrow(["web"], "contexto de resultados web", "indexed-list-web", { strict: true });
   }
 
-  if (ctx.hasMailContext && !ctx.hasMemoryRecallCue) {
+  if (ctx.hasMailContext && !ctx.hasMemoryRecallCue && !conversationalOnly) {
     if (scheduledMailCue) {
       applyNarrow(["schedule", "gmail", "gmail-recipients"], "mail context programado", "mail-context-schedule", {
         strict: true,
@@ -133,11 +148,11 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
     applyNarrow(["memory"], "señal fuerte de memoria", "memory-cue", { strict: true });
   }
 
-  if (/\b(workspace|archivo|carpeta|renombra|mueve|copia|pega|borra)\b/.test(ctx.normalizedText)) {
+  if (!conversationalOnly && /\b(workspace|archivo|carpeta|renombra|mueve|copia|pega|borra)\b/.test(ctx.normalizedText)) {
     applyNarrow(["workspace", "document"], "señal fuerte de workspace", "workspace-cue", { strict: true });
   }
 
-  if (hasMailCue(ctx.normalizedText)) {
+  if (!conversationalOnly && hasMailCue(ctx.normalizedText)) {
     if (scheduledMailCue) {
       applyNarrow(["schedule", "gmail", "gmail-recipients"], "señal fuerte de gmail programado", "gmail-cue-schedule", {
         strict: true,
@@ -147,8 +162,12 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
     }
   }
 
-  if (/\b(web|internet|url|link|noticias)\b/.test(ctx.normalizedText) && !hasMailSendCue(ctx.normalizedText)) {
+  if (!conversationalOnly && /\b(web|internet|url|link|noticias)\b/.test(ctx.normalizedText) && !hasMailSendCue(ctx.normalizedText)) {
     applyNarrow(["web"], "señal fuerte de web", "web-cue", { strict: true });
+  }
+
+  if (hasSelfSkillCue(ctx.normalizedText) && !/\b(workspace|archivo|carpeta|ruta|path|directorio)\b/.test(ctx.normalizedText)) {
+    applyNarrow(["self-maintenance"], "señal fuerte de skill", "selfskill-cue", { strict: true });
   }
 
   if (allowed.length === baseCandidates.length) {

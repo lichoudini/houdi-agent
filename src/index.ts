@@ -56,6 +56,7 @@ import { DynamicIntentRoutesStore } from "./domains/router/dynamic-routes.js";
 import { rankIntentCandidatesWithEnsemble } from "./domains/router/ensemble.js";
 import { applyIntentRouteLayers, type RouteLayerDecision } from "./domains/router/route-layers.js";
 import { buildHierarchicalIntentDecision, type HierarchicalIntentDecision } from "./domains/router/hierarchical.js";
+import { shouldBypassAmbiguousPair } from "./domains/router/conflict-resolution.js";
 import { resolveIntentRouterAbVariant } from "./domains/router/ab-routing.js";
 import { RouterVersionStore } from "./domains/router/router-versioning.js";
 import { countNewsTopicMatches, extractNewsTopicTokens } from "./domains/web/news-topic-relevance.js";
@@ -5055,6 +5056,10 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
         missing,
       };
     },
+    clarificationsByAction: {
+      "delete-skill":
+        "Indica qué habilidad eliminar por índice o id. Ejemplos: 'elimina la habilidad 2', 'elimina la última habilidad' o 'elimina la habilidad #sk-abc123'.",
+    },
   },
   "gmail-recipients": {
     extract: (text) => {
@@ -5120,14 +5125,21 @@ function extractTypedRouteAction(params: {
 
 function buildTypedRouteClarificationQuestion(extraction: TypedRouteExtraction): string {
   const contract = TYPED_ROUTE_CONTRACTS[extraction.route];
+  const missing = extraction.missing.filter(Boolean);
   if (contract && extraction.action) {
     const actionMessage = contract.clarificationsByAction?.[extraction.action];
-    if (actionMessage) {
+    if (actionMessage && missing.length === 0) {
       return actionMessage;
+    }
+    if (actionMessage && missing.length > 0) {
+      return `${actionMessage} (faltan: ${missing.join(", ")}).`;
     }
   }
   if (contract?.fallbackClarification) {
-    return contract.fallbackClarification;
+    return missing.length > 0 ? `${contract.fallbackClarification} (faltan: ${missing.join(", ")}).` : contract.fallbackClarification;
+  }
+  if (missing.length > 0) {
+    return `Faltan parámetros para ejecutar ${extraction.summary}: ${missing.join(", ")}.`;
   }
   return `Faltan parámetros para ejecutar ${extraction.summary}. ¿Lo reformulas con más detalle?`;
 }
@@ -5157,16 +5169,14 @@ function shouldAbstainByUncertainty(params: {
     .filter(Boolean)
     .sort()
     .join("|");
-  if (pair === "gmail|gmail-recipients" && shouldBypassGmailRecipientsAmbiguity(params.text)) {
+  if (
+    shouldBypassAmbiguousPair(pair, params.text, {
+      normalizeIntentText,
+      detectSelfMaintenanceIntent,
+      shouldBypassGmailRecipientsAmbiguity,
+    })
+  ) {
     return false;
-  }
-  if (pair === "self-maintenance|workspace") {
-    const selfIntent = detectSelfMaintenanceIntent(params.text);
-    const normalized = normalizeIntentText(params.text);
-    const explicitWorkspaceCue = /\b(workspace|archivo|carpeta|ruta|path|directorio|pdf|txt|csv|json|md)\b/.test(normalized);
-    if (selfIntent.shouldHandle && (selfIntent.action === "add-skill" || selfIntent.action === "list-skills") && !explicitWorkspaceCue) {
-      return false;
-    }
   }
   const sensitive = isSensitiveIntentRoute(top.handler as Exclude<NaturalIntentHandlerName, "none">);
   if (calibrated < 0.52 && gap < 0.1) {

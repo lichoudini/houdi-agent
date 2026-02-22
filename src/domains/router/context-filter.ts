@@ -1,3 +1,5 @@
+import { classifyInteractionMode } from "./interaction-mode.js";
+
 export type RouterContextListKind = "workspace-list" | "stored-files" | "web-results" | "gmail-list";
 
 export type RouterContextFilterDecision = {
@@ -41,6 +43,16 @@ function hasScheduledMailCue(normalizedText: string): boolean {
   return hasScheduleVerb && hasTemporalCue;
 }
 
+function hasSelfSkillCue(normalizedText: string): boolean {
+  const hasSkillNoun = /\b(habilidad(?:es)?|skill(?:s)?|regla(?:s)?|capacidad(?:es)?)\b/.test(normalizedText);
+  if (!hasSkillNoun) {
+    return false;
+  }
+  return /\b(crea|crear|agrega|agregar|suma|sumar|incorpora|incorporar|define|definir|configura|configurar|elimina|eliminar|borra|borrar|lista|listar|muestra|mostrar)\b/.test(
+    normalizedText,
+  );
+}
+
 function narrowCandidates(
   base: string[],
   subset: string[],
@@ -71,6 +83,8 @@ export function buildIntentRouterContextFilter(
   if (!normalized) {
     return null;
   }
+  const interactionMode = classifyInteractionMode(normalized);
+  const conversationalOnly = interactionMode === "conversational";
 
   const reasons: string[] = [];
   let allowed = uniqueCandidates(params.candidates);
@@ -152,7 +166,7 @@ export function buildIntentRouterContextFilter(
     applyNarrow(["connector"], "explicit-lim-route", { strict: true });
   }
 
-  if (hasMailCue(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {
+  if (!conversationalOnly && hasMailCue(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {
     if (scheduledMailCue) {
       applyNarrow(["schedule", "gmail", "gmail-recipients"], "explicit-gmail-schedule-route", { strict: true });
     } else {
@@ -161,13 +175,18 @@ export function buildIntentRouterContextFilter(
   }
 
   if (
+    !conversationalOnly &&
     /\b(workspace|archivo|carpeta|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized) &&
     !/\b(gmail|correo|correos|mail|mails|email|emails|lim|web|internet|noticias)\b/.test(normalized)
   ) {
     applyNarrow(["workspace", "document"], "explicit-workspace-route", { strict: true });
   }
 
-  if (params.hasMailContext && !params.hasMemoryRecallCue) {
+  if (hasSelfSkillCue(normalized) && !/\b(workspace|archivo|carpeta|ruta|path|directorio)\b/.test(normalized)) {
+    applyNarrow(["self-maintenance"], "explicit-selfskill-route", { strict: true });
+  }
+
+  if (params.hasMailContext && !params.hasMemoryRecallCue && !conversationalOnly) {
     if (scheduledMailCue) {
       applyNarrow(["schedule", "gmail", "gmail-recipients"], "mail-lexical-cue-scheduled");
     } else {

@@ -114,6 +114,32 @@ test("context filter does not misroute 'leer correos' to workspace", () => {
   }
 });
 
+test("context filter prioriza self-maintenance para skill natural", () => {
+  const decision = buildIntentRouterContextFilter(
+    {
+      chatId: 1,
+      text: "crear una habilidad para responder mas breve",
+      candidates: ["self-maintenance", "workspace", "document"],
+      hasMailContext: false,
+      hasMemoryRecallCue: false,
+    },
+    {
+      normalizeIntentText: (text) => text.toLowerCase().trim(),
+      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
+      getIndexedListContext: () => null,
+      getPendingWorkspaceDelete: () => null,
+      getPendingWorkspaceDeletePath: () => null,
+      getLastGmailResultsCount: () => 0,
+      getLastListedFilesCount: () => 0,
+      getLastConnectorContextAt: () => 0,
+      connectorContextTtlMs: 60_000,
+    },
+  );
+  assert.ok(decision);
+  assert.equal(decision?.strict, true);
+  assert.deepEqual(decision?.allowed, ["self-maintenance"]);
+});
+
 test("route layers do not treat clock times as indexed-list references", () => {
   const decision = applyIntentRouteLayers(["gmail", "gmail-recipients", "schedule", "workspace"], {
     normalizedText: "programar correo para las 10:25 pm",
@@ -142,4 +168,18 @@ test("route layers keep gmail route when sending mail that mentions news topic",
   assert.equal(decision.exhausted, false);
   assert.ok(decision.allowed.includes("gmail"));
   assert.ok(!decision.allowed.includes("web"));
+});
+
+test("route layers priorizan self-maintenance para crear habilidad", () => {
+  const decision = applyIntentRouteLayers(["self-maintenance", "workspace", "document"], {
+    normalizedText: "crear una habilidad: cuando diga 33 redacta un poema en ingles",
+    hasMailContext: false,
+    hasMemoryRecallCue: false,
+    indexedListKind: null,
+    hasPendingWorkspaceDelete: false,
+  });
+  assert.ok(decision);
+  assert.equal(decision.strict, true);
+  assert.equal(decision.exhausted, false);
+  assert.deepEqual(decision.allowed, ["self-maintenance"]);
 });
