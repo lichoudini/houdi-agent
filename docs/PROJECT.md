@@ -4,7 +4,7 @@
 Houdi Agent es un bot de Telegram para operar una PC Linux de forma controlada, con ejecución de comandos restringida por agente y aprobación explícita para acciones sensibles.
 
 ## Alcance actual
-- Bot Telegram con comandos operativos (`/status`, `/exec`, `/tasks`, `/kill`).
+- Bot Telegram con comandos operativos (`/status`, `/exec`, `/task`, `/kill`).
 - Modo IA conversacional (`/ask`) y modo shell asistido (`/shell`, `/shellmode`).
 - Ingesta de archivos adjuntos:
   - guarda documentos en `workspace/files/...`

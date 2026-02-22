@@ -68,6 +68,12 @@
 - `src/selfskill-drafts.ts`
   - Borrador persistente de habilidades en múltiples mensajes por chat
   - Soporte start/add/show/apply/cancel
+- `src/domains/selfskill/natural.ts`
+  - Parser natural de skills: extracción de instrucción, comandos de borrador y heurística anti-colisión
+- `src/domains/selfskill/intents.ts`
+  - Detección de intenciones de mantenimiento (add/list/delete skill, restart, update)
+- `src/domains/selfskill/store.ts`
+  - Persistencia robusta en `workspace/AGENTS.md` para agregar/listar/eliminar skills dinámicas
 - `src/interest-learning.ts`
   - Aprendizaje de gustos/intereses por recurrencia de pedidos
   - Perfil por chat con categorías y keywords
@@ -103,7 +109,7 @@
    - ejecución de comando
    - operación de seguridad (approve/deny/panic)
    - operación de memoria (`/remember`, `/memory ...`)
-   - operación de agenda (`/agenda ...`)
+   - operación de agenda/tareas (`/task ...`)
    - operación de archivos de workspace (`/workspace ...` o lenguaje natural)
    - operación Gmail (`/gmail ...`)
 4. Para ejecutar:

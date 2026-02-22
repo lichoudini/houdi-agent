@@ -59,3 +59,54 @@ test("workspace files service basic operations", async () => {
 
   await fs.rm(tempDir, { recursive: true, force: true });
 });
+
+test("workspace files service resolves ellipsis placeholder when match is unique", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-ellipsis-test-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+
+  await service.createWorkspaceDirectory("images");
+  await service.createWorkspaceDirectory("images/events");
+  await service.writeWorkspaceTextFile({
+    relativePath: "images/events/reporte.txt",
+    content: "hola",
+  });
+
+  const resolvedDir = await service.resolveEllipsisPathPlaceholder("imag...");
+  assert.equal(resolvedDir.resolvedPath, "images");
+  assert.equal(resolvedDir.expanded, true);
+
+  const resolvedNested = await service.resolveEllipsisPathPlaceholder("imag.../eve.../repo...");
+  assert.equal(resolvedNested.resolvedPath, "images/events/reporte.txt");
+  assert.equal(resolvedNested.expanded, true);
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+test("workspace files service reports ambiguity for ellipsis placeholder", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-ellipsis-ambiguous-test-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+
+  await service.createWorkspaceDirectory("images");
+  await service.createWorkspaceDirectory("imagenes");
+
+  await assert.rejects(
+    async () => service.resolveEllipsisPathPlaceholder("imag..."),
+    /Ruta ambigua/,
+  );
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});

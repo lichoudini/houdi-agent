@@ -213,7 +213,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/web <consulta>`
 - `/webopen <n|url> [pregunta]`
 - `/webask <consulta>`
-- `/agenda ...`
+- `/task ...`
 - `/gmail ...`
 - `/remember <nota>`
 - `/memory`
@@ -250,7 +250,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/outbox [status|flush|recover]`
 - `/metrics [reset]`
 - `/panic on|off|status`
-- `/tasks`
+- `/task running`
 - `/kill <taskId>`
 
 También puedes escribir mensajes normales (sin `/`) y el bot responderá con OpenAI.
@@ -258,8 +258,8 @@ Si detecta intención de web (buscar en internet o analizar una URL), lo hace en
 Si detecta intención de recordatorios/tareas con fecha/hora, las agenda en lenguaje natural.
 Si activas `/shellmode on`, esos mensajes también podrán disparar ejecución shell (siempre limitada por la allowlist del agente activo).
 También puedes enviar nota de voz/audio: el bot lo transcribe y responde sobre ese contenido.
-Si envías un archivo por Telegram (document), lo guarda automáticamente en `workspace/files/...`.
-Si envías una imagen/foto, la guarda en `workspace/images/...` y además puede analizarla con OpenAI Vision.
+Si envías un archivo por Telegram (document), lo guarda automáticamente en `workspace/files/`.
+Si envías una imagen/foto, la guarda en `workspace/images/` y además puede analizarla con OpenAI Vision.
 También puedes pedir en lenguaje natural operaciones sobre `workspace` (listar, crear carpeta, crear archivo simple, mover, renombrar, eliminar y enviar archivos).
 Para acciones sensibles (exec, send de Gmail y borrado en workspace), puede requerir `Plan Preview` y confirmación explícita con `/confirm`.
 
@@ -351,16 +351,16 @@ Modo natural:
 - `enviame "files/chat-123/2026-02-19/reporte.pdf"`
 - `enviame el archivo 2`
 
-## Agenda y Recordatorios
+## Task y Recordatorios
 
 Permite crear tareas programadas con lenguaje natural y dispararlas automáticamente en el chat.
 
 Comandos:
 
-- `/agenda` o `/agenda list`
-- `/agenda add <cuando> | <detalle>`
-- `/agenda del <n|id|last>`
-- `/agenda edit <n|id> | <nuevo cuando> | <nuevo detalle opcional>`
+- `/task` o `/task list`
+- `/task add <cuando> | <detalle>`
+- `/task del <n|id|last>`
+- `/task edit <n|id> | <nuevo cuando> | <nuevo detalle opcional>`
 
 Modo natural:
 
@@ -522,9 +522,7 @@ El script crea:
 Comandos:
 
 - `/web <consulta>`: busca en la web y devuelve resultados numerados.
-- `/crypto [consulta] [limit]`: mercado crypto en USD (CoinGecko).
 - `/weather [ubicación]`: clima actual + próximos días (Open-Meteo).
-- `/reddit <consulta> [limit]`: búsqueda de posts en Reddit API.
 - `/webopen <n|url> [pregunta]`: abre un resultado (o URL directa). Si agregas pregunta, lo analiza con IA.
 - `/webask <consulta>`: búsqueda + síntesis automática con fuentes.
 
@@ -543,7 +541,7 @@ Modo natural:
 - `abre https://nodejs.org/en/blog y resumilo`
 - `quiero links sobre ollama en docker`
 
-Para pedidos de noticias en lenguaje natural, el buscador prioriza lo más reciente, muestra como máximo 2 resultados de Reddit y luego completa con otras fuentes web relevantes.
+Para pedidos de noticias en lenguaje natural, el buscador prioriza lo más reciente y completa con fuentes web relevantes.
 
 ## Lectura de Documentos (PDF + Office)
 

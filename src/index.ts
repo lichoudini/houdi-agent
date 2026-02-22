@@ -29,7 +29,6 @@ import { OpenMeteoApiTool } from "./open-meteo-api.js";
 import { formatUsd as formatUsageUsd } from "./openai-usage.js";
 import { AgenticCanary } from "./agentic-canary.js";
 import { AgentPolicyEngine, type AgentCapability } from "./agent-policy.js";
-import { RedditApiTool, type RedditPostResult } from "./reddit-api.js";
 import { finishRunTrace, startRunTrace } from "./run-trace.js";
 import { type SavedEmailRecipient, EmailRecipientsSqliteService } from "./email-recipients-sqlite.js";
 import { ScheduledTaskSqliteService } from "./scheduled-tasks-sqlite.js";
@@ -40,6 +39,7 @@ import {
   detectGmailRecipientNaturalIntent as detectGmailRecipientNaturalIntentDomain,
 } from "./domains/gmail/intents.js";
 import { createGmailTextParsers } from "./domains/gmail/text-parsers.js";
+import { shouldBypassGmailRecipientsAmbiguity } from "./domains/gmail/uncertainty.js";
 import { buildIntentRouterContextFilter as buildIntentRouterContextFilterDomain } from "./domains/router/context-filter.js";
 import { isLikelyConversationalNarrative as isLikelyConversationalNarrativeDomain } from "./domains/router/conversation-cues.js";
 import {
@@ -58,6 +58,22 @@ import { applyIntentRouteLayers, type RouteLayerDecision } from "./domains/route
 import { buildHierarchicalIntentDecision, type HierarchicalIntentDecision } from "./domains/router/hierarchical.js";
 import { resolveIntentRouterAbVariant } from "./domains/router/ab-routing.js";
 import { RouterVersionStore } from "./domains/router/router-versioning.js";
+import { countNewsTopicMatches, extractNewsTopicTokens } from "./domains/web/news-topic-relevance.js";
+import {
+  detectSelfMaintenanceIntent,
+  type SelfMaintenanceIntent,
+} from "./domains/selfskill/intents.js";
+import {
+  extractSelfSkillInstructionFromText,
+  formatSelfSkillDraftLines,
+  isLikelySelfSkillDraftLine,
+  isSkillDraftCancelRequested,
+  isSkillDraftCommitRequested,
+  isSkillDraftMultiMessageRequested,
+  isSkillDraftShowRequested,
+  sanitizeSelfSkillText,
+} from "./domains/selfskill/natural.js";
+import { SelfSkillStore } from "./domains/selfskill/store.js";
 import { detectWorkspaceNaturalIntent as detectWorkspaceNaturalIntentDomain } from "./domains/workspace/intents.js";
 import {
   detectSimpleTextExtensionHint as detectSimpleTextExtensionHintDomain,
@@ -71,7 +87,6 @@ import { SelfSkillDraftService } from "./selfskill-drafts.js";
 import { acquireSingleInstanceLock } from "./single-instance-lock.js";
 import { TaskRunner } from "./task-runner.js";
 import { splitForTelegram } from "./telegram-utils.js";
-import { CoinGeckoApiTool } from "./coingecko-api.js";
 import type { WebSearchResult } from "./web-browser.js";
 import { WebBrowser } from "./web-browser.js";
 import { ObservabilityService } from "./observability.js";
@@ -119,12 +134,6 @@ const webBrowser = new WebBrowser({
   maxFetchBytes: config.webFetchMaxBytes,
   maxTextChars: config.webContentMaxChars,
   defaultSearchResults: config.webSearchMaxResults,
-});
-const redditApi = new RedditApiTool({
-  timeoutMs: config.webFetchTimeoutMs,
-});
-const coinGeckoApi = new CoinGeckoApiTool({
-  timeoutMs: config.webFetchTimeoutMs,
 });
 const openMeteoApi = new OpenMeteoApiTool({
   timeoutMs: config.webFetchTimeoutMs,
@@ -210,6 +219,9 @@ const selfSkillDrafts = new SelfSkillDraftService({
   filePath: config.selfSkillDraftsFile,
 });
 await selfSkillDrafts.load();
+const selfSkillStore = new SelfSkillStore({
+  workspaceDir: config.workspaceDir,
+});
 const interestLearning = new InterestLearningService({
   filePath: config.interestsFile,
 });
@@ -364,10 +376,8 @@ type StoicSmalltalkSession = {
 const stoicSmalltalkByChat = new Map<number, StoicSmalltalkSession>();
 const DOCUMENT_SEARCH_MAX_DEPTH = 6;
 const DOCUMENT_SEARCH_MAX_DIRS = 2000;
-const SELF_SKILLS_SECTION_TITLE = "## Dynamic Skills";
 const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
 const SELF_UPDATE_APPROVAL_COMMAND = "__selfupdate__";
-const NEWS_MAX_REDDIT_RESULTS = 2;
 const NEWS_MAX_AGE_DAYS = 7;
 const NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES = 8;
 const CONNECTOR_CONTEXT_TTL_MS = 30 * 60 * 1000;
@@ -447,9 +457,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "getfile",
   "web",
   "lim",
-  "crypto",
   "weather",
-  "reddit",
   "webopen",
   "webask",
   "gmail",
@@ -794,6 +802,7 @@ const {
   buildGmailDraftInstruction,
   shouldAvoidLiteralBodyFallback,
   parseNaturalLimit,
+  extractNewsTopicFromText,
   buildNaturalGmailQuery,
 } = gmailTextParsers;
 
@@ -956,227 +965,6 @@ async function askOpenAiForChat(params: {
   });
 }
 
-function sanitizeSelfSkillText(text: string): string {
-  return truncateInline(text.replace(/\s+/g, " ").trim(), 1200);
-}
-
-function extractSelfSkillInstructionFromText(text: string): string {
-  const original = text.trim();
-  if (!original) {
-    return "";
-  }
-
-  const quoted = extractQuotedSegments(original);
-  if (quoted.length > 0) {
-    const joined = quoted.join(" ").trim();
-    if (joined) {
-      return sanitizeSelfSkillText(joined);
-    }
-  }
-
-  const patterns = [
-    /\b(?:agrega|agregar|suma|sumar|anade|añade|incorpora|incorporar|crea|crear|genera|generar|define|definir|configura|configurar|habilita|habilitar|entrena|entrenar|ensena|enseña|mejora|mejorate)\s+(?:una?\s+|la\s+|el\s+)?(?:nueva\s+)?(?:habilidades?|skills?|reglas?|capacidades?)\s*(?:de|para|que|:|-)?\s*(.+)$/i,
-    /\b(?:nueva\s+)?(?:habilidades?|skills?|reglas?|capacidades?)\s*[:=-]\s*(.+)$/i,
-    /\b(?:mejorate|mejora)\s+(?:con|para)\s+(.+)$/i,
-    /\b(?:crear|crea|sumar|suma|agregar|agrega)\s+skill\s+(?:de|para|que|:|-)?\s*(.+)$/i,
-  ];
-
-  for (const pattern of patterns) {
-    const extracted = original.match(pattern)?.[1]?.trim();
-    if (!extracted) {
-      continue;
-    }
-    const cleaned = extracted
-      .replace(/^["'`]+|["'`]+$/g, "")
-      .replace(/^(de|para|que|sobre|acerca de)\s+/i, "")
-      .trim();
-    if (cleaned) {
-      return sanitizeSelfSkillText(cleaned);
-    }
-  }
-
-  return "";
-}
-
-function isSkillDraftMultiMessageRequested(textNormalized: string): boolean {
-  return (
-    /\b(varios mensajes|en varios mensajes|por partes|en partes|paso a paso|de a poco)\b/.test(textNormalized) &&
-    /\b(skill|skills|habilidad|habilidades|regla|reglas|capacidad|capacidades)\b/.test(textNormalized)
-  );
-}
-
-function isSkillDraftCommitRequested(textNormalized: string): boolean {
-  return /\b(listo|aplica|aplicalo|aplicar|finaliza|finalizar|termina|terminar|guarda|guardar|crea|crear)\b/.test(
-    textNormalized,
-  );
-}
-
-function isSkillDraftCancelRequested(textNormalized: string): boolean {
-  return /\b(cancela|cancelar|descarta|descartar|olvida|olvidar|aborta|abortar)\b/.test(textNormalized);
-}
-
-function isSkillDraftShowRequested(textNormalized: string): boolean {
-  return (
-    /\b(ver|mostrar|mostrame|muestrame|estado|resumen)\b/.test(textNormalized) &&
-    /\b(borrador|draft|skill|habilidad)\b/.test(textNormalized)
-  );
-}
-
-function formatSelfSkillDraftLines(lines: string[]): string {
-  if (lines.length === 0) {
-    return "(vacio)";
-  }
-  return lines.map((line, index) => `${index + 1}. ${line}`).join("\n");
-}
-
-function parseDynamicSkillsFromAgentsFile(content: string): string[] {
-  const lines = content.split(/\r?\n/);
-  const start = lines.findIndex((line) => line.trim() === SELF_SKILLS_SECTION_TITLE);
-  if (start === -1) {
-    return [];
-  }
-
-  const entries: string[] = [];
-  for (let idx = start + 1; idx < lines.length; idx += 1) {
-    const line = lines[idx] ?? "";
-    if (/^##\s+/.test(line.trim())) {
-      break;
-    }
-    const cleaned = line.trim();
-    if (!cleaned) {
-      continue;
-    }
-    entries.push(cleaned);
-  }
-  return entries;
-}
-
-async function appendDynamicSkillInstruction(instruction: string): Promise<{ relPath: string; entry: string }> {
-  const cleaned = sanitizeSelfSkillText(instruction);
-  if (!cleaned) {
-    throw new Error("Instrucción vacía");
-  }
-
-  const relPath = "AGENTS.md";
-  const fullPath = path.join(config.workspaceDir, relPath);
-  await fs.mkdir(config.workspaceDir, { recursive: true });
-
-  let current = "";
-  try {
-    current = await fs.readFile(fullPath, "utf8");
-  } catch {
-    current = "# AGENTS.md\n";
-  }
-
-  const timestamp = new Date().toISOString().slice(0, 19);
-  const entry = `- [${timestamp}] ${cleaned}`;
-  const entries = parseDynamicSkillsFromAgentsFile(current);
-
-  if (entries.length === 0) {
-    const next = `${current.trimEnd()}\n\n${SELF_SKILLS_SECTION_TITLE}\n${entry}\n`;
-    await fs.writeFile(fullPath, next, "utf8");
-  } else {
-    const lines = current.split(/\r?\n/);
-    const start = lines.findIndex((line) => line.trim() === SELF_SKILLS_SECTION_TITLE);
-    let end = lines.length;
-    for (let idx = start + 1; idx < lines.length; idx += 1) {
-      if (/^##\s+/.test((lines[idx] ?? "").trim())) {
-        end = idx;
-        break;
-      }
-    }
-    const nextLines = [...lines.slice(0, end), entry, ...lines.slice(end)];
-    await fs.writeFile(fullPath, `${nextLines.join("\n").replace(/\n+$/g, "")}\n`, "utf8");
-  }
-
-  return { relPath: relPath.replace(/\\/g, "/"), entry };
-}
-
-async function listDynamicSkillInstructions(): Promise<{ relPath: string; entries: string[] }> {
-  const relPath = "AGENTS.md";
-  const fullPath = path.join(config.workspaceDir, relPath);
-  let content = "";
-  try {
-    content = await fs.readFile(fullPath, "utf8");
-  } catch {
-    return { relPath, entries: [] };
-  }
-  const entries = parseDynamicSkillsFromAgentsFile(content);
-  return {
-    relPath,
-    entries,
-  };
-}
-
-async function removeDynamicSkillInstruction(inputIndex: number): Promise<{
-  relPath: string;
-  removedEntry: string;
-  removedIndex: number;
-  remaining: number;
-}> {
-  if (!Number.isFinite(inputIndex) || inputIndex === 0) {
-    throw new Error("Índice inválido");
-  }
-
-  const relPath = "AGENTS.md";
-  const fullPath = path.join(config.workspaceDir, relPath);
-  let content = "";
-  try {
-    content = await fs.readFile(fullPath, "utf8");
-  } catch {
-    throw new Error("No existe AGENTS.md para editar");
-  }
-
-  const lines = content.split(/\r?\n/);
-  const sectionStart = lines.findIndex((line) => line.trim() === SELF_SKILLS_SECTION_TITLE);
-  if (sectionStart < 0) {
-    throw new Error("No hay sección Dynamic Skills");
-  }
-
-  let sectionEnd = lines.length;
-  for (let idx = sectionStart + 1; idx < lines.length; idx += 1) {
-    if (/^##\s+/.test((lines[idx] ?? "").trim())) {
-      sectionEnd = idx;
-      break;
-    }
-  }
-
-  const entryLineIndexes: number[] = [];
-  const entryLines: string[] = [];
-  for (let idx = sectionStart + 1; idx < sectionEnd; idx += 1) {
-    const cleaned = (lines[idx] ?? "").trim();
-    if (!cleaned) {
-      continue;
-    }
-    entryLineIndexes.push(idx);
-    entryLines.push(cleaned);
-  }
-
-  if (entryLineIndexes.length === 0) {
-    throw new Error("No hay habilidades dinámicas para eliminar");
-  }
-
-  const targetPosition = inputIndex === -1 ? entryLineIndexes.length - 1 : inputIndex - 1;
-  if (targetPosition < 0 || targetPosition >= entryLineIndexes.length) {
-    throw new Error(`Índice fuera de rango (1..${entryLineIndexes.length})`);
-  }
-
-  const removedIndex = targetPosition + 1;
-  const removedEntry = entryLines[targetPosition] ?? "";
-  const removeLineAt = entryLineIndexes[targetPosition]!;
-
-  lines.splice(removeLineAt, 1);
-  const nextContent = `${lines.join("\n").replace(/\n+$/g, "")}\n`;
-  await fs.writeFile(fullPath, nextContent, "utf8");
-
-  return {
-    relPath,
-    removedEntry,
-    removedIndex,
-    remaining: entryLineIndexes.length - 1,
-  };
-}
-
 type IncomingAudio = {
   kind: "voice" | "audio" | "document";
   fileId: string;
@@ -1242,13 +1030,6 @@ type NewsVertical =
 type CuratedNewsDomains = {
   es: string[];
   en: string[];
-};
-
-type SelfMaintenanceIntent = {
-  shouldHandle: boolean;
-  action?: "add-skill" | "delete-skill" | "list-skills" | "restart-service" | "update-service";
-  instruction?: string;
-  skillIndex?: number;
 };
 
 type ConnectorNaturalAction = "status" | "start" | "stop" | "restart" | "query";
@@ -1987,7 +1768,7 @@ async function findWorkspaceFilesBySelector(
   matches: Array<{ path: string; relPath: string }>;
   truncated: boolean;
 }> {
-  const scopeNormalized = normalizeWorkspaceRelativePath(selector.scopePath ?? "");
+  const scopeNormalized = await resolveWorkspacePathInputWithAutocomplete(selector.scopePath ?? "");
   const scope = resolveWorkspacePath(scopeNormalized);
   let scopeStat: Awaited<ReturnType<typeof fs.stat>>;
   try {
@@ -2110,7 +1891,7 @@ async function findWorkspaceFilesByExtensions(params: {
     };
   }
 
-  const scopeNormalized = normalizeWorkspaceRelativePath(params.scopePath ?? "");
+  const scopeNormalized = await resolveWorkspacePathInputWithAutocomplete(params.scopePath ?? "");
   const scope = resolveWorkspacePath(scopeNormalized);
   let scopeStat: Awaited<ReturnType<typeof fs.stat>>;
   try {
@@ -2214,8 +1995,10 @@ function basenameCollisionNames(paths: string[]): string[] {
 }
 
 async function copyWorkspacePath(sourceInput: string, targetInput: string): Promise<{ from: string; to: string }> {
-  const sourceNormalized = normalizeWorkspaceRelativePath(sourceInput);
-  const targetNormalized = normalizeWorkspaceRelativePath(targetInput);
+  const [sourceNormalized, targetNormalized] = await Promise.all([
+    resolveWorkspacePathInputWithAutocomplete(sourceInput),
+    resolveWorkspacePathInputWithAutocomplete(targetInput),
+  ]);
   if (!sourceNormalized || !targetNormalized) {
     throw new Error("Faltan ruta origen o destino");
   }
@@ -2252,11 +2035,11 @@ async function copyWorkspacePath(sourceInput: string, targetInput: string): Prom
 }
 
 async function moveWorkspacePathsToDirectory(paths: string[], targetDirInput: string): Promise<Array<{ from: string; to: string }>> {
-  const targetDir = normalizeWorkspaceRelativePath(targetDirInput);
+  const targetDir = await resolveWorkspacePathInputWithAutocomplete(targetDirInput);
   if (!targetDir) {
     throw new Error("Indica la carpeta destino dentro de workspace");
   }
-  const normalizedPaths = paths.map((item) => normalizeWorkspaceRelativePath(item)).filter(Boolean);
+  const normalizedPaths = (await Promise.all(paths.map((item) => resolveWorkspacePathInputWithAutocomplete(item)))).filter(Boolean);
   if (normalizedPaths.length === 0) {
     return [];
   }
@@ -2296,11 +2079,11 @@ async function moveWorkspacePathsToDirectory(paths: string[], targetDirInput: st
 }
 
 async function copyWorkspacePathsToDirectory(paths: string[], targetDirInput: string): Promise<Array<{ from: string; to: string }>> {
-  const targetDir = normalizeWorkspaceRelativePath(targetDirInput);
+  const targetDir = await resolveWorkspacePathInputWithAutocomplete(targetDirInput);
   if (!targetDir) {
     throw new Error("Indica la carpeta destino dentro de workspace");
   }
-  const normalizedPaths = paths.map((item) => normalizeWorkspaceRelativePath(item)).filter(Boolean);
+  const normalizedPaths = (await Promise.all(paths.map((item) => resolveWorkspacePathInputWithAutocomplete(item)))).filter(Boolean);
   if (normalizedPaths.length === 0) {
     return [];
   }
@@ -2502,6 +2285,18 @@ function stripTrailingPunctuation(raw: string): string {
   return raw.replace(/[)\]}",;:.!?]+$/g, "").trim();
 }
 
+function stripTrailingWorkspacePathPunctuation(raw: string): string {
+  const withoutClosing = raw.replace(/[)\]}",;:!?]+$/g, "").trim();
+  if (!withoutClosing) {
+    return "";
+  }
+  // Preserve ellipsis path placeholders (e.g. "img...") for workspace autocompletion.
+  if (/(?:^|\/)[^/\s]+\.{3,}$/.test(withoutClosing)) {
+    return withoutClosing;
+  }
+  return withoutClosing.replace(/\.+$/g, "").trim();
+}
+
 function extractDocumentReferences(text: string, allowedExts: string[]): string[] {
   const escapedExts = allowedExts
     .map((ext) => ext.trim().toLowerCase())
@@ -2574,7 +2369,7 @@ function normalizeWorkspaceRelativePath(raw: string): string {
     return "";
   }
   const unquoted = trimmed.replace(/^["'`]+|["'`]+$/g, "");
-  const withoutPunctuation = stripTrailingPunctuation(unquoted);
+  const withoutPunctuation = stripTrailingWorkspacePathPunctuation(unquoted);
   if (!withoutPunctuation) {
     return "";
   }
@@ -2596,7 +2391,7 @@ function cleanWorkspacePathPhrase(raw: string): string {
   }
 
   const unquoted = original.replace(/^["'`]+|["'`]+$/g, "").trim();
-  if (/^[a-z0-9_-]+\.{3,}$/i.test(unquoted)) {
+  if (/^\.{3,}$/.test(unquoted)) {
     return "";
   }
 
@@ -2940,11 +2735,41 @@ function resolveWorkspacePath(relativeInput?: string): { fullPath: string; relPa
   return workspaceFiles.resolveWorkspacePath(relativeInput);
 }
 
+function hasWorkspaceEllipsisPathPlaceholder(relativeInput?: string): boolean {
+  return workspaceFiles.hasEllipsisPathPlaceholder(relativeInput);
+}
+
+async function resolveWorkspaceEllipsisPathPlaceholder(
+  relativeInput: string,
+): Promise<{ inputPath: string; resolvedPath: string; expanded: boolean }> {
+  return workspaceFiles.resolveEllipsisPathPlaceholder(relativeInput);
+}
+
+async function resolveWorkspacePathInputWithAutocomplete(
+  relativeInput: string | undefined,
+  options?: { autocompleteNotices?: string[]; label?: string },
+): Promise<string> {
+  const normalized = normalizeWorkspaceRelativePath(relativeInput ?? "");
+  if (!normalized) {
+    return "";
+  }
+  if (!hasWorkspaceEllipsisPathPlaceholder(normalized)) {
+    return normalized;
+  }
+  const resolved = await resolveWorkspaceEllipsisPathPlaceholder(normalized);
+  if (resolved.expanded && options?.autocompleteNotices) {
+    const label = options.label?.trim() ? `${options.label.trim()}: ` : "";
+    options.autocompleteNotices.push(`${label}workspace/${resolved.inputPath} -> workspace/${resolved.resolvedPath}`);
+  }
+  return resolved.resolvedPath;
+}
+
 async function listWorkspaceDirectory(relativeInput?: string): Promise<{
   relPath: string;
   entries: Array<{ name: string; kind: "dir" | "file" | "link" | "other"; size?: number }>;
 }> {
-  return workspaceFiles.listWorkspaceDirectory(relativeInput);
+  const resolvedPath = await resolveWorkspacePathInputWithAutocomplete(relativeInput);
+  return workspaceFiles.listWorkspaceDirectory(resolvedPath);
 }
 
 function formatWorkspaceEntries(entries: Array<{ name: string; kind: "dir" | "file" | "link" | "other"; size?: number }>): string[] {
@@ -2952,7 +2777,8 @@ function formatWorkspaceEntries(entries: Array<{ name: string; kind: "dir" | "fi
 }
 
 async function createWorkspaceDirectory(relativeInput: string): Promise<{ relPath: string }> {
-  return workspaceFiles.createWorkspaceDirectory(relativeInput);
+  const resolvedPath = await resolveWorkspacePathInputWithAutocomplete(relativeInput);
+  return workspaceFiles.createWorkspaceDirectory(resolvedPath);
 }
 
 async function writeWorkspaceTextFile(params: {
@@ -2961,15 +2787,24 @@ async function writeWorkspaceTextFile(params: {
   overwrite?: boolean;
   append?: boolean;
 }): Promise<{ relPath: string; size: number; created: boolean }> {
-  return workspaceFiles.writeWorkspaceTextFile(params);
+  const resolvedPath = await resolveWorkspacePathInputWithAutocomplete(params.relativePath);
+  return workspaceFiles.writeWorkspaceTextFile({
+    ...params,
+    relativePath: resolvedPath,
+  });
 }
 
 async function moveWorkspacePath(sourceInput: string, targetInput: string): Promise<{ from: string; to: string }> {
-  return workspaceFiles.moveWorkspacePath(sourceInput, targetInput);
+  const [resolvedSource, resolvedTarget] = await Promise.all([
+    resolveWorkspacePathInputWithAutocomplete(sourceInput),
+    resolveWorkspacePathInputWithAutocomplete(targetInput),
+  ]);
+  return workspaceFiles.moveWorkspacePath(resolvedSource, resolvedTarget);
 }
 
 async function deleteWorkspacePath(relativeInput: string): Promise<{ relPath: string; kind: "dir" | "file" | "other" }> {
-  return workspaceFiles.deleteWorkspacePath(relativeInput);
+  const resolvedPath = await resolveWorkspacePathInputWithAutocomplete(relativeInput);
+  return workspaceFiles.deleteWorkspacePath(resolvedPath);
 }
 
 function detectWorkspaceNaturalIntent(text: string): WorkspaceNaturalIntent {
@@ -2999,15 +2834,6 @@ function extractFirstHttpUrl(text: string): string | null {
   }
   const candidate = stripTrailingPunctuation(match[0] ?? "");
   return candidate || null;
-}
-
-function isRedditUrl(rawUrl: string): boolean {
-  try {
-    const hostname = new URL(rawUrl).hostname.toLowerCase();
-    return hostname === "reddit.com" || hostname.endsWith(".reddit.com") || hostname === "redd.it";
-  } catch {
-    return false;
-  }
 }
 
 function resolveWebResultDomain(rawUrl: string): string {
@@ -3131,9 +2957,6 @@ function buildCuratedNewsDomains(rawQuery: string): { vertical: NewsVertical; do
 }
 
 function computeNewsSourceAuthorityScore(hit: WebSearchResult): number {
-  if (isRedditUrl(hit.url)) {
-    return 3;
-  }
   const domain = resolveWebResultDomain(hit.url);
   if (domain === "sitio desconocido") {
     return -2;
@@ -3394,15 +3217,22 @@ function computeNewsRecencyScore(date: Date | null, now: Date = new Date()): num
   return -18;
 }
 
-function buildNewsPriorityScore(hit: WebSearchResult, index: number, now: Date = new Date()): number {
+function buildNewsPriorityScore(
+  hit: WebSearchResult,
+  index: number,
+  now: Date = new Date(),
+  topicTokens: string[] = [],
+): number {
   const date = extractDetectedNewsDate(hit, now);
   const recencyScore = computeNewsRecencyScore(date, now);
   const sourceAuthority = computeNewsSourceAuthorityScore(hit);
+  const topicMatches = countNewsTopicMatches(`${hit.title}\n${hit.snippet}\n${hit.url}`, topicTokens);
+  const topicRelevance = topicTokens.length === 0 ? 0 : topicMatches > 0 ? topicMatches * 14 : -26;
   const snippet = normalizeSearchSnippet(hit.snippet, 240);
   const snippetQuality = snippet ? Math.min(4, snippet.length / 80) : -1.2;
   const titleQuality = hit.title.trim().length >= 14 ? 1.5 : 0;
   const orderBias = Math.max(0, 7 - index * 0.7);
-  return recencyScore + sourceAuthority + snippetQuality + titleQuality + orderBias;
+  return recencyScore + sourceAuthority + topicRelevance + snippetQuality + titleQuality + orderBias;
 }
 
 function formatNewsDetectedDate(date: Date | null): string {
@@ -3494,35 +3324,37 @@ function mergeWebSearchResults(results: WebSearchResult[], limitInput: number): 
   return merged;
 }
 
-function prioritizeNewsResultsWithRedditCap(params: {
-  redditHits: WebSearchResult[];
+function prioritizeNewsResults(params: {
   generalHits: WebSearchResult[];
   limit: number;
-  redditCap: number;
+  topicTokens: string[];
 }): WebSearchResult[] {
   const now = new Date();
-  const deduped = mergeWebSearchResults(
-    [...params.redditHits, ...params.generalHits],
-    Math.max(params.limit * 4, params.limit),
-  );
+  const deduped = mergeWebSearchResults([...params.generalHits], Math.max(params.limit * 4, params.limit));
   const ranked = deduped.map((hit, index) => {
     const detectedDate = extractDetectedNewsDate(hit, now);
-    const score = buildNewsPriorityScore(hit, index, now);
+    const topicMatches = countNewsTopicMatches(`${hit.title}\n${hit.snippet}\n${hit.url}`, params.topicTokens);
+    const score = buildNewsPriorityScore(hit, index, now, params.topicTokens);
     return {
       hit,
       index,
       score,
       detectedDate,
-      reddit: isRedditUrl(hit.url),
+      topicMatches,
     };
   });
+  const strictTopicRequested = params.topicTokens.length > 0;
+  const topical = strictTopicRequested ? ranked.filter((item) => item.topicMatches > 0) : ranked;
+  const topicalOnly = strictTopicRequested && topical.length > 0;
+  const rankedForSelection = topicalOnly ? topical : ranked;
+  const allowOffTopicFallback = !topicalOnly;
   const isWithinFreshWindow = (date: Date): boolean => {
     const ageDays = (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000);
     return ageDays >= -1 && ageDays <= NEWS_MAX_AGE_DAYS;
   };
-  const freshDated = ranked.filter((item) => item.detectedDate && isWithinFreshWindow(item.detectedDate));
-  const undated = ranked.filter((item) => !item.detectedDate);
-  const stale = ranked.filter((item) => item.detectedDate && !isWithinFreshWindow(item.detectedDate));
+  const freshDated = rankedForSelection.filter((item) => item.detectedDate && isWithinFreshWindow(item.detectedDate));
+  const undated = rankedForSelection.filter((item) => !item.detectedDate);
+  const stale = rankedForSelection.filter((item) => item.detectedDate && !isWithinFreshWindow(item.detectedDate));
   let pool: typeof ranked = [];
   if (freshDated.length > 0) {
     pool = [...freshDated, ...undated];
@@ -3531,8 +3363,8 @@ function prioritizeNewsResultsWithRedditCap(params: {
   } else {
     pool = stale;
   }
-  if (pool.length < params.limit) {
-    pool = [...pool, ...ranked.filter((item) => !pool.some((entry) => entry.hit.url === item.hit.url))];
+  if (pool.length < params.limit && allowOffTopicFallback) {
+    pool = [...pool, ...rankedForSelection.filter((item) => !pool.some((entry) => entry.hit.url === item.hit.url))];
   }
   const byScore = (a: (typeof pool)[number], b: (typeof pool)[number]): number => {
     if (b.score !== a.score) {
@@ -3545,18 +3377,11 @@ function prioritizeNewsResultsWithRedditCap(params: {
     }
     return a.index - b.index;
   };
-  const maxReddit = Math.max(0, params.redditCap);
-  const reddit = pool.filter((item) => item.reddit).sort(byScore).slice(0, maxReddit);
-  const selected = new Set(reddit.map((item) => item.hit.url));
-  const nonReddit = pool
-    .filter((item) => !item.reddit)
-    .sort(byScore)
-    .slice(0, Math.max(0, params.limit - reddit.length));
-  const combined = [...reddit, ...nonReddit];
-  if (combined.length < params.limit) {
-    const filler = ranked
+  const combined = pool.sort(byScore).slice(0, params.limit);
+  if (combined.length < params.limit && allowOffTopicFallback) {
+    const filler = rankedForSelection
       .sort(byScore)
-      .filter((item) => !selected.has(item.hit.url) && !combined.some((entry) => entry.hit.url === item.hit.url))
+      .filter((item) => !combined.some((entry) => entry.hit.url === item.hit.url))
       .slice(0, params.limit - combined.length);
     combined.push(...filler);
   }
@@ -3590,61 +3415,6 @@ function buildFreshNewsSearchQuery(rawQuery: string): string {
     return `ultimas noticias hoy ultimas horas ${month} ${year}`;
   }
   return `${base} ultimas noticias hoy ultimas horas ${month} ${year}`.replace(/\s+/g, " ").trim();
-}
-
-function formatRedditPostDate(createdUtc: number): string {
-  if (!Number.isFinite(createdUtc) || createdUtc <= 0) {
-    return "fecha-desconocida";
-  }
-  try {
-    return new Date(createdUtc * 1000).toISOString().slice(0, 10);
-  } catch {
-    return "fecha-desconocida";
-  }
-}
-
-function formatIsoDateCompact(isoRaw: string): string {
-  const raw = isoRaw.trim();
-  if (!raw) {
-    return "fecha desconocida";
-  }
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) {
-    return raw.slice(0, 19);
-  }
-  return parsed.toISOString().slice(0, 16).replace("T", " ");
-}
-
-function formatUsd(value: number): string {
-  if (!Number.isFinite(value)) {
-    return "n/d";
-  }
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: value >= 100 ? 2 : 6,
-  }).format(value);
-}
-
-function formatSignedPercent(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "n/d";
-  }
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toFixed(2)}%`;
-}
-
-function redditPostsToWebSearchResults(posts: RedditPostResult[]): WebSearchResult[] {
-  return posts.map((post) => {
-    const datePart = formatRedditPostDate(post.createdUtc);
-    const metrics = `r/${post.subreddit} | ${datePart} | score ${post.score} | comentarios ${post.numComments}`;
-    const textPart = normalizeSearchSnippet(post.selfText, 170);
-    return {
-      title: post.title,
-      url: post.url || post.permalink,
-      snippet: textPart ? `${metrics} | ${textPart}` : metrics,
-    };
-  });
 }
 
 function detectWebIntent(text: string): WebIntent {
@@ -3727,30 +3497,25 @@ async function runWebSearchQuery(params: {
 
     const expandedLimit = Math.min(
       10,
-      Math.max(config.webSearchMaxResults + NEWS_MAX_REDDIT_RESULTS, config.webSearchMaxResults * 2),
+      Math.max(config.webSearchMaxResults + 2, config.webSearchMaxResults * 2),
     );
+    const topicTokens = extractNewsTopicTokens(rawQuery || queryText);
     const curated = buildCuratedNewsDomains(rawQuery || queryText);
+    const useSpecializedDomainSearch = curated.vertical !== "general" || topicTokens.length === 0;
     const perDomainLimit = Math.max(2, Math.min(4, Math.ceil(expandedLimit / 3)));
-    const domainSearchTasks = curated.domains
-      .slice(0, NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES)
-      .map((domain) =>
-        webBrowser.search(`${queryText} site:${domain} ultimos 7 dias last 7 days`, perDomainLimit),
-      );
+    const domainSearchTasks = useSpecializedDomainSearch
+      ? curated.domains
+          .slice(0, NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES)
+          .map((domain) =>
+            webBrowser.search(`${queryText} site:${domain} ultimos 7 dias last 7 days`, perDomainLimit),
+          )
+      : [];
 
-    const to = new Date();
-    const from = new Date(to.getTime() - NEWS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000);
-    const [redditPosts, recentGeneralHits, generalHits, specializedResults] = await Promise.all([
-      redditApi.searchPosts({
-        query: queryText,
-        limit: Math.max(NEWS_MAX_REDDIT_RESULTS * 2, expandedLimit),
-        sort: "new",
-        time: "week",
-      }),
+    const [recentGeneralHits, generalHits, specializedResults] = await Promise.all([
       webBrowser.search(`${queryText} hoy ultimas horas`, expandedLimit),
       webBrowser.search(queryText, expandedLimit),
       Promise.allSettled(domainSearchTasks),
     ]);
-    const redditHits = redditPostsToWebSearchResults(redditPosts);
     const specializedHits = specializedResults.flatMap((entry) =>
       entry.status === "fulfilled" ? entry.value : [],
     );
@@ -3758,11 +3523,10 @@ async function runWebSearchQuery(params: {
       [...specializedHits, ...recentGeneralHits, ...generalHits],
       expandedLimit * 3,
     );
-    return prioritizeNewsResultsWithRedditCap({
-      redditHits,
+    return prioritizeNewsResults({
       generalHits: mergedGeneral,
       limit: config.webSearchMaxResults,
-      redditCap: NEWS_MAX_REDDIT_RESULTS,
+      topicTokens,
     });
   };
 
@@ -3786,84 +3550,6 @@ function normalizeIntentText(text: string): string {
     .replace(/\p{Diacritic}/gu, "")
     .toLowerCase()
     .trim();
-}
-
-function detectSelfMaintenanceIntent(text: string): SelfMaintenanceIntent {
-  const original = text.trim();
-  if (!original) {
-    return { shouldHandle: false };
-  }
-
-  const normalized = normalizeIntentText(original);
-  const isQuestion = original.includes("?");
-
-  const listSkillsRequested =
-    /\b(que|cuales)\b.*\b(habilidades|skills|reglas)\b/.test(normalized) &&
-    /\b(tenes|tienes|agregadas|dinamicas|dynamicas|actuales)\b/.test(normalized);
-  if (listSkillsRequested) {
-    return { shouldHandle: true, action: "list-skills" };
-  }
-
-  const deleteSkillIntent =
-    /\b(elimina|eliminar|borra|borrar|quita|quitar|remueve|remover)\b/.test(normalized) &&
-    /\b(habilidad|skills?|reglas?|capacidad(?:es)?)\b/.test(normalized);
-  if (!isQuestion && deleteSkillIntent) {
-    const wantsLast = /\b(ultimo|ultima|final)\b/.test(normalized);
-    const indexRaw =
-      normalized.match(/\b(?:habilidad|skill|regla|capacidad)\s*(?:numero|nro|#)?\s*(\d{1,3})\b/)?.[1] ??
-      normalized.match(/\b(?:numero|nro|#)\s*(\d{1,3})\b/)?.[1] ??
-      normalized.match(/\b(\d{1,3})\b/)?.[1];
-    const parsedIndex = indexRaw ? Number.parseInt(indexRaw, 10) : NaN;
-    if (wantsLast) {
-      return { shouldHandle: true, action: "delete-skill", skillIndex: -1 };
-    }
-    if (Number.isFinite(parsedIndex) && parsedIndex > 0) {
-      return { shouldHandle: true, action: "delete-skill", skillIndex: parsedIndex };
-    }
-    return { shouldHandle: true, action: "delete-skill" };
-  }
-
-  const restartRequested =
-    /\b(reinicia|reiniciate|reiniciar|restart)\b.*\b(agente|bot|servicio)\b/.test(normalized) ||
-    /\b(reinicia|reiniciate|reiniciar|restart)\b.*\b(houdi)\b/.test(normalized);
-  if (!isQuestion && restartRequested) {
-    return { shouldHandle: true, action: "restart-service" };
-  }
-
-  const updateVerb =
-    /\b(actualiza|actualizar|actualizate|updatea|updatear|upgradea|upgrade|sincroniza|sincronizar|ponete al dia|ponte al dia)\b/.test(
-      normalized,
-    );
-  const updateNoun = /\b(agente|bot|houdi|repo|repositorio|version|versiones|codigo|release)\b/.test(normalized);
-  if (!isQuestion && updateVerb && updateNoun) {
-    return { shouldHandle: true, action: "update-service" };
-  }
-
-  if (!isQuestion && isSkillDraftMultiMessageRequested(normalized)) {
-    const instruction = extractSelfSkillInstructionFromText(original);
-    return instruction
-      ? { shouldHandle: true, action: "add-skill", instruction }
-      : { shouldHandle: true, action: "add-skill" };
-  }
-
-  const addSkillVerb =
-    /\b(agrega|agregar|suma|sumar|anade|añade|incorpora|incorporar|crea|crear|genera|generar|define|definir|configura|configurar|habilita|habilitar|entrena|entrenar|ensena|enseña|mejorate|mejora|arma|armar|construi|construir)\b/.test(
-      normalized,
-    );
-  const addSkillNoun = /\b(habilidades?|skills?|reglas?|capacidades?)\b/.test(normalized);
-  const addSkillIntent = addSkillVerb && addSkillNoun;
-  const conciseSkillDefinition = /\b(?:nueva\s+)?(?:habilidades?|skills?|reglas?|capacidades?)\s*[:=-]\s*.+/.test(
-    normalized,
-  );
-  if (addSkillIntent || conciseSkillDefinition) {
-    const instruction = extractSelfSkillInstructionFromText(original);
-    if (instruction) {
-      return { shouldHandle: true, action: "add-skill", instruction };
-    }
-    return { shouldHandle: true, action: "add-skill" };
-  }
-
-  return { shouldHandle: false };
 }
 
 function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: boolean }): ConnectorNaturalIntent {
@@ -4503,7 +4189,11 @@ function extractTaskTitleForCreate(text: string): string {
 
   const cleaned = stripScheduleTemporalPhrases(text)
     .replace(
-      /\b(recordame|recordarme|recuerdame|recordar|agenda|agendame|agendar|programa|programar|crea|crear|genera|generar|tarea|tareas|recordatorio|recordatorios|por favor|porfa)\b/gi,
+      /\b(recordame|recordarme|recuerda|recuerdame|recordar|agenda|agendame|agendar|programa|programar|crea|crear|genera|generar|tarea|tareas|recordatorio|recordatorios|por favor|porfa)\b/gi,
+      " ",
+    )
+    .replace(
+      /\b(haceme|hacerme|hace(?:r)?me)\s+acordar\b/gi,
       " ",
     )
     .replace(/\s+/g, " ")
@@ -4597,6 +4287,10 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
   const parsedSchedule = parseNaturalScheduleDateTime(original, new Date());
   const hasEmailNoun = /\b(correo|mail|email|gmail)\b/.test(normalized);
   const hasSendVerb = /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme)\b/.test(normalized);
+  const hasReminderVerb =
+    /\b(recordar|recorda|recordame|recordarme|recuerda|recuerdame|agenda|agendame|agendar|programa|programar|crear|crea|genera|generar)\b/.test(
+      normalized,
+    ) || /\b(haceme|hacerme|hace(?:r)?me)\s+acordar\b/.test(normalized);
   const hasRecipientCue =
     /\b(destinatari[oa]s?|para\s+[^\s]+@[^\s]+|a\s+[^\s]+@[^\s]+)\b/.test(normalized) ||
     extractEmailAddresses(original).length > 0;
@@ -4635,10 +4329,7 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
     };
   }
 
-  const createRequested =
-    /\b(recordame|recordarme|recuerdame|agenda|agendame|agendar|programa|programar|crear|crea|genera|generar)\b/.test(
-      normalized,
-    ) && (scheduleNouns || parsedSchedule.hasTemporalSignal);
+  const createRequested = hasReminderVerb && (scheduleNouns || parsedSchedule.hasTemporalSignal);
   const scheduledEmailRequested = parsedSchedule.hasTemporalSignal && hasEmailNoun && (hasSendVerb || hasRecipientCue);
   if (scheduledEmailRequested) {
     const to = extractEmailAddresses(original)[0] ?? inferDefaultSelfEmailRecipient(original);
@@ -4750,9 +4441,10 @@ function detectMemoryNaturalIntent(text: string): MemoryNaturalIntent {
     };
   }
 
-  const scheduleLike = /\b(recordame|recordarme|recuerdame|recordatorio|recordatorios|agenda|tarea|tareas|programa|programar)\b/.test(
-    normalized,
-  );
+  const scheduleLike =
+    /\b(recordar|recorda|recordame|recordarme|recuerda|recuerdame|recordatorio|recordatorios|agenda|tarea|tareas|programa|programar)\b/.test(
+      normalized,
+    ) || /\b(haceme|hacerme|hace(?:r)?me)\s+acordar\b/.test(normalized);
   if (scheduleLike) {
     return { shouldHandle: false };
   }
@@ -4959,11 +4651,18 @@ function buildIntentRouterScoreBoosts(params: {
   if (params.hasMemoryRecallCue) {
     addBoost("memory", 0.05);
   }
+  const selfIntent = detectSelfMaintenanceIntent(params.text);
+  if (selfIntent.shouldHandle) {
+    addBoost("self-maintenance", 0.06);
+    if (/\b(habilidad|habilidades|skill|skills|regla|reglas|capacidad|capacidades)\b/.test(normalized)) {
+      addBoost("self-maintenance", 0.04);
+    }
+  }
   if (/\b(workspace|archivo|carpeta|documento|pdf|txt|csv|json|md)\b/.test(normalized)) {
     addBoost("workspace", 0.02);
     addBoost("document", 0.02);
   }
-  if (/\b(web|internet|noticias|reddit|url|link)\b/.test(normalized)) {
+  if (/\b(web|internet|noticias|url|link)\b/.test(normalized)) {
     addBoost("web", 0.02);
   }
 
@@ -5343,9 +5042,11 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
       const required: string[] = [];
       const missing: string[] = [];
       if (intent.action === "delete-skill") {
-        required.push("skillIndex");
-        if (!Number.isFinite(intent.skillIndex ?? NaN)) {
-          missing.push("skillIndex");
+        required.push("skillRefOrIndex");
+        const hasIndex = Number.isFinite(intent.skillIndex ?? Number.NaN);
+        const hasRef = typeof intent.skillRef === "string" && intent.skillRef.trim().length > 0;
+        if (!hasIndex && !hasRef) {
+          missing.push("skillRefOrIndex");
         }
       }
       return {
@@ -5440,6 +5141,7 @@ function shouldAbstainByUncertainty(params: {
   calibratedConfidence: number | null;
   gap: number | null;
   ensembleTop: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }>;
+  text: string;
 }): boolean {
   const top = params.semantic;
   if (!top) {
@@ -5451,6 +5153,21 @@ function shouldAbstainByUncertainty(params: {
   const ensembleAmbiguous =
     params.ensembleTop.length >= 2 &&
     (params.ensembleTop[0]?.score ?? 0) - (ensembleSecond?.score ?? 0) < 0.08;
+  const pair = [params.ensembleTop[0]?.name, ensembleSecond?.name]
+    .filter(Boolean)
+    .sort()
+    .join("|");
+  if (pair === "gmail|gmail-recipients" && shouldBypassGmailRecipientsAmbiguity(params.text)) {
+    return false;
+  }
+  if (pair === "self-maintenance|workspace") {
+    const selfIntent = detectSelfMaintenanceIntent(params.text);
+    const normalized = normalizeIntentText(params.text);
+    const explicitWorkspaceCue = /\b(workspace|archivo|carpeta|ruta|path|directorio|pdf|txt|csv|json|md)\b/.test(normalized);
+    if (selfIntent.shouldHandle && (selfIntent.action === "add-skill" || selfIntent.action === "list-skills") && !explicitWorkspaceCue) {
+      return false;
+    }
+  }
   const sensitive = isSensitiveIntentRoute(top.handler as Exclude<NaturalIntentHandlerName, "none">);
   if (calibrated < 0.52 && gap < 0.1) {
     return true;
@@ -6176,8 +5893,14 @@ function detectGmailAutoContentKind(
 }
 
 function buildEmailNewsQueryFromText(text: string): string {
+  const explicitTopic = extractNewsTopicFromText(text);
+  if (explicitTopic) {
+    return explicitTopic;
+  }
+
   const cleaned = sanitizeNaturalWebQuery(text)
     .replace(/\b(?:a|para)\s+[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+    .replace(/\b(?:a|para)\s+[A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ.-]{1,40}\b/g, " ")
     .replace(/\b(envi\w*|mand\w*)\s+(?:un\s+)?(?:correo|mail|email|gmail)\b/gi, " ")
     .replace(/\b(correo|mail|email|gmail|asunto|mensaje|cuerpo)\b/gi, " ")
     .replace(/\b(con)\s+(?:las?|los?)\b/gi, " ")
@@ -6631,7 +6354,7 @@ async function listSavedImages(
   chatId: number,
   limitInput?: number,
 ): Promise<Array<{ relPath: string; size: number; modifiedAt: string }>> {
-  const root = path.join(config.workspaceDir, "images", `chat-${chatId}`);
+  const root = path.join(config.workspaceDir, "images");
   return await listStoredFilesUnderRoot(root, limitInput);
 }
 
@@ -6639,7 +6362,7 @@ async function listSavedWorkspaceFiles(
   chatId: number,
   limitInput?: number,
 ): Promise<Array<{ relPath: string; size: number; modifiedAt: string }>> {
-  const root = path.join(config.workspaceDir, "files", `chat-${chatId}`);
+  const root = path.join(config.workspaceDir, "files");
   return await listStoredFilesUnderRoot(root, limitInput);
 }
 
@@ -6689,10 +6412,11 @@ async function resolveStoredFileReference(params: {
   if (!reference) {
     throw new Error("Indica la ruta del archivo dentro de workspace o un número de /files.");
   }
-  const normalized = normalizeWorkspaceRelativePath(reference);
-  if (!normalized) {
+  const normalizedRaw = normalizeWorkspaceRelativePath(reference);
+  if (!normalizedRaw) {
     throw new Error("No pude interpretar la ruta del archivo.");
   }
+  const normalized = await resolveWorkspacePathInputWithAutocomplete(normalizedRaw);
   const resolved = resolveWorkspacePath(normalized);
   let stat: Awaited<ReturnType<typeof fs.stat>>;
   try {
@@ -6764,29 +6488,33 @@ async function listStoredFilesUnderRoot(
   }
 
   const collected: Array<{ relPath: string; size: number; modifiedAt: string; modifiedMs: number }> = [];
-  let dateDirs: Dirent[] = [];
-  try {
-    dateDirs = await fs.readdir(root, { withFileTypes: true });
-  } catch {
-    return [];
-  }
+  const pendingDirs: string[] = [root];
+  const visited = new Set<string>();
+  const MAX_SCANNED_DIRS = 600;
 
-  for (const dirEntry of dateDirs) {
-    if (!dirEntry.isDirectory()) {
+  while (pendingDirs.length > 0 && visited.size < MAX_SCANNED_DIRS) {
+    const currentDir = pendingDirs.shift()!;
+    if (visited.has(currentDir)) {
       continue;
     }
-    const dateDir = path.join(root, dirEntry.name);
-    let files: Dirent[] = [];
+    visited.add(currentDir);
+
+    let entries: Dirent[] = [];
     try {
-      files = await fs.readdir(dateDir, { withFileTypes: true });
+      entries = await fs.readdir(currentDir, { withFileTypes: true });
     } catch {
       continue;
     }
-    for (const fileEntry of files) {
-      if (!fileEntry.isFile()) {
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        pendingDirs.push(fullPath);
         continue;
       }
-      const fullPath = path.join(dateDir, fileEntry.name);
+      if (!entry.isFile()) {
+        continue;
+      }
       try {
         const stat = await fs.stat(fullPath);
         const modifiedMs = stat.mtime.getTime();
@@ -7065,10 +6793,8 @@ async function saveIncomingImage(params: {
   incoming: IncomingImage;
   imageBuffer: Buffer;
   telegramFilePath?: string;
-  chatId: number;
 }): Promise<{ fullPath: string; relPath: string }> {
   const now = new Date();
-  const datePart = now.toISOString().slice(0, 10);
   const timePart = now.toISOString().slice(11, 19).replace(/:/g, "");
   const ext = pickImageExtension({
     fileName: params.incoming.fileName,
@@ -7079,7 +6805,7 @@ async function saveIncomingImage(params: {
   const random = Math.random().toString(36).slice(2, 7);
   const fileName = `${timePart}-m${params.incoming.messageId}-${base}-${random}${ext}`;
 
-  const dir = path.join(config.workspaceDir, "images", `chat-${params.chatId}`, datePart);
+  const dir = path.join(config.workspaceDir, "images");
   await fs.mkdir(dir, { recursive: true });
 
   const fullPath = path.join(dir, fileName);
@@ -7094,10 +6820,7 @@ async function saveIncomingWorkspaceFile(params: {
   incoming: IncomingWorkspaceFile;
   fileBuffer: Buffer;
   telegramFilePath?: string;
-  chatId: number;
 }): Promise<{ fullPath: string; relPath: string }> {
-  const now = new Date();
-  const datePart = now.toISOString().slice(0, 10);
   const fallbackExt = pickGenericFileExtension({
     fileName: params.incoming.fileName,
     telegramFilePath: params.telegramFilePath,
@@ -7105,7 +6828,7 @@ async function saveIncomingWorkspaceFile(params: {
   const desiredNameRaw = params.incoming.fileName?.trim() || `archivo-${params.incoming.messageId}${fallbackExt}`;
   const desiredName = sanitizeIncomingWorkspaceFileName(desiredNameRaw);
 
-  const dir = path.join(config.workspaceDir, "files", `chat-${params.chatId}`, datePart);
+  const dir = path.join(config.workspaceDir, "files");
   await fs.mkdir(dir, { recursive: true });
 
   const fullPath = await resolveUniqueIncomingWorkspaceFilePath({
@@ -9419,9 +9142,9 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
 
   const activeDraft = selfSkillDrafts.getDraft(params.ctx.chat.id);
   if (activeDraft) {
-    await persistUserTurnIfNeeded();
     try {
       if (isSkillDraftCancelRequested(normalizedText)) {
+        await persistUserTurnIfNeeded();
         await selfSkillDrafts.clearDraft(params.ctx.chat.id);
         await params.ctx.reply("Borrador de habilidad descartado.");
         await safeAudit({
@@ -9437,6 +9160,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
       }
 
       if (isSkillDraftShowRequested(normalizedText)) {
+        await persistUserTurnIfNeeded();
         await params.ctx.reply(
           [
             `Borrador de habilidad (${activeDraft.lines.length} lineas):`,
@@ -9449,6 +9173,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
       }
 
       if (isSkillDraftCommitRequested(normalizedText)) {
+        await persistUserTurnIfNeeded();
         const extra = extractSelfSkillInstructionFromText(text);
         if (extra && extra.length > 0) {
           try {
@@ -9465,7 +9190,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           return true;
         }
 
-        const saved = await appendDynamicSkillInstruction(instruction);
+        const saved = await selfSkillStore.appendInstruction(instruction);
         await selfSkillDrafts.clearDraft(params.ctx.chat.id);
         await params.ctx.reply(
           [
@@ -9488,6 +9213,11 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
         return true;
       }
 
+      if (!isLikelySelfSkillDraftLine(text, normalizedText)) {
+        return false;
+      }
+
+      await persistUserTurnIfNeeded();
       const updated = await selfSkillDrafts.appendLine(params.ctx.chat.id, text);
       await params.ctx.reply(
         [
@@ -9531,7 +9261,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
 
   try {
     if (intent.action === "list-skills") {
-      const result = await listDynamicSkillInstructions();
+      const result = await selfSkillStore.listInstructions();
       if (result.entries.length === 0) {
         await params.ctx.reply("No hay habilidades dinámicas agregadas todavía.");
         return true;
@@ -9590,7 +9320,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
         return true;
       }
 
-      const saved = await appendDynamicSkillInstruction(instruction);
+      const saved = await selfSkillStore.appendInstruction(instruction);
       await params.ctx.reply(
         [
           `Habilidad agregada en ${saved.relPath}:`,
@@ -9614,14 +9344,17 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
 
     if (intent.action === "delete-skill") {
       const skillIndex = intent.skillIndex;
-      if (typeof skillIndex !== "number" || !Number.isFinite(skillIndex) || skillIndex === 0) {
+      const skillRef = intent.skillRef?.trim();
+      const hasSkillRef = Boolean(skillRef);
+      const hasSkillIndex = typeof skillIndex === "number" && Number.isFinite(skillIndex) && skillIndex !== 0;
+      if (!hasSkillRef && !hasSkillIndex) {
         await params.ctx.reply(
-          "Indica qué habilidad eliminar. Ejemplos: 'elimina la habilidad 2' o 'elimina la última habilidad'.",
+          "Indica qué habilidad eliminar. Ejemplos: 'elimina la habilidad 2', 'elimina la última habilidad' o 'elimina la habilidad #sk-abc123'.",
         );
         return true;
       }
 
-      const removed = await removeDynamicSkillInstruction(skillIndex);
+      const removed = await selfSkillStore.removeInstruction(hasSkillRef ? skillRef! : skillIndex!);
       await params.ctx.reply(
         [
           `Habilidad eliminada (${removed.removedIndex}) en ${removed.relPath}:`,
@@ -9635,7 +9368,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
         userId: params.userId,
         details: {
           source: params.source,
-          skillIndex,
+          ...(hasSkillRef ? { skillRef } : { skillIndex }),
           removedIndex: removed.removedIndex,
           remaining: removed.remaining,
         },
@@ -10467,6 +10200,29 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
   }
 
   try {
+    const autocompleteNotices: string[] = [];
+    const resolveMaybeAutocompletePath = async (rawPath: string | undefined, label: string): Promise<string | undefined> => {
+      if (!rawPath?.trim()) {
+        return undefined;
+      }
+      const resolved = await resolveWorkspacePathInputWithAutocomplete(rawPath, {
+        autocompleteNotices,
+        label,
+      });
+      return resolved || undefined;
+    };
+
+    intent.path = await resolveMaybeAutocompletePath(intent.path, "ruta");
+    intent.sourcePath = await resolveMaybeAutocompletePath(intent.sourcePath, "origen");
+    intent.targetPath = await resolveMaybeAutocompletePath(intent.targetPath, "destino");
+    intent.deleteContentsOfPath = await resolveMaybeAutocompletePath(intent.deleteContentsOfPath, "alcance");
+    if (intent.selector?.scopePath) {
+      intent.selector = {
+        ...intent.selector,
+        scopePath: await resolveMaybeAutocompletePath(intent.selector.scopePath, "alcance"),
+      };
+    }
+
     if (intent.action === "list") {
       const listed = await listWorkspaceDirectory(intent.path);
       rememberWorkspaceListContext({
@@ -10475,13 +10231,17 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         entries: listed.entries,
         source: `${params.source}:workspace-intent`,
       });
-      const responseText =
+      const responseLines =
         listed.entries.length === 0
-          ? `Carpeta vacia: ${listed.relPath}`
+          ? [`Carpeta vacia: ${listed.relPath}`]
           : [
               `Contenido de ${listed.relPath} (${listed.entries.length}):`,
               ...formatWorkspaceEntries(listed.entries),
-            ].join("\n");
+            ];
+      if (autocompleteNotices.length > 0) {
+        responseLines.push("", "autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`));
+      }
+      const responseText = responseLines.join("\n");
       await replyLong(params.ctx, responseText);
       await appendConversationTurn({
         chatId: params.ctx.chat.id,
@@ -11119,7 +10879,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
           [
             "Indica qué archivo enviar desde workspace.",
             "Ejemplos:",
-            " - enviame files/chat-123/2026-02-19/reporte.pdf",
+            " - enviame files/reporte.pdf",
             " - enviame el archivo 2",
           ].join("\n"),
         );
@@ -11275,7 +11035,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
           [
             "Indica qué ruta eliminar dentro de workspace.",
             "Ejemplos:",
-            " - elimina files/chat-123/2026-02-19/reporte.pdf",
+            " - elimina files/reporte.pdf",
             " - borra carpeta archivados/enero",
             'Puedes responder solo con la ruta (ej: "vrand" o "/vrand").',
             `expira en: ${pendingWorkspaceDeletePathRemainingSeconds(pendingPath)}s`,
@@ -11419,10 +11179,15 @@ async function maybeHandlePendingWorkspaceDeletePathInput(params: {
     return true;
   }
 
-  const candidatePath = extractWorkspaceDeletePathCandidate(params.text);
-  if (!candidatePath) {
+  const candidatePathRaw = extractWorkspaceDeletePathCandidate(params.text);
+  if (!candidatePathRaw) {
     return false;
   }
+  const autocompleteNotices: string[] = [];
+  const candidatePath = await resolveWorkspacePathInputWithAutocomplete(candidatePathRaw, {
+    autocompleteNotices,
+    label: "ruta",
+  });
 
   pendingWorkspaceDeletePathByChat.delete(params.ctx.chat.id);
   await appendConversationTurn({
@@ -11442,6 +11207,9 @@ async function maybeHandlePendingWorkspaceDeletePathInput(params: {
   const responseText = [
     "Confirmación requerida para eliminar en workspace.",
     `ruta: workspace/${deletePending.paths[0]}`,
+    ...(autocompleteNotices.length > 0
+      ? ["autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`)]
+      : []),
     `expira en: ${pendingWorkspaceDeleteRemainingSeconds(deletePending)}s`,
     'Responde "si" para confirmar o "no" para cancelar.',
   ].join("\n");
@@ -11942,7 +11710,7 @@ async function maybeHandleNaturalWebInstruction(params: {
   await replyProgress(
     params.ctx,
     intent.newsRequested
-      ? `Buscando noticias recientes (máx ${NEWS_MAX_REDDIT_RESULTS} Reddit): ${query}`
+      ? `Buscando noticias recientes: ${query}`
       : `Buscando en web: ${query}`,
   );
 
@@ -11968,8 +11736,6 @@ async function maybeHandleNaturalWebInstruction(params: {
           rawQuery,
           usedFallbackQuery,
           newsRequested: intent.newsRequested,
-          redditPriority: intent.newsRequested,
-          redditCap: NEWS_MAX_REDDIT_RESULTS,
         },
       });
       return true;
@@ -12007,8 +11773,6 @@ async function maybeHandleNaturalWebInstruction(params: {
           rawQuery,
           usedFallbackQuery,
           newsRequested: intent.newsRequested,
-          redditPriority: intent.newsRequested,
-          redditCap: NEWS_MAX_REDDIT_RESULTS,
           results: hits.length,
         },
       });
@@ -12045,8 +11809,6 @@ async function maybeHandleNaturalWebInstruction(params: {
           rawQuery,
           usedFallbackQuery,
           newsRequested: intent.newsRequested,
-          redditPriority: intent.newsRequested,
-          redditCap: NEWS_MAX_REDDIT_RESULTS,
           results: hits.length,
         },
       });
@@ -12071,7 +11833,7 @@ async function maybeHandleNaturalWebInstruction(params: {
         ? `El pedido es de noticias: prioriza hechos de los ultimos ${NEWS_MAX_AGE_DAYS} dias y menciona fechas concretas (día/mes/año) cuando estén disponibles.`
         : "Si la evidencia no alcanza, dilo explícitamente.",
       intent.newsRequested
-        ? `Usa como máximo ${NEWS_MAX_REDDIT_RESULTS} fuentes de Reddit y completa con otros sitios relevantes; marca qué puntos requieren validación adicional.`
+        ? "Prioriza fuentes web especializadas y marca qué puntos requieren validación adicional."
         : "Sé claro y breve.",
       intent.newsRequested
         ? `No uses como base noticias de más de ${NEWS_MAX_AGE_DAYS} días; si no hay suficiente evidencia reciente, dilo explícitamente.`
@@ -12124,8 +11886,6 @@ async function maybeHandleNaturalWebInstruction(params: {
         rawQuery,
         usedFallbackQuery,
         newsRequested: intent.newsRequested,
-        redditPriority: intent.newsRequested,
-        redditCap: NEWS_MAX_REDDIT_RESULTS,
         results: hits.length,
         sources: sources.length,
       },
@@ -12144,8 +11904,6 @@ async function maybeHandleNaturalWebInstruction(params: {
         rawQuery,
         usedFallbackQuery,
         newsRequested: intent.newsRequested,
-        redditPriority: intent.newsRequested,
-        redditCap: NEWS_MAX_REDDIT_RESULTS,
         error: message,
       },
     });
@@ -13464,6 +13222,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
       calibratedConfidence: semanticCalibratedConfidence,
       gap: semanticGap,
       ensembleTop,
+      text: params.text,
     })
   ) {
     await params.ctx.reply(buildIntentClarificationQuestion(uncertainSemanticDecision.alternatives));
@@ -13929,16 +13688,14 @@ bot.command("help", async (ctx) => {
     "/mkfile <ruta> [contenido] - Crear archivo de texto simple en workspace",
     "/files [limit] - Listar archivos guardados en workspace",
     "/getfile <ruta|n> - Enviar archivo del workspace al chat",
-    "/images [limit] - Listar imágenes guardadas para este chat",
+    "/images [limit] - Listar imágenes guardadas en workspace",
     "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
     "/web <consulta> - Buscar en la web",
     '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
-    "/crypto [consulta] [limit] - Precios crypto con CoinGecko",
     "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
-    "/reddit <consulta> [limit] - Buscar posts en Reddit (API)",
     "/webopen <n|url> [pregunta] - Abrir resultado web y opcionalmente analizarlo",
     "/webask <consulta> - Buscar + sintetizar respuesta con fuentes",
-    "/agenda ... - Crear/listar/editar/eliminar tareas programadas",
+    "/task ... - Crear/listar/editar/eliminar tareas programadas",
     "/gmail ... - Consultar/operar tu cuenta Gmail conectada",
     "/remember <nota> - Guardar nota en memoria diaria",
     "/memory - Estado de memoria",
@@ -13948,7 +13705,7 @@ bot.command("help", async (ctx) => {
     "/suggest now|status - Forzar sugerencia o ver cuota/config",
     "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
     "/selfskill list - Ver habilidades agregadas",
-    "/selfskill del <n|last> - Eliminar habilidad agregada",
+    "/selfskill del <n|last|#id> - Eliminar habilidad agregada",
     "/selfskill draft <start|add|show|apply|cancel> - Armar skill en varios mensajes",
     "/selfrestart - Reiniciar servicio del agente",
     "/selfupdate [check] - Actualizar a la última versión del repositorio",
@@ -13964,8 +13721,8 @@ bot.command("help", async (ctx) => {
     "/intentversion [list|save [label]|rollback <id>] - Versionado/rollback de rutas",
     "/intentcanary [status|set <id> <pct>|off] - Canary rollout de versión de router",
     "Enviar nota de voz/audio - Se transcribe y se responde con IA",
-    "Enviar archivo (document) - Se guarda en workspace/files/...",
-    "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
+    "Enviar archivo (document) - Se guarda directo en workspace/files/",
+    "Enviar imagen/foto - Se guarda directo en workspace/images/ y puede analizarse con IA",
     "/shell <instrucción> - IA propone y ejecuta comando shell",
     "/shellmode on|off - Habilitar shell IA en chat libre",
     "/exec <cmd> [args] - Ejecutar comando permitido por el agente",
@@ -13979,7 +13736,6 @@ bot.command("help", async (ctx) => {
     "/outbox [status|flush|recover] - Estado/reintento de respuestas pendientes",
     "/metrics [reset] - Snapshot de observabilidad (counters/timings/colas)",
     "/panic on|off|status - Bloqueo global de ejecución",
-    "/tasks - Ver tareas activas",
     "/kill <taskId> - Terminar tarea activa",
     "",
     "Chat libre: escribe un mensaje normal (sin /) y responde OpenAI.",
@@ -14085,7 +13841,7 @@ bot.command("status", async (ctx) => {
     : gmailStatus.configured
       ? `on (${gmailStatus.accountEmail || "cuenta no indicada"})`
       : `on (incompleto: ${gmailStatus.missing.join(", ")})`;
-  const imageStorePath = toProjectRelativePath(path.join(config.workspaceDir, "images", `chat-${ctx.chat.id}`));
+  const imageStorePath = toProjectRelativePath(path.join(config.workspaceDir, "images"));
   const scheduledPendingCount = scheduledTasks.listPending(ctx.chat.id).length;
   const selfSkillDraft = selfSkillDrafts.getDraft(ctx.chat.id);
   const interestSummary = interestLearning.getSummary(ctx.chat.id, config.suggestionsMaxPerDay);
@@ -14136,7 +13892,7 @@ bot.command("status", async (ctx) => {
       `Web browse: ${config.enableWebBrowse ? `on (max results ${config.webSearchMaxResults})` : "off"}`,
       `Gmail account: ${gmailSummary}`,
       `LIM control: ${config.enableLimControl ? `on | appDir=${toProjectRelativePath(config.limAppDir)} | appUnit=${config.limAppService} | tunnelUnit=${config.limTunnelService}` : "off"}`,
-      `Archivos inbound: maxFile=${Math.round(config.fileMaxFileBytes / (1024 * 1024))}MB | store=${toProjectRelativePath(path.join(config.workspaceDir, "files", `chat-${ctx.chat.id}`))}`,
+      `Archivos inbound: maxFile=${Math.round(config.fileMaxFileBytes / (1024 * 1024))}MB | store=${toProjectRelativePath(path.join(config.workspaceDir, "files"))}`,
       `Imagenes: maxFile=${Math.round(config.imageMaxFileBytes / (1024 * 1024))}MB | store=${imageStorePath}`,
       `Agenda: pending=${scheduledPendingCount} | poll=${config.schedulePollMs}ms | file=${config.scheduleFile}`,
       `State DB: ${toProjectRelativePath(config.stateDbFile)} | idempotencyTTL=${config.idempotencyTtlMs}ms | runtimePersist=${RUNTIME_STATE_PERSIST_INTERVAL_MS}ms`,
@@ -14732,44 +14488,8 @@ bot.command("agent", async (ctx) => {
   });
 });
 
-bot.command("tasks", async (ctx) => {
-  const tasks = taskRunner.listRunning();
-  if (tasks.length === 0) {
-    await ctx.reply("No hay tareas activas.");
-    return;
-  }
-
-  const lines = tasks.map(
-    (task) =>
-      `- ${task.id} | ${task.command} ${task.args.join(" ")} | ${task.status} | ${formatSeconds(task.startedAt)}s`,
-  );
-  await replyLong(ctx, ["Tareas activas:", ...lines].join("\n"));
-});
-
-bot.command("kill", async (ctx) => {
-  const taskId = String(ctx.match ?? "").trim();
-  if (!taskId) {
-    await ctx.reply("Uso: /kill <taskId>");
-    return;
-  }
-
-  const ok = taskRunner.kill(taskId);
-  if (!ok) {
-    await ctx.reply(`No encontré una tarea activa con ID ${taskId}`);
-    return;
-  }
-
-  await ctx.reply(`Señal de terminación enviada a ${taskId}`);
-  await safeAudit({
-    type: "task.kill",
-    chatId: ctx.chat.id,
-    userId: ctx.from?.id,
-    details: { taskId },
-  });
-});
-
-bot.command("agenda", async (ctx) => {
-  const input = String(ctx.match ?? "").trim();
+async function handleTaskCommand(ctx: ChatReplyContext, inputRaw: string): Promise<void> {
+  const input = inputRaw.trim();
 
   const listPendingTasks = async () => {
     const pending = scheduledTasks.listPending(ctx.chat.id);
@@ -14786,6 +14506,19 @@ bot.command("agenda", async (ctx) => {
     );
   };
 
+  const listRunningTasks = async () => {
+    const running = taskRunner.listRunning();
+    if (running.length === 0) {
+      await ctx.reply("No hay tareas activas del runner.");
+      return;
+    }
+    const lines = running.map(
+      (task) =>
+        `- ${task.id} | ${task.command} ${task.args.join(" ")} | ${task.status} | ${formatSeconds(task.startedAt)}s`,
+    );
+    await replyLong(ctx, ["Tareas activas del runner:", ...lines].join("\n"));
+  };
+
   if (!input || input.toLowerCase() === "list" || input.toLowerCase() === "status") {
     await listPendingTasks();
     return;
@@ -14795,13 +14528,19 @@ bot.command("agenda", async (ctx) => {
   const sub = (subRaw ?? "").trim().toLowerCase();
   const restRaw = restTokens.join(" ").trim();
 
+  if (["running", "run", "process", "procesos"].includes(sub)) {
+    await listRunningTasks();
+    return;
+  }
+
   const usage = [
     "Uso:",
-    "/agenda",
-    "/agenda list",
-    "/agenda add <cuando> | <detalle>",
-    "/agenda del <n|id|last>",
-    "/agenda edit <n|id> | <nuevo cuando> | <nuevo detalle opcional>",
+    "/task",
+    "/task list",
+    "/task add <cuando> | <detalle>",
+    "/task del <n|id|last>",
+    "/task edit <n|id> | <nuevo cuando> | <nuevo detalle opcional>",
+    "/task running",
   ].join("\n");
 
   if (sub === "add") {
@@ -14820,7 +14559,7 @@ bot.command("agenda", async (ctx) => {
       return;
     }
     if (!detail) {
-      await ctx.reply("Falta detalle de la tarea. Ejemplo: /agenda add mañana 10:30 | llamar a Juan");
+      await ctx.reply("Falta detalle de la tarea. Ejemplo: /task add mañana 10:30 | llamar a Juan");
       return;
     }
 
@@ -14926,6 +14665,32 @@ bot.command("agenda", async (ctx) => {
   }
 
   await ctx.reply(usage);
+}
+
+bot.command("task", async (ctx) => {
+  await handleTaskCommand(ctx, String(ctx.match ?? ""));
+});
+
+bot.command("kill", async (ctx) => {
+  const taskId = String(ctx.match ?? "").trim();
+  if (!taskId) {
+    await ctx.reply("Uso: /kill <taskId>");
+    return;
+  }
+
+  const ok = taskRunner.kill(taskId);
+  if (!ok) {
+    await ctx.reply(`No encontré una tarea activa con ID ${taskId}`);
+    return;
+  }
+
+  await ctx.reply(`Señal de terminación enviada a ${taskId}`);
+  await safeAudit({
+    type: "task.kill",
+    chatId: ctx.chat.id,
+    userId: ctx.from?.id,
+    details: { taskId },
+  });
 });
 
 bot.command("exec", async (ctx) => {
@@ -15598,7 +15363,7 @@ bot.command("files", async (ctx) => {
   });
 
   if (merged.length === 0) {
-    await ctx.reply("No hay archivos guardados para este chat.");
+    await ctx.reply("No hay archivos guardados.");
     return;
   }
 
@@ -15620,7 +15385,7 @@ bot.command("getfile", async (ctx) => {
     await ctx.reply(
       [
         "Uso: /getfile <ruta|n>",
-        'Ejemplos: /getfile "files/chat-123/2026-02-19/reporte.pdf"',
+        'Ejemplos: /getfile "files/reporte.pdf"',
         "          /getfile 2",
       ].join("\n"),
     );
@@ -15667,7 +15432,7 @@ bot.command("images", async (ctx) => {
 
   const items = await listSavedImages(ctx.chat.id, limit);
   if (items.length === 0) {
-    await ctx.reply("No hay imágenes guardadas para este chat.");
+    await ctx.reply("No hay imágenes guardadas.");
     return;
   }
   rememberStoredFilesListContext({
@@ -15813,7 +15578,7 @@ bot.command("web", async (ctx) => {
   await replyProgress(
     ctx,
     newsRequested
-      ? `Buscando noticias recientes (máx ${NEWS_MAX_REDDIT_RESULTS} Reddit): ${searchQuery}`
+      ? `Buscando noticias recientes: ${searchQuery}`
       : `Buscando en web: ${searchQuery}`,
   );
   try {
@@ -15857,8 +15622,6 @@ bot.command("web", async (ctx) => {
         rawQuery,
         usedFallbackQuery,
         newsRequested,
-        redditPriority: newsRequested,
-        redditCap: NEWS_MAX_REDDIT_RESULTS,
         results: hits.length,
       },
     });
@@ -15975,68 +15738,6 @@ bot.command("lim", async (ctx) => {
   });
 });
 
-bot.command("crypto", async (ctx) => {
-  const rawInput = String(ctx.match ?? "").trim();
-  const tokens = rawInput.split(/\s+/).filter(Boolean);
-  const maybeLimit = Number.parseInt(tokens[tokens.length - 1] ?? "", 10);
-  const limit = Number.isFinite(maybeLimit) && maybeLimit > 0 ? Math.min(10, maybeLimit) : 5;
-  const query =
-    Number.isFinite(maybeLimit) && maybeLimit > 0 ? tokens.slice(0, -1).join(" ").trim() : rawInput;
-
-  await replyProgress(
-    ctx,
-    query ? `Consultando CoinGecko: ${query}` : "Consultando CoinGecko (top mercado)...",
-  );
-  try {
-    const markets = query
-      ? await coinGeckoApi.searchMarkets(query, limit)
-      : await coinGeckoApi.getTopMarkets(limit);
-    if (markets.length === 0) {
-      await ctx.reply("No encontré monedas para esa búsqueda.");
-      return;
-    }
-
-    const lines = markets.map((coin, index) =>
-      [
-        `${index + 1}. ${coin.name} (${coin.symbol.toUpperCase()})`,
-        `Precio: ${formatUsd(coin.currentPriceUsd)} | 24h: ${formatSignedPercent(coin.priceChange24hPct)} | Rank: ${coin.marketCapRank ?? "n/d"}`,
-        `Actualizado: ${formatIsoDateCompact(coin.lastUpdated)}`,
-      ].join("\n"),
-    );
-
-    await replyLong(
-      ctx,
-      [
-        query ? `Crypto para: ${query}` : `Top crypto por market cap (${markets.length})`,
-        ...lines,
-      ].join("\n\n"),
-    );
-    await safeAudit({
-      type: "crypto.search",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query: query || null,
-        limit,
-        results: markets.length,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`No pude consultar CoinGecko: ${message}`);
-    await safeAudit({
-      type: "crypto.search_failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query: query || null,
-        limit,
-        error: message,
-      },
-    });
-  }
-});
-
 bot.command("weather", async (ctx) => {
   const rawLocation = String(ctx.match ?? "").trim();
   const location = rawLocation || "Buenos Aires";
@@ -16086,97 +15787,6 @@ bot.command("weather", async (ctx) => {
       userId: ctx.from?.id,
       details: {
         location,
-        error: message,
-      },
-    });
-  }
-});
-
-bot.command("reddit", async (ctx) => {
-  const rawInput = String(ctx.match ?? "").trim();
-  if (!rawInput) {
-    await ctx.reply("Uso: /reddit <consulta> [limit]");
-    return;
-  }
-
-  const tokens = rawInput.split(/\s+/).filter(Boolean);
-  const maybeLimit = Number.parseInt(tokens[tokens.length - 1] ?? "", 10);
-  const limit = Number.isFinite(maybeLimit) && maybeLimit > 0 ? Math.min(10, maybeLimit) : 5;
-  const queryText =
-    Number.isFinite(maybeLimit) && maybeLimit > 0 ? tokens.slice(0, -1).join(" ").trim() : rawInput;
-  if (!queryText) {
-    await ctx.reply("Uso: /reddit <consulta> [limit]");
-    return;
-  }
-
-  const subredditMatch = queryText.match(/^\s*r\/([a-z0-9_]+)\s+(.+)$/i);
-  const subreddit = subredditMatch?.[1]?.trim();
-  const query = (subredditMatch?.[2] ?? queryText).trim();
-  if (!query) {
-    await ctx.reply("Consulta vacía para Reddit.");
-    return;
-  }
-
-  await replyProgress(ctx, `Buscando en Reddit API: ${subreddit ? `r/${subreddit} | ` : ""}${query}`);
-  try {
-    const posts = await redditApi.searchPosts({
-      query,
-      ...(subreddit ? { subreddit } : {}),
-      sort: "new",
-      time: "week",
-      limit,
-    });
-    if (posts.length === 0) {
-      await ctx.reply("No encontré resultados en Reddit para esa consulta.");
-      return;
-    }
-
-    const hits = redditPostsToWebSearchResults(posts);
-    lastWebResultsByChat.set(ctx.chat.id, hits);
-    rememberWebResultsListContext({
-      chatId: ctx.chat.id,
-      title: `Reddit: ${subreddit ? `r/${subreddit} | ` : ""}${query}`,
-      hits,
-      source: "telegram:/reddit",
-    });
-
-    const lines = posts.map((post, index) =>
-      [
-        `${index + 1}. ${post.title}`,
-        `Subreddit: r/${post.subreddit} | Fecha: ${formatRedditPostDate(post.createdUtc)} | Score: ${post.score} | Comentarios: ${post.numComments}`,
-        `Link: ${post.url}`,
-      ].join("\n"),
-    );
-    await replyLong(
-      ctx,
-      [
-        `Resultados Reddit (${posts.length}) para: ${query}${subreddit ? ` en r/${subreddit}` : ""}`,
-        ...lines,
-        "Tip: usa /webopen <n> para abrir y analizar un resultado.",
-      ].join("\n\n"),
-    );
-    await safeAudit({
-      type: "reddit.search",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query,
-        subreddit: subreddit ?? null,
-        limit,
-        results: posts.length,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`No pude consultar Reddit API: ${message}`);
-    await safeAudit({
-      type: "reddit.search_failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        query,
-        subreddit: subreddit ?? null,
-        limit,
         error: message,
       },
     });
@@ -16386,7 +15996,7 @@ bot.command("webask", async (ctx) => {
         ? `El pedido es de noticias: prioriza hechos de los ultimos ${NEWS_MAX_AGE_DAYS} dias y menciona fechas concretas (dia/mes/ano) cuando esten disponibles.`
         : "Si la evidencia no alcanza, dilo explicitamente.",
       newsRequested
-        ? `Usa como maximo ${NEWS_MAX_REDDIT_RESULTS} fuentes de Reddit y completa con otros sitios relevantes; marca que puntos requieren validacion adicional.`
+        ? "Prioriza fuentes web especializadas y marca que puntos requieren validacion adicional."
         : "Se claro y breve.",
       newsRequested
         ? `No uses como base noticias de mas de ${NEWS_MAX_AGE_DAYS} dias; si no hay suficiente evidencia reciente, dilo explicitamente.`
@@ -16447,8 +16057,6 @@ bot.command("webask", async (ctx) => {
         rawQuery,
         usedFallbackQuery,
         newsRequested,
-        redditPriority: newsRequested,
-        redditCap: NEWS_MAX_REDDIT_RESULTS,
         sources: sources.length,
       },
     });
@@ -17169,7 +16777,7 @@ bot.command("selfskill", async (ctx) => {
   const input = String(ctx.match ?? "").trim();
   if (!input) {
     await ctx.reply(
-      "Uso: /selfskill <instrucción> | /selfskill list | /selfskill del <n|last> | /selfskill draft <start|add|show|apply|cancel>",
+      "Uso: /selfskill <instrucción> | /selfskill list | /selfskill del <n|last|#id> | /selfskill draft <start|add|show|apply|cancel>",
     );
     return;
   }
@@ -17187,7 +16795,7 @@ bot.command("selfskill", async (ctx) => {
         await ctx.reply("El borrador esta vacio. Usa /selfskill draft add <texto>.");
         return;
       }
-      const saved = await appendDynamicSkillInstruction(instruction);
+      const saved = await selfSkillStore.appendInstruction(instruction);
       await selfSkillDrafts.clearDraft(ctx.chat.id);
       await ctx.reply(
         [
@@ -17275,14 +16883,20 @@ bot.command("selfskill", async (ctx) => {
   if (deleteMatch) {
     const target = deleteMatch[1]?.trim() ?? "";
     const isLast = /\b(last|ultimo|ultima)\b/i.test(target);
-    const index = isLast ? -1 : Number.parseInt(target.replace(/[^0-9]/g, ""), 10);
-    if (!isLast && (!Number.isFinite(index) || index <= 0)) {
-      await ctx.reply("Uso: /selfskill del <n|last>");
+    const idMatch =
+      target.match(/\b#([a-z0-9][a-z0-9_-]{2,40})\b/i) ??
+      target.match(/\b([a-z0-9][a-z0-9_-]{3,40})\b/i);
+    const parsedIndex = Number.parseInt(target.replace(/[^0-9]/g, ""), 10);
+    const hasIndex = Number.isFinite(parsedIndex) && parsedIndex > 0;
+    const skillRef = idMatch?.[1]?.trim();
+    const hasRef = Boolean(skillRef && /[a-z]/i.test(skillRef));
+    if (!isLast && !hasIndex && !hasRef) {
+      await ctx.reply("Uso: /selfskill del <n|last|#id>");
       return;
     }
 
     try {
-      const result = await removeDynamicSkillInstruction(isLast ? -1 : index);
+      const result = await selfSkillStore.removeInstruction(isLast ? -1 : hasRef ? skillRef! : parsedIndex);
       await ctx.reply(
         [
           `Habilidad eliminada (${result.removedIndex}) en ${result.relPath}:`,
@@ -17310,7 +16924,7 @@ bot.command("selfskill", async (ctx) => {
   const mode = input.toLowerCase();
   if (mode === "list" || mode === "status") {
     try {
-      const result = await listDynamicSkillInstructions();
+      const result = await selfSkillStore.listInstructions();
       if (result.entries.length === 0) {
         await ctx.reply(
           [
@@ -17345,7 +16959,7 @@ bot.command("selfskill", async (ctx) => {
   }
 
   try {
-    const result = await appendDynamicSkillInstruction(input);
+    const result = await selfSkillStore.appendInstruction(input);
     await ctx.reply(
       [
         `Habilidad agregada en ${result.relPath}:`,
@@ -17353,7 +16967,7 @@ bot.command("selfskill", async (ctx) => {
         "",
         "Se aplicará en próximas respuestas de IA.",
         "Si quieres reiniciar el servicio ahora: /selfrestart",
-        "Para borrar una habilidad: /selfskill del <n>",
+        "Para borrar una habilidad: /selfskill del <n|#id|last>",
         "Si quieres armarla en varios mensajes: /selfskill draft start",
       ].join("\n"),
     );
@@ -17874,7 +17488,6 @@ bot.on(["message:photo", "message:document"], async (ctx, next) => {
       incoming,
       imageBuffer: downloaded.buffer,
       telegramFilePath: downloaded.filePath,
-      chatId: ctx.chat.id,
     });
     const resolvedMimeType = resolveIncomingImageMimeType({
       fileName: incoming.fileName,
@@ -18030,7 +17643,6 @@ bot.on("message:document", async (ctx, next) => {
       incoming,
       fileBuffer: downloaded.buffer,
       telegramFilePath: downloaded.filePath,
-      chatId: ctx.chat.id,
     });
 
     await appendConversationTurn({

@@ -140,6 +140,13 @@ test("read intent works as content follow-up without explicit path", () => {
   assert.equal(intent.path, undefined);
 });
 
+test("list intent preserves ellipsis path placeholder for workspace autocomplete", () => {
+  const intent = detectWorkspaceNaturalIntent("listar /workspace/img...", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "list");
+  assert.equal(intent.path, "img...");
+});
+
 test("delete intent detects delete-contents for folder phrasing", () => {
   const intent = detectWorkspaceNaturalIntent("Eliminar todos los archivos de la carpeta workspace/images", deps);
   assert.equal(intent.shouldHandle, true);

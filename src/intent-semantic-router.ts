@@ -274,7 +274,7 @@ const DEFAULT_ROUTES: SemanticRouteConfig[] = [
     utterances: [
       "busca en internet",
       "ultimas noticias",
-      "revisa reddit",
+      "revisa la web",
       "abre este link",
       "noticias de cripto",
       "resumen de noticias de hoy",

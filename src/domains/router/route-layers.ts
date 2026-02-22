@@ -147,7 +147,7 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
     }
   }
 
-  if (/\b(web|internet|url|link|reddit|noticias)\b/.test(ctx.normalizedText) && !hasMailSendCue(ctx.normalizedText)) {
+  if (/\b(web|internet|url|link|noticias)\b/.test(ctx.normalizedText) && !hasMailSendCue(ctx.normalizedText)) {
     applyNarrow(["web"], "señal fuerte de web", "web-cue", { strict: true });
   }
 

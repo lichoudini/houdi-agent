@@ -30,6 +30,102 @@ export class WorkspaceFilesService {
     return { fullPath, relPath };
   }
 
+  hasEllipsisPathPlaceholder(relativeInput?: string): boolean {
+    const normalized = this.normalizeWorkspaceRelativePath(relativeInput ?? "");
+    if (!normalized) {
+      return false;
+    }
+    return normalized
+      .split("/")
+      .some((segment) => Boolean(segment) && /\.{3,}$/.test(segment));
+  }
+
+  async resolveEllipsisPathPlaceholder(
+    relativeInput: string,
+  ): Promise<{ inputPath: string; resolvedPath: string; expanded: boolean }> {
+    const inputPath = this.normalizeWorkspaceRelativePath(relativeInput);
+    if (!inputPath) {
+      return { inputPath: "", resolvedPath: "", expanded: false };
+    }
+    if (!this.hasEllipsisPathPlaceholder(inputPath)) {
+      return { inputPath, resolvedPath: inputPath, expanded: false };
+    }
+
+    const sourceSegments = inputPath.split("/").filter(Boolean);
+    const resolvedSegments: string[] = [];
+    for (let index = 0; index < sourceSegments.length; index += 1) {
+      const segment = sourceSegments[index] ?? "";
+      if (!segment || !segment.endsWith("...")) {
+        resolvedSegments.push(segment);
+        continue;
+      }
+      const prefix = segment.slice(0, -3);
+      const baseDirRel = resolvedSegments.join("/");
+      const baseDirResolved = this.resolveWorkspacePath(baseDirRel);
+      let baseDirEntries;
+      try {
+        baseDirEntries = await fs.readdir(baseDirResolved.fullPath, { withFileTypes: true });
+      } catch {
+        throw new Error(`No existe la carpeta base para autocompletar: ${baseDirResolved.relPath}`);
+      }
+
+      const normalizedPrefix = normalizeForPathMatch(prefix);
+      const matches = baseDirEntries
+        .map((entry) => entry.name)
+        .filter((entryName) => {
+          if (!normalizedPrefix) {
+            return true;
+          }
+          return normalizeForPathMatch(entryName).startsWith(normalizedPrefix);
+        })
+        .sort((a, b) => a.localeCompare(b, "es", { sensitivity: "base" }));
+
+      if (matches.length === 0) {
+        throw new Error(`No encontré coincidencias para "${segment}" en ${baseDirResolved.relPath}.`);
+      }
+
+      let selected = "";
+      if (matches.length === 1) {
+        selected = matches[0] ?? "";
+      } else {
+        const exactMatches = normalizedPrefix
+          ? matches.filter((entryName) => normalizeForPathMatch(entryName) === normalizedPrefix)
+          : [];
+        if (exactMatches.length === 1) {
+          selected = exactMatches[0] ?? "";
+        } else {
+          const optionsPreview = matches.slice(0, 8).join(", ");
+          const suffix = matches.length > 8 ? "..." : "";
+          throw new Error(
+            `Ruta ambigua para "${segment}" en ${baseDirResolved.relPath}. Coincidencias: ${optionsPreview}${suffix}`,
+          );
+        }
+      }
+
+      resolvedSegments.push(selected);
+      const isLastSegment = index === sourceSegments.length - 1;
+      if (!isLastSegment) {
+        const selectedPath = this.resolveWorkspacePath(resolvedSegments.join("/"));
+        let stat;
+        try {
+          stat = await fs.stat(selectedPath.fullPath);
+        } catch {
+          throw new Error(`No existe la ruta autocompletada: ${selectedPath.relPath}`);
+        }
+        if (!stat.isDirectory()) {
+          throw new Error(`"${selectedPath.relPath}" es un archivo, no carpeta.`);
+        }
+      }
+    }
+
+    const resolvedPath = this.normalizeWorkspaceRelativePath(resolvedSegments.join("/"));
+    return {
+      inputPath,
+      resolvedPath,
+      expanded: resolvedPath !== inputPath,
+    };
+  }
+
   async listWorkspaceDirectory(relativeInput?: string): Promise<{ relPath: string; entries: WorkspaceEntry[]; truncated: boolean }> {
     const resolved = this.resolveWorkspacePath(relativeInput ?? "");
     const dirents = await fs.readdir(resolved.fullPath, { withFileTypes: true });
@@ -148,4 +244,12 @@ export class WorkspaceFilesService {
 
     return { relPath: resolved.relPath, kind };
   }
+}
+
+function normalizeForPathMatch(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .trim();
 }

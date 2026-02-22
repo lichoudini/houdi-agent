@@ -201,6 +201,87 @@ export function createGmailTextParsers(deps: GmailTextParsersDeps) {
     return Math.min(maxAllowed, parsed);
   }
 
+  function cleanNewsTopicCandidate(value: string): string {
+    return value
+      .replace(/\b(?:para|en)\s+(?:el\s+)?(?:correo|mail|email|gmail)\b.*$/i, " ")
+      .replace(/\b(?:asunto|subject|mensaje|cuerpo|body)\s*[:=-].*$/i, " ")
+      .replace(/\b(?:por\s+favor|porfa|gracias)\b.*$/i, " ")
+      .replace(/^["'`“”«»]+|["'`“”«»]+$/g, "")
+      .replace(/^(?:de|del|la|el|los|las|sobre|acerca\s+de)\s+/i, "")
+      .replace(/[.,;:!?]+$/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function extractNewsTopicFromText(text: string): string {
+    const compact = text.replace(/\s+/g, " ").trim();
+    if (!compact) {
+      return "";
+    }
+
+    const withoutEmails = compact
+      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+      .replace(/\bcc\s*[:=-]\s*[^\n]+/gi, " ")
+      .replace(/\bbcc\s*[:=-]\s*[^\n]+/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const normalized = deps.normalizeIntentText(withoutEmails);
+    const newsNounPattern = "(?:noticias?|news|nove(?:dad(?:es)?|ades?)|titulares?|actualidad)";
+
+    const explicitTopicLabel =
+      withoutEmails.match(/\b(?:tema|topic)\s*[:=-]\s*(.+)$/i)?.[1] ??
+      withoutEmails.match(/\b(?:sobre|acerca\s+de)\s+(.+)$/i)?.[1] ??
+      "";
+    const explicitTopic = cleanNewsTopicCandidate(explicitTopicLabel);
+    if (explicitTopic) {
+      return explicitTopic;
+    }
+
+    if (new RegExp(`\\b${newsNounPattern}\\b`).test(normalized)) {
+      const quoted = deps.extractQuotedSegments(withoutEmails).map(cleanNewsTopicCandidate).filter(Boolean);
+      if (quoted.length > 0) {
+        return quoted[0] ?? "";
+      }
+    }
+
+    const patterns = [
+      new RegExp(
+        `\\b${newsNounPattern}\\s+(?:de|sobre|acerca\\s+de|del|de\\s+la|de\\s+los|de\\s+las|relacionad[oa]s?\\s+con)\\s+([^,.;:\\n]+)`,
+        "i",
+      ),
+      new RegExp(
+        `\\b(?:con\\s+)?(?:las?\\s+|los?\\s+)?(?:s?ultim[oa]s?|recientes?|nuevas?)?\\s*${newsNounPattern}\\s+(?:de|sobre|acerca\\s+de|del|de\\s+la|de\\s+los|de\\s+las|relacionad[oa]s?\\s+con)\\s+([^,.;:\\n]+)`,
+        "i",
+      ),
+      new RegExp(`\\b${newsNounPattern}\\s+([^,.;:\\n]+)`, "i"),
+    ] as const;
+
+    for (const pattern of patterns) {
+      const match = withoutEmails.match(pattern);
+      const candidate = cleanNewsTopicCandidate(match?.[1] ?? "");
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    const newsStart = normalized.search(new RegExp(`\\b${newsNounPattern}\\b`));
+    if (newsStart >= 0) {
+      const fromNewsCue = normalized.slice(newsStart);
+      const fallback = fromNewsCue
+        .replace(
+          /\b(?:s?ultim[oa]s?|recientes?|nuevas?|de\s+hoy|hoy|noticias?|news|nove(?:dad(?:es)?|ades?)|titulares?|actualidad|resumen|sobre|acerca\s+de|de|del|la|el|los|las|con)\b/g,
+          " ",
+        )
+        .replace(/\s+/g, " ")
+        .trim();
+      if (fallback) {
+        return fallback;
+      }
+    }
+
+    return "";
+  }
+
   function buildNaturalGmailQuery(text: string, textNormalized: string): string {
     const explicitTokens = text.match(
       /\b(?:is|from|to|subject|after|before|newer_than|older_than|label|category|has):[^\s]+/gi,
@@ -247,6 +328,7 @@ export function createGmailTextParsers(deps: GmailTextParsersDeps) {
     buildGmailDraftInstruction,
     shouldAvoidLiteralBodyFallback,
     parseNaturalLimit,
+    extractNewsTopicFromText,
     buildNaturalGmailQuery,
   };
 }

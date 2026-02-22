@@ -70,7 +70,7 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
   if (/\b(workspace|archivo|carpeta|pdf|docx|xlsx|csv|json|md|renombr|mover|copiar|pegar|borrar|eliminar|leer archivo)\b/.test(t)) {
     add("files", 0.62);
   }
-  if (/\b(web|internet|url|link|noticias|reddit|buscar en)\b/.test(t)) {
+  if (/\b(web|internet|url|link|noticias|buscar en)\b/.test(t)) {
     add("knowledge", 0.62);
   }
   if (
