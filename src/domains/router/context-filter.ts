@@ -17,8 +17,8 @@ export type RouterContextFilterDeps = {
   getPendingWorkspaceDeletePath: (chatId: number) => { expiresAtMs: number } | null;
   getLastGmailResultsCount: (chatId: number) => number;
   getLastListedFilesCount: (chatId: number) => number;
-  getLastConnectorContextAt: (chatId: number) => number;
-  connectorContextTtlMs: number;
+  getLastLimContextAt: (chatId: number) => number;
+  limContextTtlMs: number;
 };
 
 function uniqueCandidates(candidates: string[]): string[] {
@@ -150,20 +150,20 @@ export function buildIntentRouterContextFilter(
     }
   }
 
-  const hasRecentConnectorContext = deps.getLastConnectorContextAt(params.chatId) + deps.connectorContextTtlMs > now;
-  const connectorControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
+  const hasRecentLimContext = deps.getLastLimContextAt(params.chatId) + deps.limContextTtlMs > now;
+  const limControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
     normalized,
   );
   const explicitLimCue = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
   const mentionsOtherDomain = /\b(gmail|correo|correos|email|emails|mail|mails|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(
     normalized,
   );
-  if (hasRecentConnectorContext && explicitLimCue && connectorControlVerb && !mentionsOtherDomain) {
-    applyNarrow(["connector"], "recent-connector-context", { strict: true });
+  if (hasRecentLimContext && explicitLimCue && limControlVerb && !mentionsOtherDomain) {
+    applyNarrow(["lim"], "recent-lim-context", { strict: true });
   }
 
   if (explicitLimCue && !mentionsOtherDomain) {
-    applyNarrow(["connector"], "explicit-lim-route", { strict: true });
+    applyNarrow(["lim"], "explicit-lim-route", { strict: true });
   }
 
   if (!conversationalOnly && hasMailCue(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {

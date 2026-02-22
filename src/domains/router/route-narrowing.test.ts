@@ -9,7 +9,7 @@ test("context filter enforces strict exhaustion when explicit route has no overl
     {
       chatId: 1,
       text: "eliminar archivo temporal",
-      candidates: ["gmail", "connector"],
+      candidates: ["gmail", "lim"],
       hasMailContext: false,
       hasMemoryRecallCue: false,
     },
@@ -21,8 +21,8 @@ test("context filter enforces strict exhaustion when explicit route has no overl
       getPendingWorkspaceDeletePath: () => null,
       getLastGmailResultsCount: () => 0,
       getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
+      getLastLimContextAt: () => 0,
+      limContextTtlMs: 60_000,
     },
   );
   assert.ok(decision);
@@ -72,7 +72,7 @@ test("route layers apply indexed-list narrowing when list reference cue exists",
 test("hierarchical router returns strict exhaustion when top domain is incompatible", () => {
   const decision = buildHierarchicalIntentDecision({
     normalizedText: "eliminar archivo de workspace",
-    candidates: ["gmail", "connector"],
+    candidates: ["gmail", "lim"],
     hasMailContext: false,
     hasMemoryRecallCue: false,
     indexedListKind: null,
@@ -101,8 +101,8 @@ test("context filter does not misroute 'leer correos' to workspace", () => {
       getPendingWorkspaceDeletePath: () => null,
       getLastGmailResultsCount: () => 0,
       getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
+      getLastLimContextAt: () => 0,
+      limContextTtlMs: 60_000,
     },
   );
   if (decision) {
@@ -131,8 +131,8 @@ test("context filter prioriza self-maintenance para skill natural", () => {
       getPendingWorkspaceDeletePath: () => null,
       getLastGmailResultsCount: () => 0,
       getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
+      getLastLimContextAt: () => 0,
+      limContextTtlMs: 60_000,
     },
   );
   assert.ok(decision);

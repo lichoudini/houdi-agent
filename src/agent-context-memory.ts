@@ -124,6 +124,7 @@ type AppendConversationTurnParams = {
 const RECENT_DAILY_CONTEXT_DAYS = 2;
 const CONVERSATION_TURN_MAX_CHARS = 1_200;
 const CHAT_CONTINUITY_UPDATE_INTERVAL_TURNS = 4;
+const CHAT_CONTINUITY_MIN_REBUILD_INTERVAL_MS = 45_000;
 const CHAT_RECENT_CONTEXT_FILES = 6;
 const CHAT_RECENT_CONTEXT_TURNS = 80;
 const SEARCH_RECENT_GLOBAL_FILES = 60;
@@ -237,6 +238,16 @@ type IndexedMemoryLine = {
   tokens: string[];
   tokenSet: Set<string>;
   tokenFreq: Map<string, number>;
+};
+
+type CachedIndexedMemoryLine = Omit<IndexedMemoryLine, "path" | "ageDays">;
+
+type CachedIndexedMemoryFile = {
+  relPath: string;
+  mtimeMs: number;
+  size: number;
+  fromPathDateMs?: number;
+  lines: CachedIndexedMemoryLine[];
 };
 
 function clampInt(value: number, min: number, max: number): number {
@@ -810,6 +821,9 @@ export class AgentContextMemory {
   private readonly memoryMaxInjectedChars: number;
   private readonly preferredBackend: MemoryBackendName;
   private readonly chatTurnCounters = new Map<number, number>();
+  private readonly chatContinuityDirty = new Set<number>();
+  private readonly chatContinuityLastRebuildAtMs = new Map<number, number>();
+  private readonly indexedMemoryFileCache = new Map<string, CachedIndexedMemoryFile>();
   private lastBackendUsed: MemoryBackendName = DEFAULT_MEMORY_BACKEND;
   private backendFallbackCount = 0;
   private lastFallbackError?: string;
@@ -982,6 +996,7 @@ export class AgentContextMemory {
 
     const dailyNote = await this.appendDailyNote(`${roleTag}: ${compactText}`, metadata);
     await this.appendChatConversationTurn(params.chatId, `${roleTag}: ${compactText}`, metadata);
+    this.markChatContinuityDirty(params.chatId);
     await this.refreshChatContinuityIfNeeded(params.chatId);
     return dailyNote;
   }
@@ -989,6 +1004,13 @@ export class AgentContextMemory {
   async flushBeforeReasoning(chatIdInput?: number): Promise<void> {
     const chatId = Number.isFinite(chatIdInput) ? Math.floor(chatIdInput ?? 0) : 0;
     if (chatId <= 0) {
+      return;
+    }
+    if (!this.chatContinuityDirty.has(chatId)) {
+      return;
+    }
+    const lastRebuildAtMs = this.chatContinuityLastRebuildAtMs.get(chatId) ?? 0;
+    if (Date.now() - lastRebuildAtMs < CHAT_CONTINUITY_MIN_REBUILD_INTERVAL_MS) {
       return;
     }
     await this.rebuildChatContinuity(chatId);
@@ -1185,53 +1207,18 @@ export class AgentContextMemory {
     const files = await this.getSearchFilePaths({ chatId });
     const nowMs = Date.now();
     const collected: IndexedMemoryLine[] = [];
+    const aliveFiles = new Set(files);
 
     for (const filePath of files) {
-      let content = "";
-      try {
-        content = await fs.readFile(filePath, "utf8");
-      } catch {
-        continue;
+      const lines = await this.getIndexedLinesForFile(filePath, nowMs);
+      if (lines.length > 0) {
+        collected.push(...lines);
       }
+    }
 
-      const relPath = path.relative(this.workspaceDir, filePath).replace(/\\/g, "/");
-      let ageDays: number | undefined;
-      const fromPathDate = parseMemoryDateFromPath(relPath);
-      if (fromPathDate) {
-        ageDays = Math.max(0, nowMs - fromPathDate.getTime()) / (24 * 60 * 60 * 1000);
-      } else {
-        try {
-          const stat = await fs.stat(filePath);
-          ageDays = Math.max(0, nowMs - stat.mtime.getTime()) / (24 * 60 * 60 * 1000);
-        } catch {
-          ageDays = undefined;
-        }
-      }
-
-      const fileLines = content.split(/\r?\n/);
-      for (let idx = 0; idx < fileLines.length; idx += 1) {
-        const rawLine = fileLines[idx]?.trim() ?? "";
-        if (!rawLine) {
-          continue;
-        }
-        const parsed = splitLineMetadata(rawLine);
-        if (!parsed.content || looksLikePromptInjection(parsed.content)) {
-          continue;
-        }
-        const tokens = tokenizeTextForIndex(parsed.content);
-        const tokenSet = new Set(tokens);
-        const tokenFreq = tokenFrequency(tokens);
-        collected.push({
-          path: relPath,
-          line: idx + 1,
-          content: parsed.content,
-          normalized: normalizeForSearch(parsed.content),
-          metadata: parsed.metadata,
-          ageDays,
-          tokens,
-          tokenSet,
-          tokenFreq,
-        });
+    for (const cacheKey of this.indexedMemoryFileCache.keys()) {
+      if (!aliveFiles.has(cacheKey)) {
+        this.indexedMemoryFileCache.delete(cacheKey);
       }
     }
 
@@ -1499,6 +1486,10 @@ export class AgentContextMemory {
     if (continuityExists && nextCount % CHAT_CONTINUITY_UPDATE_INTERVAL_TURNS !== 0) {
       return;
     }
+    const lastRebuildAtMs = this.chatContinuityLastRebuildAtMs.get(chatId) ?? 0;
+    if (continuityExists && Date.now() - lastRebuildAtMs < CHAT_CONTINUITY_MIN_REBUILD_INTERVAL_MS) {
+      return;
+    }
 
     await this.rebuildChatContinuity(chatId);
   }
@@ -1506,6 +1497,8 @@ export class AgentContextMemory {
   private async rebuildChatContinuity(chatId: number): Promise<void> {
     const recentExcerpts = await this.collectRecentChatExcerpts(chatId, CHAT_RECENT_CONTEXT_TURNS);
     if (recentExcerpts.length === 0) {
+      this.chatContinuityDirty.delete(chatId);
+      this.chatContinuityLastRebuildAtMs.set(chatId, Date.now());
       return;
     }
 
@@ -1564,6 +1557,8 @@ export class AgentContextMemory {
     const fullPath = path.join(this.workspaceDir, relPath);
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
     await fs.writeFile(fullPath, `${lines.join("\n")}\n`, "utf8");
+    this.chatContinuityDirty.delete(chatId);
+    this.chatContinuityLastRebuildAtMs.set(chatId, Date.now());
   }
 
   private async collectRecentChatExcerpts(chatId: number, maxTurns: number): Promise<ConversationExcerpt[]> {
@@ -1761,5 +1756,108 @@ export class AgentContextMemory {
     } catch {
       return false;
     }
+  }
+
+  private markChatContinuityDirty(chatIdInput: number): void {
+    const chatId = Number.isFinite(chatIdInput) ? Math.floor(chatIdInput) : 0;
+    if (chatId <= 0) {
+      return;
+    }
+    this.chatContinuityDirty.add(chatId);
+  }
+
+  private computeIndexedFileAgeDays(params: {
+    nowMs: number;
+    fromPathDateMs?: number;
+    mtimeMs?: number;
+  }): number | undefined {
+    if (typeof params.fromPathDateMs === "number" && Number.isFinite(params.fromPathDateMs)) {
+      return Math.max(0, params.nowMs - params.fromPathDateMs) / (24 * 60 * 60 * 1000);
+    }
+    if (typeof params.mtimeMs === "number" && Number.isFinite(params.mtimeMs)) {
+      return Math.max(0, params.nowMs - params.mtimeMs) / (24 * 60 * 60 * 1000);
+    }
+    return undefined;
+  }
+
+  private async getIndexedLinesForFile(filePath: string, nowMs: number): Promise<IndexedMemoryLine[]> {
+    let stat;
+    try {
+      stat = await fs.stat(filePath);
+    } catch {
+      this.indexedMemoryFileCache.delete(filePath);
+      return [];
+    }
+    const relPath = path.relative(this.workspaceDir, filePath).replace(/\\/g, "/");
+    const fromPathDate = parseMemoryDateFromPath(relPath);
+    const fromPathDateMs = fromPathDate ? fromPathDate.getTime() : undefined;
+    const cached = this.indexedMemoryFileCache.get(filePath);
+    const cacheValid =
+      cached &&
+      cached.relPath === relPath &&
+      cached.mtimeMs === stat.mtimeMs &&
+      cached.size === stat.size &&
+      cached.fromPathDateMs === fromPathDateMs;
+
+    const ageDays = this.computeIndexedFileAgeDays({
+      nowMs,
+      fromPathDateMs: cacheValid ? cached.fromPathDateMs : fromPathDateMs,
+      mtimeMs: stat.mtimeMs,
+    });
+
+    if (cacheValid && cached) {
+      return cached.lines.map((line) => ({
+        ...line,
+        path: cached.relPath,
+        ageDays,
+      }));
+    }
+
+    let content = "";
+    try {
+      content = await fs.readFile(filePath, "utf8");
+    } catch {
+      this.indexedMemoryFileCache.delete(filePath);
+      return [];
+    }
+
+    const lines: CachedIndexedMemoryLine[] = [];
+    const fileLines = content.split(/\r?\n/);
+    for (let idx = 0; idx < fileLines.length; idx += 1) {
+      const rawLine = fileLines[idx]?.trim() ?? "";
+      if (!rawLine) {
+        continue;
+      }
+      const parsed = splitLineMetadata(rawLine);
+      if (!parsed.content || looksLikePromptInjection(parsed.content)) {
+        continue;
+      }
+      const tokens = tokenizeTextForIndex(parsed.content);
+      const tokenSet = new Set(tokens);
+      const tokenFreq = tokenFrequency(tokens);
+      lines.push({
+        line: idx + 1,
+        content: parsed.content,
+        normalized: normalizeForSearch(parsed.content),
+        metadata: parsed.metadata,
+        tokens,
+        tokenSet,
+        tokenFreq,
+      });
+    }
+
+    this.indexedMemoryFileCache.set(filePath, {
+      relPath,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      fromPathDateMs,
+      lines,
+    });
+
+    return lines.map((line) => ({
+      ...line,
+      path: relPath,
+      ageDays,
+    }));
   }
 }

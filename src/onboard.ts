@@ -557,33 +557,31 @@ async function main(): Promise<void> {
     const enableLim = await promptYesNo(
       rl,
       "Habilitar control de LIM externo",
-      (envMap.get("ENABLE_LIM_CONTROL") || envMap.get("ENABLE_CONNECTOR_CONTROL") || "false").toLowerCase() ===
-        "true",
+      (envMap.get("ENABLE_LIM_CONTROL") || "false").toLowerCase() === "true",
     );
     envMap.set("ENABLE_LIM_CONTROL", normalizeBoolean(enableLim));
     if (enableLim) {
       const limAppDir = normalizeDirValue(
         await promptLine(rl, "LIM_APP_DIR", {
-          defaultValue: envMap.get("LIM_APP_DIR") || envMap.get("CONNECTOR_APP_DIR") || "./lim-app",
+          defaultValue: envMap.get("LIM_APP_DIR") || "./lim-app",
           required: true,
         }),
         "./lim-app",
       );
       const limAppService = await promptLine(rl, "LIM_APP_SERVICE", {
-        defaultValue: envMap.get("LIM_APP_SERVICE") || envMap.get("CONNECTOR_RETRIEVER_SERVICE") || "houdi-lim-app.service",
+        defaultValue: envMap.get("LIM_APP_SERVICE") || "houdi-lim-app.service",
         required: true,
       });
       const limTunnelService = await promptLine(rl, "LIM_TUNNEL_SERVICE", {
-        defaultValue:
-          envMap.get("LIM_TUNNEL_SERVICE") || envMap.get("CONNECTOR_CLOUDFLARED_SERVICE") || "houdi-lim-tunnel.service",
+        defaultValue: envMap.get("LIM_TUNNEL_SERVICE") || "houdi-lim-tunnel.service",
         required: true,
       });
       const limLocalHealth = await promptLine(rl, "LIM_LOCAL_HEALTH_URL", {
-        defaultValue: envMap.get("LIM_LOCAL_HEALTH_URL") || envMap.get("CONNECTOR_LOCAL_HEALTH_URL") || "http://127.0.0.1:3333/health",
+        defaultValue: envMap.get("LIM_LOCAL_HEALTH_URL") || "http://127.0.0.1:3333/health",
         required: true,
       });
       const limPublicHealth = await promptLine(rl, "LIM_PUBLIC_HEALTH_URL", {
-        defaultValue: envMap.get("LIM_PUBLIC_HEALTH_URL") || envMap.get("CONNECTOR_PUBLIC_HEALTH_URL") || limLocalHealth,
+        defaultValue: envMap.get("LIM_PUBLIC_HEALTH_URL") || limLocalHealth,
         required: true,
       });
       envMap.set("LIM_APP_DIR", limAppDir);
@@ -592,13 +590,6 @@ async function main(): Promise<void> {
       envMap.set("LIM_LOCAL_HEALTH_URL", limLocalHealth);
       envMap.set("LIM_PUBLIC_HEALTH_URL", limPublicHealth);
     }
-    envMap.delete("ENABLE_CONNECTOR_CONTROL");
-    envMap.delete("CONNECTOR_APP_DIR");
-    envMap.delete("CONNECTOR_RETRIEVER_SERVICE");
-    envMap.delete("CONNECTOR_CLOUDFLARED_SERVICE");
-    envMap.delete("CONNECTOR_LOCAL_HEALTH_URL");
-    envMap.delete("CONNECTOR_PUBLIC_HEALTH_URL");
-    envMap.delete("CONNECTOR_HEALTH_TIMEOUT_MS");
 
     process.stdout.write("\nPaso 7/7 - Confirmación\n");
     process.stdout.write(

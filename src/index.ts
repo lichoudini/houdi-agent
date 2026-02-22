@@ -209,12 +209,10 @@ const scheduledTasks = new ScheduledTaskSqliteService({
   dbPath: config.stateDbFile,
 });
 await scheduledTasks.load();
-await scheduledTasks.migrateFromJson(config.scheduleFile);
 const emailRecipients = new EmailRecipientsSqliteService({
   dbPath: config.stateDbFile,
 });
 await emailRecipients.load();
-await emailRecipients.migrateFromJson(config.recipientsFile);
 const gmailRecipients = new GmailRecipientsManager(emailRecipients, normalizeIntentText);
 const selfSkillDrafts = new SelfSkillDraftService({
   filePath: config.selfSkillDraftsFile,
@@ -318,12 +316,14 @@ type IndexedListContext = {
   createdAtMs: number;
 };
 const indexedListByChat = new Map<number, IndexedListContext>();
-const lastConnectorContextByChat = new Map<number, number>();
+const lastLimContextByChat = new Map<number, number>();
 let selfUpdateInProgress = false;
 let localBridgeServer: Server | null = null;
 let outboxRecoveryTimer: NodeJS.Timeout | null = null;
 let outboxRecoveryInFlight = false;
 let runtimeStatePersistenceTimer: NodeJS.Timeout | null = null;
+let runtimeStatePersistDebounceTimer: NodeJS.Timeout | null = null;
+let runtimeStatePersistPendingSource = "startup";
 let intentHardNegativesTimer: NodeJS.Timeout | null = null;
 let intentHardNegativesInFlight = false;
 let intentCanaryGuardTimer: NodeJS.Timeout | null = null;
@@ -381,7 +381,7 @@ const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
 const SELF_UPDATE_APPROVAL_COMMAND = "__selfupdate__";
 const NEWS_MAX_AGE_DAYS = 7;
 const NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES = 8;
-const CONNECTOR_CONTEXT_TTL_MS = 30 * 60 * 1000;
+const LIM_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const RECENT_EMAIL_ROUTER_CONTEXT_TURNS = 3;
 const RECENT_INTENT_ROUTER_CONTEXT_TURNS = 3;
 const RECENT_CONVERSATION_TURN_LIMIT = 40;
@@ -411,6 +411,7 @@ const OUTBOX_BACKOFF_MS: readonly number[] = [5_000, 25_000, 120_000, 600_000, 1
 const OUTBOX_RECOVERY_INTERVAL_MS = 15_000;
 const OUTBOX_RECOVERY_BATCH_SIZE = 30;
 const RUNTIME_STATE_PERSIST_INTERVAL_MS = 5_000;
+const RUNTIME_STATE_PERSIST_DEBOUNCE_MS = 1_200;
 const WORKSPACE_SELECTOR_MAX_DEPTH = 10;
 const WORKSPACE_SELECTOR_MAX_DIRS = 4000;
 const WORKSPACE_SELECTOR_MAX_MATCHES = 200;
@@ -493,52 +494,88 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "intentcanary",
 ]);
 
+const runtimeStatePersistSignatures = {
+  approvals: "",
+  planned: "",
+  workspaceDelete: "",
+  workspaceDeletePath: "",
+  chatRuntime: "",
+  globalRuntime: "",
+};
+
+function serializeRuntimeSnapshot(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function isKnownTelegramCommandText(text: string): boolean {
+  const match = text.trim().match(/^\/([a-z0-9_-]+)(?:@[a-z0-9_]+)?\b/i);
+  if (!match) {
+    return false;
+  }
+  const command = (match[1] ?? "").toLowerCase();
+  return KNOWN_TELEGRAM_COMMANDS.has(command);
+}
+
 function buildStoredPendingApprovalRows(): StoredPendingApproval[] {
-  return adminSecurity.snapshotApprovals().map((approval) => ({
-    id: approval.id,
-    kind: approval.kind,
-    chatId: approval.chatId,
-    userId: approval.userId,
-    agentName: approval.agentName,
-    commandLine: approval.commandLine,
-    createdAt: approval.createdAt,
-    expiresAt: approval.expiresAt,
-    ...(approval.note ? { note: approval.note } : {}),
-  }));
+  return adminSecurity
+    .snapshotApprovals()
+    .slice()
+    .sort((a, b) => a.createdAt - b.createdAt || a.chatId - b.chatId || a.id.localeCompare(b.id))
+    .map((approval) => ({
+      id: approval.id,
+      kind: approval.kind,
+      chatId: approval.chatId,
+      userId: approval.userId,
+      agentName: approval.agentName,
+      commandLine: approval.commandLine,
+      createdAt: approval.createdAt,
+      expiresAt: approval.expiresAt,
+      ...(approval.note ? { note: approval.note } : {}),
+    }));
 }
 
 function buildStoredPlannedActionRows(): StoredPlannedAction[] {
-  return [...pendingPlannedActionsById.values()].map((planned) => ({
-    id: planned.id,
-    kind: planned.kind,
-    chatId: planned.chatId,
-    ...(typeof planned.userId === "number" ? { userId: planned.userId } : {}),
-    requestedAtMs: planned.requestedAtMs,
-    expiresAtMs: planned.expiresAtMs,
-    summary: planned.summary,
-    payloadJson: JSON.stringify(planned.payload ?? {}),
-  }));
+  return [...pendingPlannedActionsById.values()]
+    .sort((a, b) => a.requestedAtMs - b.requestedAtMs || a.chatId - b.chatId || a.id.localeCompare(b.id))
+    .map((planned) => ({
+      id: planned.id,
+      kind: planned.kind,
+      chatId: planned.chatId,
+      ...(typeof planned.userId === "number" ? { userId: planned.userId } : {}),
+      requestedAtMs: planned.requestedAtMs,
+      expiresAtMs: planned.expiresAtMs,
+      summary: planned.summary,
+      payloadJson: JSON.stringify(planned.payload ?? {}),
+    }));
 }
 
 function buildStoredWorkspaceDeleteConfirmationRows(): StoredWorkspaceDeleteConfirmation[] {
-  return [...pendingWorkspaceDeleteByChat.entries()].map(([chatId, pending]) => ({
-    chatId,
-    pathsJson: JSON.stringify(pending.paths ?? []),
-    requestedAtMs: pending.requestedAtMs,
-    expiresAtMs: pending.expiresAtMs,
-    source: pending.source,
-    ...(typeof pending.userId === "number" ? { userId: pending.userId } : {}),
-  }));
+  return [...pendingWorkspaceDeleteByChat.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([chatId, pending]) => ({
+      chatId,
+      pathsJson: JSON.stringify(pending.paths ?? []),
+      requestedAtMs: pending.requestedAtMs,
+      expiresAtMs: pending.expiresAtMs,
+      source: pending.source,
+      ...(typeof pending.userId === "number" ? { userId: pending.userId } : {}),
+    }));
 }
 
 function buildStoredWorkspaceDeletePathRequestRows(): StoredWorkspaceDeletePathRequest[] {
-  return [...pendingWorkspaceDeletePathByChat.entries()].map(([chatId, pending]) => ({
-    chatId,
-    requestedAtMs: pending.requestedAtMs,
-    expiresAtMs: pending.expiresAtMs,
-    source: pending.source,
-    ...(typeof pending.userId === "number" ? { userId: pending.userId } : {}),
-  }));
+  return [...pendingWorkspaceDeletePathByChat.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([chatId, pending]) => ({
+      chatId,
+      requestedAtMs: pending.requestedAtMs,
+      expiresAtMs: pending.expiresAtMs,
+      source: pending.source,
+      ...(typeof pending.userId === "number" ? { userId: pending.userId } : {}),
+    }));
 }
 
 function buildStoredChatRuntimeSettingsRows(): StoredChatRuntimeSettings[] {
@@ -598,23 +635,85 @@ function buildStoredChatRuntimeSettingsRows(): StoredChatRuntimeSettings[] {
     });
 }
 
-function persistRuntimeStateSnapshot(source: string): void {
+function flushRuntimeStateSnapshot(source: string): void {
   try {
-    sqliteState.replacePendingApprovals(buildStoredPendingApprovalRows());
-    sqliteState.replacePendingPlannedActions(buildStoredPlannedActionRows());
-    sqliteState.replaceWorkspaceDeleteConfirmations(buildStoredWorkspaceDeleteConfirmationRows());
-    sqliteState.replaceWorkspaceDeletePathRequests(buildStoredWorkspaceDeletePathRequestRows());
-    sqliteState.replaceChatRuntimeSettings(buildStoredChatRuntimeSettingsRows());
-    sqliteState.upsertGlobalRuntimeSettings({
+    let changedTables = 0;
+
+    const approvals = buildStoredPendingApprovalRows();
+    const approvalsSignature = serializeRuntimeSnapshot(approvals);
+    if (approvalsSignature !== runtimeStatePersistSignatures.approvals) {
+      sqliteState.replacePendingApprovals(approvals);
+      runtimeStatePersistSignatures.approvals = approvalsSignature;
+      changedTables += 1;
+    }
+
+    const planned = buildStoredPlannedActionRows();
+    const plannedSignature = serializeRuntimeSnapshot(planned);
+    if (plannedSignature !== runtimeStatePersistSignatures.planned) {
+      sqliteState.replacePendingPlannedActions(planned);
+      runtimeStatePersistSignatures.planned = plannedSignature;
+      changedTables += 1;
+    }
+
+    const workspaceDelete = buildStoredWorkspaceDeleteConfirmationRows();
+    const workspaceDeleteSignature = serializeRuntimeSnapshot(workspaceDelete);
+    if (workspaceDeleteSignature !== runtimeStatePersistSignatures.workspaceDelete) {
+      sqliteState.replaceWorkspaceDeleteConfirmations(workspaceDelete);
+      runtimeStatePersistSignatures.workspaceDelete = workspaceDeleteSignature;
+      changedTables += 1;
+    }
+
+    const workspaceDeletePath = buildStoredWorkspaceDeletePathRequestRows();
+    const workspaceDeletePathSignature = serializeRuntimeSnapshot(workspaceDeletePath);
+    if (workspaceDeletePathSignature !== runtimeStatePersistSignatures.workspaceDeletePath) {
+      sqliteState.replaceWorkspaceDeletePathRequests(workspaceDeletePath);
+      runtimeStatePersistSignatures.workspaceDeletePath = workspaceDeletePathSignature;
+      changedTables += 1;
+    }
+
+    const chatRuntime = buildStoredChatRuntimeSettingsRows();
+    const chatRuntimeSignature = serializeRuntimeSnapshot(chatRuntime);
+    if (chatRuntimeSignature !== runtimeStatePersistSignatures.chatRuntime) {
+      sqliteState.replaceChatRuntimeSettings(chatRuntime);
+      runtimeStatePersistSignatures.chatRuntime = chatRuntimeSignature;
+      changedTables += 1;
+    }
+
+    const globalRuntime = {
       panicMode: adminSecurity.isPanicModeEnabled(),
       updatedAtMs: Date.now(),
+    };
+    const globalRuntimeSignature = serializeRuntimeSnapshot({
+      panicMode: globalRuntime.panicMode,
     });
-    observability.increment("runtime_state.persist.ok", 1, { source });
+    if (globalRuntimeSignature !== runtimeStatePersistSignatures.globalRuntime) {
+      sqliteState.upsertGlobalRuntimeSettings(globalRuntime);
+      runtimeStatePersistSignatures.globalRuntime = globalRuntimeSignature;
+      changedTables += 1;
+    }
+
+    if (changedTables > 0) {
+      observability.increment("runtime_state.persist.ok", 1, { source, changedTables });
+    } else {
+      observability.increment("runtime_state.persist.skipped", 1, { source });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logWarn(`No pude persistir runtime state (${source}): ${message}`);
     observability.increment("runtime_state.persist.failed", 1, { source });
   }
+}
+
+function persistRuntimeStateSnapshot(source: string): void {
+  runtimeStatePersistPendingSource = source;
+  if (runtimeStatePersistDebounceTimer) {
+    return;
+  }
+  runtimeStatePersistDebounceTimer = setTimeout(() => {
+    runtimeStatePersistDebounceTimer = null;
+    flushRuntimeStateSnapshot(runtimeStatePersistPendingSource);
+  }, RUNTIME_STATE_PERSIST_DEBOUNCE_MS);
+  runtimeStatePersistDebounceTimer.unref?.();
 }
 
 function restoreRuntimeStateSnapshot(): void {
@@ -1136,7 +1235,7 @@ type GmailRecipientNaturalIntent = {
 type NaturalIntentHandlerName =
   | "stoic-smalltalk"
   | "self-maintenance"
-  | "connector"
+  | "lim"
   | "schedule"
   | "memory"
   | "gmail-recipients"
@@ -4618,8 +4717,8 @@ function buildIntentRouterContextFilter(params: {
       getPendingWorkspaceDeletePath: (chatId) => pendingWorkspaceDeletePathByChat.get(chatId) ?? null,
       getLastGmailResultsCount: (chatId) => lastGmailResultsByChat.get(chatId)?.length ?? 0,
       getLastListedFilesCount: (chatId) => lastListedFilesByChat.get(chatId)?.length ?? 0,
-      getLastConnectorContextAt: (chatId) => lastConnectorContextByChat.get(chatId) ?? 0,
-      connectorContextTtlMs: CONNECTOR_CONTEXT_TTL_MS,
+      getLastLimContextAt: (chatId) => lastLimContextByChat.get(chatId) ?? 0,
+      limContextTtlMs: LIM_CONTEXT_TTL_MS,
     },
   );
   if (!decision) {
@@ -4979,7 +5078,7 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
       delete: "Para borrar necesito ruta o selector. Ejemplo: eliminar archivo <ruta> o eliminar archivos que contienen \"...\".",
     },
   },
-  connector: {
+  lim: {
     extract: (text) => {
       const intent = detectConnectorNaturalIntent(text);
       if (!intent.shouldHandle || !intent.action) {
@@ -5145,7 +5244,7 @@ function buildTypedRouteClarificationQuestion(extraction: TypedRouteExtraction):
 }
 
 function isSensitiveIntentRoute(route: Exclude<NaturalIntentHandlerName, "none">): boolean {
-  return ["gmail", "workspace", "connector", "self-maintenance", "schedule"].includes(route);
+  return ["gmail", "workspace", "lim", "self-maintenance", "schedule"].includes(route);
 }
 
 function shouldAbstainByUncertainty(params: {
@@ -5208,7 +5307,7 @@ function handlerLikelyMatchesText(handler: Exclude<NaturalIntentHandlerName, "no
       return detectStoicSmalltalkIntent(text);
     case "self-maintenance":
       return detectSelfMaintenanceIntent(text).shouldHandle;
-    case "connector":
+    case "lim":
       return detectConnectorNaturalIntent(text).shouldHandle;
     case "schedule":
       return detectScheduleNaturalIntent(text).shouldHandle;
@@ -5487,7 +5586,7 @@ function tryParseNaturalRouteDecision(raw: string): {
     const allowed = new Set<NaturalIntentHandlerName>([
       "stoic-smalltalk",
       "self-maintenance",
-      "connector",
+      "lim",
       "schedule",
       "memory",
       "gmail-recipients",
@@ -5531,7 +5630,7 @@ async function classifyNaturalIntentRouteWithAi(params: {
     "Handlers disponibles:",
     "- stoic-smalltalk: charla corta estoica/motivacional.",
     "- self-maintenance: tareas del propio agente (skills, update, restart).",
-    "- connector: estado/start/stop/restart de LIM/tunnel y consulta de mensajes LIM (first_name, last_name, fuente).",
+    "- lim: estado/start/stop/restart de LIM/tunnel y consulta de mensajes LIM (first_name, last_name, fuente).",
     "- schedule: crear/listar/editar/eliminar tareas o recordatorios.",
     "- memory: preguntas de memoria/recuerdo/contexto previo.",
     "- gmail-recipients: ABM de destinatarios guardados.",
@@ -5628,7 +5727,7 @@ async function classifySequencedIntentPlanWithAi(params: {
     "Si es sequence, devuelve pasos concretos en orden de ejecucion.",
     "Devuelve SOLO JSON valido.",
     "",
-    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, connector, self-maintenance, stoic-smalltalk.",
+    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, lim, self-maintenance, stoic-smalltalk.",
     "",
     "Reglas:",
     "- Usa mode=sequence solo si hay 2 o mas acciones distintas o dependientes.",
@@ -7325,6 +7424,9 @@ async function runInIncomingQueue<T>(params: {
 async function buildPromptContextForQuery(query: string, options?: { chatId?: number }) {
   const text = query.trim();
   if (!text) {
+    return undefined;
+  }
+  if (isKnownTelegramCommandText(text)) {
     return undefined;
   }
   try {
@@ -9486,7 +9588,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
   if (!config.enableLimControl) {
     await params.ctx.reply("LIM está deshabilitado por configuración (ENABLE_LIM_CONTROL=false).");
     await safeAudit({
-      type: "connector.intent_disabled",
+      type: "lim.intent_disabled",
       chatId,
       userId: params.userId,
       details: {
@@ -9497,7 +9599,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     return true;
   }
 
-  lastConnectorContextByChat.set(chatId, now);
+  lastLimContextByChat.set(chatId, now);
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -9536,7 +9638,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         ].join("\n"),
       );
       await safeAudit({
-        type: "connector.intent_query_failed",
+        type: "lim.intent_query_failed",
         chatId,
         userId: params.userId,
         details: {
@@ -9579,10 +9681,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       userId: params.userId,
       role: "assistant",
       text: truncateInline(responseText, 3000),
-      source: `${params.source}:connector-intent`,
+      source: `${params.source}:lim-intent`,
     });
     await safeAudit({
-      type: "connector.intent_query",
+      type: "lim.intent_query",
       chatId,
       userId: params.userId,
       details: {
@@ -9609,7 +9711,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       ].join("\n"),
     );
     await safeAudit({
-      type: "connector.intent_blocked_agent",
+      type: "lim.intent_blocked_agent",
       chatId,
       userId: params.userId,
       details: {
@@ -9638,10 +9740,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         userId: params.userId,
         role: "assistant",
         text: truncateInline(responseText, 2800),
-        source: `${params.source}:connector-intent`,
+        source: `${params.source}:lim-intent`,
       });
       await safeAudit({
-        type: "connector.intent_status",
+        type: "lim.intent_status",
         chatId,
         userId: params.userId,
         details: {
@@ -9659,7 +9761,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     if (adminSecurity.isPanicModeEnabled()) {
       await params.ctx.reply("Panic mode está activo: ejecución bloqueada.");
       await safeAudit({
-        type: "connector.intent_blocked_panic",
+        type: "lim.intent_blocked_panic",
         chatId,
         userId: params.userId,
         details: {
@@ -9678,10 +9780,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         profile,
         commandLine,
         kind: "exec",
-        note: `connector natural intent (${intent.action})`,
+        note: `lim natural intent (${intent.action})`,
       });
       await safeAudit({
-        type: "connector.intent_approval_queued",
+        type: "lim.intent_approval_queued",
         chatId,
         userId: params.userId,
         details: {
@@ -9714,7 +9816,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         ].join("\n"),
       );
       await safeAudit({
-        type: "connector.intent_command_failed",
+        type: "lim.intent_command_failed",
         chatId,
         userId: params.userId,
         details: {
@@ -9744,10 +9846,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       userId: params.userId,
       role: "assistant",
       text: truncateInline(responseText, 2800),
-      source: `${params.source}:connector-intent`,
+      source: `${params.source}:lim-intent`,
     });
     await safeAudit({
-      type: "connector.intent_command_ok",
+      type: "lim.intent_command_ok",
       chatId,
       userId: params.userId,
       details: {
@@ -9766,7 +9868,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     const message = error instanceof Error ? error.message : String(error);
     await params.ctx.reply(`No pude operar LIM: ${message}`);
     await safeAudit({
-      type: "connector.intent_failed",
+      type: "lim.intent_failed",
       chatId,
       userId: params.userId,
       details: {
@@ -13008,7 +13110,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
   }> = [
     { name: "stoic-smalltalk", fn: maybeHandleNaturalStoicSmalltalk },
     { name: "self-maintenance", fn: maybeHandleNaturalSelfMaintenanceInstruction },
-    { name: "connector", fn: maybeHandleNaturalConnectorInstruction },
+    { name: "lim", fn: maybeHandleNaturalConnectorInstruction },
     { name: "schedule", fn: maybeHandleNaturalScheduleInstruction },
     { name: "memory", fn: maybeHandleNaturalMemoryInstruction },
     { name: "gmail-recipients", fn: maybeHandleNaturalGmailRecipientsInstruction },
@@ -13068,8 +13170,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
     hasMemoryRecallCue,
     indexedListKind: indexedListContext?.kind ?? null,
     hasPendingWorkspaceDelete: hasPendingWorkspaceDeleteConfirmation(params.ctx.chat.id),
-    hasRecentConnectorContext: lastConnectorContextByChat.get(params.ctx.chat.id)
-      ? lastConnectorContextByChat.get(params.ctx.chat.id)! + CONNECTOR_CONTEXT_TTL_MS > Date.now()
+    hasRecentLimContext: lastLimContextByChat.get(params.ctx.chat.id)
+      ? lastLimContextByChat.get(params.ctx.chat.id)! + LIM_CONTEXT_TTL_MS > Date.now()
       : false,
   });
   const hierarchyNarrowed = hierarchyDecision
@@ -13904,7 +14006,7 @@ bot.command("status", async (ctx) => {
       `LIM control: ${config.enableLimControl ? `on | appDir=${toProjectRelativePath(config.limAppDir)} | appUnit=${config.limAppService} | tunnelUnit=${config.limTunnelService}` : "off"}`,
       `Archivos inbound: maxFile=${Math.round(config.fileMaxFileBytes / (1024 * 1024))}MB | store=${toProjectRelativePath(path.join(config.workspaceDir, "files"))}`,
       `Imagenes: maxFile=${Math.round(config.imageMaxFileBytes / (1024 * 1024))}MB | store=${imageStorePath}`,
-      `Agenda: pending=${scheduledPendingCount} | poll=${config.schedulePollMs}ms | file=${config.scheduleFile}`,
+      `Agenda: pending=${scheduledPendingCount} | poll=${config.schedulePollMs}ms`,
       `State DB: ${toProjectRelativePath(config.stateDbFile)} | idempotencyTTL=${config.idempotencyTtlMs}ms | runtimePersist=${RUNTIME_STATE_PERSIST_INTERVAL_MS}ms`,
       `Selfskill draft: ${selfSkillDraft ? `activo (${selfSkillDraft.lines.length} lineas)` : "off"} | file=${config.selfSkillDraftsFile}`,
       `${suggestionStatusLine} | enabled=${config.suggestionsEnabled ? "on" : "off"} | poll=${config.suggestionsPollMs}ms`,
@@ -15696,7 +15798,7 @@ bot.command("lim", async (ctx) => {
       ].join("\n"),
     );
     await safeAudit({
-      type: "connector.command_query_failed",
+      type: "lim.command_query_failed",
       chatId: ctx.chat.id,
       userId: ctx.from?.id,
       details: {
@@ -15733,7 +15835,7 @@ bot.command("lim", async (ctx) => {
   const responseText = lines.join("\n");
   await replyLong(ctx, responseText);
   await safeAudit({
-    type: "connector.command_query",
+    type: "lim.command_query",
     chatId: ctx.chat.id,
     userId: ctx.from?.id,
     details: {

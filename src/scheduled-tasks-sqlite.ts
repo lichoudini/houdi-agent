@@ -6,7 +6,7 @@ import type {
   ScheduledTask,
   ScheduledTaskStatus,
   UpdateScheduledTaskInput,
-} from "./scheduled-tasks.js";
+} from "./scheduled-task-types.js";
 
 type ScheduledTaskStorage = {
   tasks: ScheduledTask[];

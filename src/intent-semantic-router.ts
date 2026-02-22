@@ -4,7 +4,7 @@ import path from "node:path";
 type IntentRouteName =
   | "stoic-smalltalk"
   | "self-maintenance"
-  | "connector"
+  | "lim"
   | "schedule"
   | "memory"
   | "gmail-recipients"
@@ -71,10 +71,12 @@ type PersistedIntentRouterConfig = {
   routes: SemanticRouteConfig[];
 };
 
+type LegacyIntentRouteName = IntentRouteName | "connector";
+
 const KNOWN_ROUTE_NAMES: IntentRouteName[] = [
   "stoic-smalltalk",
   "self-maintenance",
-  "connector",
+  "lim",
   "schedule",
   "memory",
   "gmail-recipients",
@@ -83,6 +85,10 @@ const KNOWN_ROUTE_NAMES: IntentRouteName[] = [
   "document",
   "web",
 ];
+
+const LEGACY_ROUTE_ALIASES: Record<string, IntentRouteName> = {
+  connector: "lim",
+};
 
 const SPANISH_STOPWORDS = new Set([
   "a",
@@ -182,7 +188,7 @@ const DEFAULT_ROUTES: SemanticRouteConfig[] = [
     ],
   },
   {
-    name: "connector",
+    name: "lim",
     threshold: 0.3,
     utterances: [
       "inicia lim",
@@ -395,6 +401,18 @@ function safeParsePersistedRoutes(raw: string): PersistedIntentRouterConfig | nu
   }
 }
 
+function normalizeRouteName(rawName: string): IntentRouteName | null {
+  const trimmed = rawName.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = (LEGACY_ROUTE_ALIASES[trimmed] ?? trimmed) as LegacyIntentRouteName;
+  if (!KNOWN_ROUTE_NAMES.includes(normalized as IntentRouteName)) {
+    return null;
+  }
+  return normalized as IntentRouteName;
+}
+
 export class IntentSemanticRouter {
   private routes: SemanticRouteConfig[];
   private hybridAlpha: number;
@@ -448,14 +466,15 @@ export class IntentSemanticRouter {
     this.bm25K1 = clamp(params?.bm25K1 ?? DEFAULT_BM25_K1, 0.2, 3);
     this.bm25B = clamp(params?.bm25B ?? DEFAULT_BM25_B, 0, 1);
     this.bm25Lambda = clamp(params?.bm25Lambda ?? DEFAULT_BM25_LAMBDA, 0, 1);
-    if (params?.routeAlphaOverrides) {
-      for (const [route, value] of Object.entries(params.routeAlphaOverrides)) {
-        if (!KNOWN_ROUTE_NAMES.includes(route as IntentRouteName) || typeof value !== "number") {
+      if (params?.routeAlphaOverrides) {
+        for (const [route, value] of Object.entries(params.routeAlphaOverrides)) {
+        const normalizedRoute = normalizeRouteName(route);
+        if (!normalizedRoute || typeof value !== "number") {
           continue;
         }
-        this.constructorRouteAlphaOverrides.set(route as IntentRouteName, clamp(value, 0.05, 0.95));
+        this.constructorRouteAlphaOverrides.set(normalizedRoute, clamp(value, 0.05, 0.95));
+        }
       }
-    }
     this.train();
   }
 
@@ -885,16 +904,23 @@ export class IntentSemanticRouter {
       if (!parsed) {
         throw new Error("archivo de rutas inválido");
       }
-      const validRoutes = parsed.routes
-        .filter((route) => KNOWN_ROUTE_NAMES.includes(route.name))
-        .map((route) => ({
-          name: route.name,
+      const validRoutes: SemanticRouteConfig[] = [];
+      for (const route of parsed.routes) {
+        const normalizedName = normalizeRouteName(route.name);
+        if (!normalizedName) {
+          continue;
+        }
+        const normalizedRoute: SemanticRouteConfig = {
+          name: normalizedName,
           threshold: clamp(route.threshold, 0.01, 0.99),
           utterances: route.utterances.map((item) => item.trim()).filter(Boolean),
           negativeUtterances: (route.negativeUtterances ?? []).map((item) => item.trim()).filter(Boolean),
           ...(typeof route.alpha === "number" ? { alpha: clamp(route.alpha, 0.05, 0.95) } : {}),
-        }))
-        .filter((route) => route.utterances.length > 0);
+        };
+        if (normalizedRoute.utterances.length > 0) {
+          validRoutes.push(normalizedRoute);
+        }
+      }
       if (validRoutes.length === 0) {
         throw new Error("sin rutas válidas");
       }
@@ -936,7 +962,8 @@ export class IntentSemanticRouter {
     for (const sample of labeled) {
       const scored = this.scoreRoutes(sample.text);
       const predicted = this.classifyByThresholds(scored, thresholds, minGap);
-      if (predicted && predicted === sample.finalHandler) {
+      const expected = normalizeRouteName(sample.finalHandler ?? "");
+      if (predicted && expected && predicted === expected) {
         correct += 1;
       }
     }
@@ -974,7 +1001,8 @@ export class IntentSemanticRouter {
     for (const route of this.routes) {
       const positives: number[] = [];
       for (const sample of labeled) {
-        if (sample.finalHandler !== route.name) {
+        const expected = normalizeRouteName(sample.finalHandler ?? "");
+        if (expected !== route.name) {
           continue;
         }
         const scored = this.scoreRoutes(sample.text);
@@ -1072,8 +1100,8 @@ export class IntentSemanticRouter {
   augmentNegativesFromDataset(samples: IntentRouterDatasetSample[], maxPerRoute = 25): Record<string, number> {
     const perRoute = new Map<string, Set<string>>();
     for (const sample of samples) {
-      const expected = (sample.finalHandler ?? "").trim();
-      if (!expected || !KNOWN_ROUTE_NAMES.includes(expected as IntentRouteName)) {
+      const expected = normalizeRouteName(sample.finalHandler ?? "");
+      if (!expected) {
         continue;
       }
       const scored = this.scoreRoutes(sample.text);
@@ -1130,7 +1158,8 @@ export class IntentSemanticRouter {
     for (const sample of samples) {
       const scored = this.scoreRoutes(sample.text);
       const predicted = this.classifyByThresholds(scored, thresholds, minGap);
-      if (predicted && predicted === sample.finalHandler) {
+      const expected = normalizeRouteName(sample.finalHandler ?? "");
+      if (predicted && expected && predicted === expected) {
         correct += 1;
       }
     }

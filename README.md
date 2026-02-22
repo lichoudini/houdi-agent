@@ -63,8 +63,6 @@ npm run onboard
 Alias:
 
 ```bash
-npm run setup
-# o:
 ./scripts/houdi-onboard.sh
 ```
 
@@ -93,12 +91,12 @@ cp .env.example .env
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_ALLOWED_USER_IDS` (ej. `123456789` o `123456789,987654321`)
 - `HOUDI_WORKSPACE_DIR` (default: `./workspace`)
-- `HOUDI_CONTEXT_FILE_MAX_CHARS` (default: `3000`)
-- `HOUDI_CONTEXT_TOTAL_MAX_CHARS` (default: `15000`)
-- `HOUDI_MEMORY_MAX_RESULTS` (default: `6`)
+- `HOUDI_CONTEXT_FILE_MAX_CHARS` (default: `1800`)
+- `HOUDI_CONTEXT_TOTAL_MAX_CHARS` (default: `9000`)
+- `HOUDI_MEMORY_MAX_RESULTS` (default: `4`)
 - `HOUDI_MEMORY_SNIPPET_MAX_CHARS` (default: `320`)
+- `HOUDI_MEMORY_MAX_INJECTED_CHARS` (default: `1200`)
 - `HOUDI_MEMORY_BACKEND` (`hybrid` o `scan`, default: `hybrid`)
-- `HOUDI_SCHEDULE_FILE` (default: `./houdi-schedule.json`)
 - `HOUDI_SCHEDULE_POLL_MS` (default: `15000`)
 - `HOUDI_INTENT_ROUTER_DATASET_FILE` (default: `./houdi-intent-router-dataset.jsonl`)
 - `HOUDI_INTENT_ROUTER_ROUTES_FILE` (default: `./workspace/state/intent-routes.json`)

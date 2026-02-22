@@ -22,13 +22,13 @@ type HierarchicalIntentParams = {
   hasMemoryRecallCue: boolean;
   indexedListKind?: "workspace-list" | "stored-files" | "web-results" | "gmail-list" | null;
   hasPendingWorkspaceDelete: boolean;
-  hasRecentConnectorContext?: boolean;
+  hasRecentLimContext?: boolean;
 };
 
 const DOMAIN_TO_HANDLERS: Record<IntentCoarseDomain, string[]> = {
   communication: ["gmail", "gmail-recipients"],
   files: ["workspace", "document"],
-  operations: ["connector", "self-maintenance"],
+  operations: ["lim", "self-maintenance"],
   "planning-memory": ["schedule", "memory"],
   knowledge: ["web"],
   social: ["stoic-smalltalk"],
@@ -101,7 +101,7 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
   if (params.hasPendingWorkspaceDelete) {
     add("files", 0.45);
   }
-  if (params.hasRecentConnectorContext && /\b(lim|conector|servicio|tunnel|estado|start|stop|restart)\b/.test(t)) {
+  if (params.hasRecentLimContext && /\b(lim|conector|servicio|tunnel|estado|start|stop|restart)\b/.test(t)) {
     add("operations", 0.35);
   }
 
