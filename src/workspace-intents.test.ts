@@ -125,3 +125,33 @@ test("send intent works for explicit send verbs", () => {
   assert.equal(intent.shouldHandle, true);
   assert.equal(intent.action, "send");
 });
+
+test("read intent works for explicit file view requests", () => {
+  const intent = detectWorkspaceNaturalIntent("Ver delta-arlas-ciqfg.txt", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "read");
+  assert.equal(intent.path, "delta-arlas-ciqfg.txt");
+});
+
+test("read intent works as content follow-up without explicit path", () => {
+  const intent = detectWorkspaceNaturalIntent("Muéstrame el contenido", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "read");
+  assert.equal(intent.path, undefined);
+});
+
+test("delete intent detects delete-contents for folder phrasing", () => {
+  const intent = detectWorkspaceNaturalIntent("Eliminar todos los archivos de la carpeta workspace/images", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "delete");
+  assert.ok(intent.deleteContentsOfPath);
+  assert.ok(intent.deleteContentsOfPath.endsWith("images"));
+});
+
+test("delete intent keeps direct folder delete when no contents cue is present", () => {
+  const intent = detectWorkspaceNaturalIntent("Eliminar carpeta workspace/images", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "delete");
+  assert.equal(intent.deleteContentsOfPath, undefined);
+  assert.equal(intent.path, "images");
+});

@@ -11,6 +11,8 @@ export type HierarchicalIntentDecision = {
   reason: string;
   domains: IntentCoarseDomain[];
   scores: Array<{ domain: IntentCoarseDomain; score: number }>;
+  strict: boolean;
+  exhausted: boolean;
 };
 
 type HierarchicalIntentParams = {
@@ -32,10 +34,20 @@ const DOMAIN_TO_HANDLERS: Record<IntentCoarseDomain, string[]> = {
   social: ["stoic-smalltalk"],
 };
 
-function narrow(base: string[], subset: string[]): string[] {
+function narrow(
+  base: string[],
+  subset: string[],
+  options?: { strict?: boolean },
+): { allowed: string[]; exhausted: boolean } {
   const allowed = new Set(subset);
   const next = base.filter((item) => allowed.has(item));
-  return next.length > 0 ? next : base;
+  if (next.length > 0) {
+    return { allowed: next, exhausted: false };
+  }
+  if (options?.strict) {
+    return { allowed: [], exhausted: true };
+  }
+  return { allowed: base, exhausted: false };
 }
 
 function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentCoarseDomain; score: number }> {
@@ -63,7 +75,9 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
   }
   if (
     params.hasMemoryRecallCue ||
-    /\b(memoria|memory|recorda|recordar|te acordas|te acuerdas|recordatorio|agenda|tarea|programa)\b/.test(t)
+    /\b(memoria|memory|recorda|recordar|te acordas|te acuerdas|recordatorio|agenda|agendar|tarea|programa|programar)\b/.test(
+      t,
+    )
   ) {
     add("planning-memory", 0.54);
   }
@@ -113,7 +127,11 @@ export function buildHierarchicalIntentDecision(params: HierarchicalIntentParams
     selectedDomains.push(second.domain);
   }
   const allowedByDomain = selectedDomains.flatMap((domain) => DOMAIN_TO_HANDLERS[domain]);
-  const allowed = narrow(base, allowedByDomain);
+  const strict =
+    selectedDomains.length === 1 &&
+    (top.score >= 0.62 || params.hasPendingWorkspaceDelete || Boolean(params.indexedListKind));
+  const narrowed = narrow(base, allowedByDomain, { strict });
+  const allowed = narrowed.allowed;
   if (allowed.length === base.length) {
     return null;
   }
@@ -122,5 +140,7 @@ export function buildHierarchicalIntentDecision(params: HierarchicalIntentParams
     domains: selectedDomains,
     scores: ranked.slice(0, 4),
     reason: `hierarchy:${selectedDomains.join("+")}`,
+    strict,
+    exhausted: narrowed.exhausted,
   };
 }

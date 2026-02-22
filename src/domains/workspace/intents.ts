@@ -1,6 +1,6 @@
 export type WorkspaceNaturalIntent = {
   shouldHandle: boolean;
-  action?: "list" | "mkdir" | "move" | "rename" | "copy" | "paste" | "delete" | "send" | "write";
+  action?: "list" | "mkdir" | "move" | "rename" | "copy" | "paste" | "delete" | "send" | "write" | "read";
   path?: string;
   sourcePath?: string;
   targetPath?: string;
@@ -83,6 +83,10 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   const hasPasteVerb = /\b(pegar|pega|pegalo|pegala|paste)\b/.test(normalized);
   const hasSimpleFileKeyword = /\b(txt|csv|json|jsonl|md|yaml|yml|xml|html|htm|css|js|ini|log)\b/.test(normalized);
   const hasFolderWord = /\b(carpeta|directorio|folder)\b/.test(normalized);
+  const hasReadVerb = /\b(ver|leer|lee|leelo|leela|mostrar|mostra|muestrame|muéstrame|mostrame|abrir|abre|abrilo|abrila)\b/.test(
+    normalized,
+  );
+  const hasContentWord = /\b(contenido|texto|detalle|detalles)\b/.test(normalized);
   const hasDeleteVerb = /\b(eliminar|elimina|borrar|borra|quitar|quita|suprimir|suprime|remove|delete)\b/.test(normalized);
   const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
   const hasSendVerb =
@@ -96,6 +100,23 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   const defaultSelectorScope = deps.pickFirstNonEmpty(explicitWorkspacePath, fromFolderPhrase);
   const hasWorkspaceFileContext =
     hasWorkspaceWord || hasFileWord || hasFileLikeToken || quoted.length > 0 || Boolean(explicitWorkspacePath);
+  const readPhraseMatch = original.match(/\b(?:ver|leer|lee|mostrar|mostra|muestrame|muéstrame|mostrame|abrir|abre)\s+(.+)$/i);
+  const readPathHintRaw = deps.pickFirstNonEmpty(
+    quoted[0],
+    explicitWorkspacePath,
+    explicitNamedPath,
+    fileLikePath,
+    fromFilePhrase,
+    deps.cleanWorkspacePathPhrase(readPhraseMatch?.[1] ?? ""),
+  );
+  const readPathHintNormalized = deps.normalizeIntentText(readPathHintRaw);
+  const readPathHintIsPlaceholder =
+    /^(?:el|la|los|las)?\s*(?:contenido|texto|detalle|detalles)(?:\s+de(?:l)?\s+(?:archivo|documento))?$/.test(
+      readPathHintNormalized,
+    );
+  const readPathHint = readPathHintIsPlaceholder ? "" : readPathHintRaw;
+  const hasListPluralCue = /\b(archivos|carpetas|directorios|folders)\b/.test(normalized);
+  const allowPathlessRead = hasReadVerb && hasContentWord;
   const deletePhraseMatch = original.match(
     /\b(?:elimin[\p{L}\d_]*|borr[\p{L}\d_]*|quit[\p{L}\d_]*|suprim[\p{L}\d_]*|delete|remove)\s+(.+)$/iu,
   );
@@ -251,6 +272,15 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       ...(typeof content === "string" ? { content } : {}),
       ...(append ? { append: true } : {}),
       ...(formatHint ? { formatHint } : {}),
+    };
+  }
+
+  const readIntent = (hasReadVerb || hasContentWord) && !hasListPluralCue && (Boolean(readPathHint) || allowPathlessRead);
+  if (readIntent) {
+    return {
+      shouldHandle: true,
+      action: "read",
+      ...(readPathHint ? { path: readPathHint } : {}),
     };
   }
 

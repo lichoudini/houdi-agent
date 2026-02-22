@@ -214,7 +214,7 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
       if (draftRequested) {
         draftInstruction = deps.buildGmailDraftInstruction(original);
       }
-      if (!body && !draftRequested && !explicitLiteralBody && !deps.shouldAvoidLiteralBodyFallback(normalized)) {
+      if (!body && !draftRequested && !explicitLiteralBody && !autoContentKind && !deps.shouldAvoidLiteralBodyFallback(normalized)) {
         body = deps.buildGmailDraftInstruction(original);
       }
     }
@@ -226,7 +226,7 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
       subject = explicitNaturalSubject;
     }
     const subjectWasExplicit = Boolean(subject.trim());
-    const forceAiDraftByMissingSubject = !subjectWasExplicit;
+    const forceAiDraftByMissingSubject = !subjectWasExplicit && !autoContentKind;
     if (forceAiDraftByMissingSubject) {
       draftInstruction = deps.buildGmailDraftInstruction(original) || original.trim();
       body = "";
@@ -290,6 +290,14 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
   }
 
   if (readVerb && (hasMailContext || directMessageId || messageIndex || explicitLatestMailPhrase)) {
+    if (!directMessageId && typeof messageIndex !== "number" && hasMailContext && !explicitLatestMailPhrase) {
+      return {
+        shouldHandle: true,
+        action: "list",
+        query: deps.buildNaturalGmailQuery(original, normalized),
+        limit: deps.parseNaturalLimit(normalized),
+      };
+    }
     if (typeof messageIndex === "number") {
       return {
         shouldHandle: true,

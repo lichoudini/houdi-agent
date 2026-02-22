@@ -41,6 +41,7 @@ import {
 } from "./domains/gmail/intents.js";
 import { createGmailTextParsers } from "./domains/gmail/text-parsers.js";
 import { buildIntentRouterContextFilter as buildIntentRouterContextFilterDomain } from "./domains/router/context-filter.js";
+import { isLikelyConversationalNarrative as isLikelyConversationalNarrativeDomain } from "./domains/router/conversation-cues.js";
 import {
   type IndexedListReferenceIntent,
   parseIndexedListReferenceIntent as parseIndexedListReferenceIntentDomain,
@@ -315,6 +316,7 @@ let intentHardNegativesInFlight = false;
 let intentCanaryGuardTimer: NodeJS.Timeout | null = null;
 let intentCanaryGuardInFlight = false;
 let intentCanaryGuardConsecutiveBreaches = 0;
+let intentRouterMutationQueue: Promise<void> = Promise.resolve();
 type PendingWorkspaceDeleteConfirmation = {
   paths: string[];
   requestedAtMs: number;
@@ -1283,7 +1285,7 @@ type WorkspaceNameSelector = {
   scopePath?: string;
 };
 
-type WorkspaceNaturalAction = "list" | "mkdir" | "move" | "rename" | "copy" | "paste" | "delete" | "send" | "write";
+type WorkspaceNaturalAction = "list" | "mkdir" | "move" | "rename" | "copy" | "paste" | "delete" | "send" | "write" | "read";
 
 type WorkspaceNaturalIntent = {
   shouldHandle: boolean;
@@ -1365,6 +1367,8 @@ type NaturalIntentHandlerName =
 type IntentRouterFilterDecision = {
   allowed: Exclude<NaturalIntentHandlerName, "none">[];
   reason: string;
+  strict: boolean;
+  exhausted: boolean;
 };
 
 type IntentRouterDatasetEntry = {
@@ -2591,6 +2595,11 @@ function cleanWorkspacePathPhrase(raw: string): string {
     return "";
   }
 
+  const unquoted = original.replace(/^["'`]+|["'`]+$/g, "").trim();
+  if (/^[a-z0-9_-]+\.{3,}$/i.test(unquoted)) {
+    return "";
+  }
+
   const explicitWorkspacePath = original.match(/\bworkspace\/([^\s"'`]+)/i)?.[1]?.trim();
   if (explicitWorkspacePath) {
     return normalizeWorkspaceRelativePath(explicitWorkspacePath);
@@ -2603,10 +2612,16 @@ function cleanWorkspacePathPhrase(raw: string): string {
     .replace(/^(?:archivo|archivos|documento|documentos|carpeta|carpetas|directorio|directorios|folder|folders|ruta|path)\s+/i, "")
     .replace(/^(?:de|del|en|dentro\s+de)\s+/i, "")
     .replace(/^(?:workspace)\b\/?/i, "")
+    .replace(/^(?:espacio\s+de\s+trabajo|ra[ií]z|root)\b\/?/i, "")
     .replace(/^(?:de|del|en)\s+workspace\b\/?/i, "")
+    .replace(/^(?:de|del|en)\s+(?:el\s+)?(?:espacio\s+de\s+trabajo|ra[ií]z|root)\b\/?/i, "")
     .replace(/\b(?:de|del|en)\s+workspace\b$/i, "")
+    .replace(/\b(?:de|del|en)\s+(?:el\s+)?(?:espacio\s+de\s+trabajo|ra[ií]z|root)\b$/i, "")
     .replace(/\s+/g, " ")
     .trim();
+  if (/^(?:espacio\s+de\s+trabajo|workspace|ra[ií]z|root)$/i.test(normalized)) {
+    return "";
+  }
   return normalizeWorkspaceRelativePath(normalized);
 }
 
@@ -2670,6 +2685,173 @@ function buildAutoWorkspaceFilePath(extensionInput?: string): string {
     .replace(/\..+$/, "")
     .replace("T", "-");
   return `generated-${stamp}${safeExt}`;
+}
+
+const RANDOM_WORKSPACE_NAME_ADJECTIVES = [
+  "agil",
+  "astral",
+  "bravo",
+  "claro",
+  "delta",
+  "firme",
+  "lunar",
+  "neo",
+  "noble",
+  "pleno",
+  "solar",
+  "vivo",
+] as const;
+
+const RANDOM_WORKSPACE_NAME_NOUNS = [
+  "atlas",
+  "pulso",
+  "nexo",
+  "trazo",
+  "bitacora",
+  "origen",
+  "ruta",
+  "nodo",
+  "vector",
+  "cifra",
+  "foco",
+  "ritmo",
+] as const;
+
+const RANDOM_WORKSPACE_COUNT_WORDS: Record<string, number> = {
+  un: 1,
+  uno: 1,
+  una: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10,
+  once: 11,
+  doce: 12,
+  trece: 13,
+  catorce: 14,
+  quince: 15,
+  dieciseis: 16,
+  diecisiete: 17,
+  dieciocho: 18,
+  diecinueve: 19,
+  veinte: 20,
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+} as const;
+
+function pickRandomItem<T>(items: readonly T[]): T {
+  return items[Math.floor(Math.random() * items.length)] ?? items[0]!;
+}
+
+function buildCreativeRandomWorkspaceFilePath(extensionInput?: string): string {
+  const extRaw = (extensionInput ?? ".txt").trim().toLowerCase();
+  const ext = extRaw.startsWith(".") ? extRaw : `.${extRaw}`;
+  const safeExt = SIMPLE_TEXT_FILE_EXTENSIONS.has(ext) ? ext : ".txt";
+  const adjective = pickRandomItem(RANDOM_WORKSPACE_NAME_ADJECTIVES);
+  const noun = pickRandomItem(RANDOM_WORKSPACE_NAME_NOUNS);
+  const suffix = Math.random().toString(36).slice(2, 7);
+  return `${adjective}-${noun}-${suffix}${safeExt}`;
+}
+
+function extractRandomWorkspaceFileNameRequest(text: string): { requested: boolean; count: number } {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) {
+    return { requested: false, count: 1 };
+  }
+  const hasRandomCue = /\b(random|aleatori(?:o|a|os|as)|azar|al\s+azar)\b/.test(normalized);
+  const hasFileCue = /\b(archivo|archivos|documento|documentos|file|files)\b/.test(normalized);
+  const hasCreateCue =
+    /\b(crea|crear|genera|generar|arma|armar|haz|hace|hacer|escrib\w*|guard\w*|redact\w*|nuevo|nueva)\b/.test(normalized) ||
+    /\b(quiero|quisiera|necesito)\b/.test(normalized);
+  if (!hasRandomCue || !hasFileCue || !hasCreateCue) {
+    return { requested: false, count: 1 };
+  }
+
+  let parsedCount: number | undefined;
+  const numericRaw =
+    normalized.match(/\b(\d{1,3})\s+(?:archivos?|documentos?|files?)\b/)?.[1] ??
+    normalized.match(/\b(?:archivos?|documentos?|files?)\s*(?:x|por)?\s*(\d{1,3})\b/)?.[1];
+  if (numericRaw) {
+    const parsedNumeric = Number.parseInt(numericRaw, 10);
+    if (Number.isFinite(parsedNumeric)) {
+      parsedCount = parsedNumeric;
+    }
+  }
+
+  if (!Number.isFinite(parsedCount)) {
+    for (const [word, value] of Object.entries(RANDOM_WORKSPACE_COUNT_WORDS)) {
+      if (
+        new RegExp(`\\b${word}\\s+(?:archivos?|documentos?|files?)\\b`).test(normalized) ||
+        new RegExp(`\\b(?:archivos?|documentos?|files?)\\s*(?:x|por)?\\s*${word}\\b`).test(normalized)
+      ) {
+        parsedCount = value;
+        break;
+      }
+    }
+  }
+
+  const pluralCue = /\b(archivos|documentos|files|varios|varias|muchos|muchas)\b/.test(normalized);
+  const count = Math.max(1, Math.min(20, Number.isFinite(parsedCount) ? Math.floor(parsedCount!) : pluralCue ? 3 : 1));
+  return { requested: true, count };
+}
+
+function isRandomWorkspaceNamePlaceholderPath(filePath: string): boolean {
+  const normalizedPath = normalizeWorkspaceRelativePath(filePath);
+  if (!normalizedPath) {
+    return false;
+  }
+  const base = path.basename(normalizedPath, path.extname(normalizedPath));
+  const normalizedBase = normalizeIntentText(base).replace(/\s+/g, " ").trim();
+  if (!normalizedBase) {
+    return false;
+  }
+  if (/\b(random|aleatori(?:o|a|os|as)|azar|diferente|distint[oa])\b/.test(normalizedBase)) {
+    return true;
+  }
+  return /^(?:con\s+)?nombres?\s+(?:random|aleatori(?:o|a|os|as)|diferente|distint[oa]|al\s+azar)$/.test(normalizedBase);
+}
+
+function isPlaceholderContentForRandomName(content: string): boolean {
+  const normalized = normalizeIntentText(content).replace(/\s+/g, " ").trim();
+  if (
+    (/\bnombres?\b/.test(normalized) && /\b(aleatori(?:o|a|os|as)|random|diferente|distint[oa]|azar)\b/.test(normalized)) ||
+    (/\b(aleatori(?:o|a|os|as)|random|diferente|distint[oa]|azar)\b/.test(normalized) && /\bnombres?\b/.test(normalized))
+  ) {
+    return true;
+  }
+  if (
+    /^nombres?\s+(?:aleatori(?:o|a|os|as)|random|diferente|distint[oa])(?:\s+(?:txt|csv|json|md|log|jsonl|yaml|yml|xml|html|css|js|ini))?$/.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  return [
+    "nombre aleatorio",
+    "nombres aleatorios",
+    "nombre random",
+    "nombres random",
+    "nombre diferente",
+    "nombres diferentes",
+    "aleatorio",
+    "aleatoria",
+    "random",
+    "al azar",
+    "diferente",
+  ].includes(normalized);
 }
 
 function extractNumberRequest(text: string): { randomRequested: boolean; explicitNumber?: number } {
@@ -4415,6 +4597,9 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
   const parsedSchedule = parseNaturalScheduleDateTime(original, new Date());
   const hasEmailNoun = /\b(correo|mail|email|gmail)\b/.test(normalized);
   const hasSendVerb = /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme)\b/.test(normalized);
+  const hasRecipientCue =
+    /\b(destinatari[oa]s?|para\s+[^\s]+@[^\s]+|a\s+[^\s]+@[^\s]+)\b/.test(normalized) ||
+    extractEmailAddresses(original).length > 0;
 
   const listRequested =
     /\b(lista|listar|mostra|mostrar|ver|cuales|cuantas|pendientes)\b/.test(normalized) &&
@@ -4454,7 +4639,7 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
     /\b(recordame|recordarme|recuerdame|agenda|agendame|agendar|programa|programar|crear|crea|genera|generar)\b/.test(
       normalized,
     ) && (scheduleNouns || parsedSchedule.hasTemporalSignal);
-  const scheduledEmailRequested = parsedSchedule.hasTemporalSignal && hasEmailNoun && hasSendVerb;
+  const scheduledEmailRequested = parsedSchedule.hasTemporalSignal && hasEmailNoun && (hasSendVerb || hasRecipientCue);
   if (scheduledEmailRequested) {
     const to = extractEmailAddresses(original)[0] ?? inferDefaultSelfEmailRecipient(original);
     const emailInstruction = extractScheduledEmailInstruction(original);
@@ -4707,10 +4892,17 @@ function uniqueRouteCandidates(candidates: Exclude<NaturalIntentHandlerName, "no
 function narrowRouteCandidates(
   base: Exclude<NaturalIntentHandlerName, "none">[],
   subset: Exclude<NaturalIntentHandlerName, "none">[],
-): Exclude<NaturalIntentHandlerName, "none">[] {
+  options?: { strict?: boolean },
+): { allowed: Exclude<NaturalIntentHandlerName, "none">[]; exhausted: boolean } {
   const allowedSet = new Set(subset);
   const next = base.filter((candidate) => allowedSet.has(candidate));
-  return next.length > 0 ? next : base;
+  if (next.length > 0) {
+    return { allowed: next, exhausted: false };
+  }
+  if (options?.strict) {
+    return { allowed: [], exhausted: true };
+  }
+  return { allowed: base, exhausted: false };
 }
 
 function buildIntentRouterContextFilter(params: {
@@ -4743,6 +4935,8 @@ function buildIntentRouterContextFilter(params: {
   return {
     allowed: decision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
     reason: decision.reason,
+    strict: decision.strict,
+    exhausted: decision.exhausted,
   };
 }
 
@@ -4843,6 +5037,68 @@ function shouldRunAiJudgeForEnsemble(decision: SemanticRouteDecision | null): bo
   return decision.score < 0.74 || gap < 0.06;
 }
 
+async function withIntentRouterMutationLock<T>(label: string, mutate: () => Promise<T>): Promise<T> {
+  const enqueuedAtMs = Date.now();
+  const run = intentRouterMutationQueue.then(async () => {
+    const waitedMs = Date.now() - enqueuedAtMs;
+    if (waitedMs >= 50) {
+      observability.increment("intent.router.mutation.lock_waited", 1, { label });
+    }
+    return await mutate();
+  });
+  intentRouterMutationQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return await run;
+}
+
+function computeWilsonInterval(successes: number, total: number, z = 1.96): { lower: number; upper: number } {
+  if (total <= 0) {
+    return { lower: 0, upper: 0 };
+  }
+  const p = successes / total;
+  const z2 = z * z;
+  const denominator = 1 + z2 / total;
+  const center = p + z2 / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p) + z2 / (4 * total)) / total);
+  const lower = Math.max(0, (center - margin) / denominator);
+  const upper = Math.min(1, (center + margin) / denominator);
+  return { lower, upper };
+}
+
+function stableTextHash(input: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function splitIntentDatasetByHoldout<T extends { text: string }>(
+  rows: T[],
+  holdoutPercent = 20,
+): { train: T[]; holdout: T[] } {
+  const boundedPct = Math.max(5, Math.min(45, Math.floor(holdoutPercent)));
+  const train: T[] = [];
+  const holdout: T[] = [];
+  for (const row of rows) {
+    const bucket = stableTextHash(normalizeIntentText(row.text)) % 100;
+    if (bucket < boundedPct) {
+      holdout.push(row);
+    } else {
+      train.push(row);
+    }
+  }
+  if (holdout.length === 0 && train.length > 0) {
+    const fallbackSize = Math.max(1, Math.floor(rows.length * (boundedPct / 100)));
+    holdout.push(...rows.slice(0, fallbackSize));
+    train.splice(0, Math.min(train.length, fallbackSize));
+  }
+  return { train, holdout };
+}
+
 async function saveCurrentRouterSnapshot(label: string): Promise<string> {
   const snapshot = routerVersionStore.createSnapshot({
     label,
@@ -4896,6 +5152,30 @@ function buildIntentClarificationQuestion(alternatives: Array<{ name: string; sc
   return `Estoy entre dos intenciones (${topChoices}). ¿Puedes aclarar en una frase la acción exacta?`;
 }
 
+function buildRouteNarrowingClarificationQuestion(params: {
+  routeFilterDecision: IntentRouterFilterDecision | null;
+  routerLayerDecision: RouteLayerDecision | null;
+  hierarchyDecision: HierarchicalIntentDecision | null;
+}): string {
+  const reason = [
+    params.routeFilterDecision?.reason ?? "",
+    params.routerLayerDecision?.reason ?? "",
+    params.hierarchyDecision?.reason ?? "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+  if (/gmail|mail|correo|email/i.test(reason)) {
+    return "Necesito más precisión para operar correo sin errores. Indica: enviar/leer + destinatario o referencia concreta.";
+  }
+  if (/workspace|archivo|carpeta|documento/i.test(reason)) {
+    return "Necesito más precisión para operar archivos sin riesgo. Indica acción + ruta/selector exacto.";
+  }
+  if (/lim|connector/i.test(reason)) {
+    return "Necesito datos completos para LIM. Indica first_name, last_name y fuente en la misma frase.";
+  }
+  return "Detecté señales contradictorias para evitar una acción equivocada. Reformula indicando dominio, acción y objetivo exacto.";
+}
+
 type TypedRouteExtraction = {
   route: Exclude<NaturalIntentHandlerName, "none">;
   action?: string;
@@ -4904,164 +5184,249 @@ type TypedRouteExtraction = {
   summary: string;
 };
 
+type TypedRouteContractMatch = {
+  action: string;
+  required: string[];
+  missing: string[];
+};
+
+type TypedRouteContract = {
+  extract: (text: string) => TypedRouteContractMatch | null;
+  clarificationsByAction?: Record<string, string>;
+  fallbackClarification?: string;
+};
+
+const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "none">, TypedRouteContract>> = {
+  gmail: {
+    extract: (text) => {
+      const intent = detectGmailNaturalIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "send") {
+        required.push("to");
+        const hasTo = Boolean(intent.to?.trim() || intent.recipientName?.trim() || inferDefaultSelfEmailRecipient(text));
+        if (!hasTo) {
+          missing.push("to");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      send: "Para enviar el correo necesito destinatario. Indica: enviar correo a <email> asunto:<...> mensaje:<...>.",
+    },
+  },
+  workspace: {
+    extract: (text) => {
+      const intent = detectWorkspaceNaturalIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "move" || intent.action === "rename") {
+        required.push("source", "target");
+        const hasSource = Boolean(intent.sourcePath?.trim() || intent.selector || intent.fileIndex);
+        const hasTarget = Boolean(intent.targetPath?.trim() || intent.path?.trim());
+        if (!hasSource) {
+          missing.push("source");
+        }
+        if (!hasTarget) {
+          missing.push("target");
+        }
+      } else if (intent.action === "delete") {
+        required.push("target");
+        const hasTarget = Boolean(
+          intent.path?.trim() ||
+            intent.selector ||
+            intent.deleteContentsOfPath?.trim() ||
+            (intent.deleteExtensions?.length ?? 0) > 0 ||
+            intent.fileIndex,
+        );
+        if (!hasTarget) {
+          missing.push("target");
+        }
+      } else if (intent.action === "write") {
+        required.push("path");
+        const normalized = normalizeIntentText(text);
+        const allowAutoPath =
+          extractRandomWorkspaceFileNameRequest(text).requested ||
+          (/\b(crea|crear|genera|generar|arma|armar|haz|hace|hacer|nuevo|nueva|escrib\w*|guard\w*|redact\w*)\b/.test(
+            normalized,
+          ) &&
+            /\b(archivo|archivos|documento|documentos|file|files|txt|csv|json|md|log|jsonl|yaml|yml|xml|html|css|js|ini)\b/.test(
+              normalized,
+            ));
+        if (!intent.path?.trim() && !allowAutoPath) {
+          missing.push("path");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      move: "Para mover necesito origen y destino. Ejemplo: mover archivo <origen> a <destino>.",
+      rename: "Para renombrar necesito nombre actual y nuevo nombre. Ejemplo: renombrar <archivo> a <nuevo_nombre>.",
+      delete: "Para borrar necesito ruta o selector. Ejemplo: eliminar archivo <ruta> o eliminar archivos que contienen \"...\".",
+    },
+  },
+  connector: {
+    extract: (text) => {
+      const intent = detectConnectorNaturalIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "query") {
+        required.push("firstName", "lastName", "sourceName");
+        if (!intent.firstName?.trim()) {
+          missing.push("firstName");
+        }
+        if (!intent.lastName?.trim()) {
+          missing.push("lastName");
+        }
+        if (!intent.sourceName?.trim()) {
+          missing.push("sourceName");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      query: "Para consultar LIM necesito first_name, last_name y fuente. Ejemplo: revisar LIM de Juan Perez en account_demo_b_marylin.",
+    },
+  },
+  schedule: {
+    extract: (text) => {
+      const intent = detectScheduleNaturalIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "edit" || intent.action === "delete") {
+        required.push("taskRef");
+        if (!intent.taskRef?.trim()) {
+          missing.push("taskRef");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      edit: "Necesito referencia de tarea (id, número o 'última').",
+      delete: "Necesito referencia de tarea (id, número o 'última').",
+    },
+  },
+  "self-maintenance": {
+    extract: (text) => {
+      const intent = detectSelfMaintenanceIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "delete-skill") {
+        required.push("skillIndex");
+        if (!Number.isFinite(intent.skillIndex ?? NaN)) {
+          missing.push("skillIndex");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+  },
+  "gmail-recipients": {
+    extract: (text) => {
+      const intent = detectGmailRecipientNaturalIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "add" || intent.action === "update") {
+        required.push("name", "email");
+        if (!intent.name?.trim()) {
+          missing.push("name");
+        }
+        if (!intent.email?.trim()) {
+          missing.push("email");
+        }
+      } else if (intent.action === "delete") {
+        required.push("name");
+        if (!intent.name?.trim()) {
+          missing.push("name");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+    fallbackClarification: "Para gestionar destinatarios necesito nombre y/o email según la acción.",
+  },
+};
+
 function extractTypedRouteAction(params: {
   route: Exclude<NaturalIntentHandlerName, "none">;
   text: string;
 }): TypedRouteExtraction | null {
-  const required: string[] = [];
-  const missing: string[] = [];
-  let action = "";
-  let summary = "";
-
-  if (params.route === "gmail") {
-    const intent = detectGmailNaturalIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return null;
-    }
-    action = intent.action;
-    if (intent.action === "send") {
-      required.push("to");
-      const hasTo = Boolean(intent.to?.trim() || intent.recipientName?.trim() || inferDefaultSelfEmailRecipient(params.text));
-      if (!hasTo) {
-        missing.push("to");
-      }
-    }
-    summary = `gmail:${action}`;
-  } else if (params.route === "workspace") {
-    const intent = detectWorkspaceNaturalIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return null;
-    }
-    action = intent.action;
-    if (intent.action === "move" || intent.action === "rename") {
-      required.push("source", "target");
-      const hasSource = Boolean(intent.sourcePath?.trim() || intent.selector || intent.fileIndex);
-      const hasTarget = Boolean(intent.targetPath?.trim() || intent.path?.trim());
-      if (!hasSource) {
-        missing.push("source");
-      }
-      if (!hasTarget) {
-        missing.push("target");
-      }
-    } else if (intent.action === "delete") {
-      required.push("target");
-      const hasTarget = Boolean(
-        intent.path?.trim() ||
-          intent.selector ||
-          intent.deleteContentsOfPath?.trim() ||
-          (intent.deleteExtensions?.length ?? 0) > 0 ||
-          intent.fileIndex,
-      );
-      if (!hasTarget) {
-        missing.push("target");
-      }
-    } else if (intent.action === "write") {
-      required.push("path");
-      if (!intent.path?.trim()) {
-        missing.push("path");
-      }
-    }
-    summary = `workspace:${action}`;
-  } else if (params.route === "connector") {
-    const intent = detectConnectorNaturalIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return null;
-    }
-    action = intent.action;
-    if (intent.action === "query") {
-      required.push("firstName", "lastName", "sourceName");
-      if (!intent.firstName?.trim()) {
-        missing.push("firstName");
-      }
-      if (!intent.lastName?.trim()) {
-        missing.push("lastName");
-      }
-      if (!intent.sourceName?.trim()) {
-        missing.push("sourceName");
-      }
-    }
-    summary = `connector:${action}`;
-  } else if (params.route === "schedule") {
-    const intent = detectScheduleNaturalIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return null;
-    }
-    action = intent.action;
-    if (intent.action === "edit" || intent.action === "delete") {
-      required.push("taskRef");
-      if (!intent.taskRef?.trim()) {
-        missing.push("taskRef");
-      }
-    }
-    summary = `schedule:${action}`;
-  } else if (params.route === "self-maintenance") {
-    const intent = detectSelfMaintenanceIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return null;
-    }
-    action = intent.action;
-    if (intent.action === "delete-skill") {
-      required.push("skillIndex");
-      if (!Number.isFinite(intent.skillIndex ?? NaN)) {
-        missing.push("skillIndex");
-      }
-    }
-    summary = `self-maintenance:${action}`;
-  } else if (params.route === "gmail-recipients") {
-    const intent = detectGmailRecipientNaturalIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return null;
-    }
-    action = intent.action;
-    if (intent.action === "add" || intent.action === "update") {
-      required.push("name", "email");
-      if (!intent.name?.trim()) {
-        missing.push("name");
-      }
-      if (!intent.email?.trim()) {
-        missing.push("email");
-      }
-    } else if (intent.action === "delete") {
-      required.push("name");
-      if (!intent.name?.trim()) {
-        missing.push("name");
-      }
-    }
-    summary = `gmail-recipients:${action}`;
-  } else {
-    summary = params.route;
+  const contract = TYPED_ROUTE_CONTRACTS[params.route];
+  if (!contract) {
+    return {
+      route: params.route,
+      required: [],
+      missing: [],
+      summary: params.route,
+    };
   }
+  const extracted = contract.extract(params.text);
+  if (!extracted) {
+    return null;
+  }
+  const action = extracted.action.trim();
+  const required = Array.from(new Set(extracted.required));
+  const missing = Array.from(new Set(extracted.missing));
 
   return {
     route: params.route,
     ...(action ? { action } : {}),
     required,
     missing,
-    summary,
+    summary: action ? `${params.route}:${action}` : params.route,
   };
 }
 
 function buildTypedRouteClarificationQuestion(extraction: TypedRouteExtraction): string {
-  if (extraction.route === "gmail" && extraction.action === "send") {
-    return "Para enviar el correo necesito destinatario. Indica: enviar correo a <email> asunto:<...> mensaje:<...>.";
+  const contract = TYPED_ROUTE_CONTRACTS[extraction.route];
+  if (contract && extraction.action) {
+    const actionMessage = contract.clarificationsByAction?.[extraction.action];
+    if (actionMessage) {
+      return actionMessage;
+    }
   }
-  if (extraction.route === "workspace" && extraction.action === "move") {
-    return "Para mover necesito origen y destino. Ejemplo: mover archivo <origen> a <destino>.";
-  }
-  if (extraction.route === "workspace" && extraction.action === "rename") {
-    return "Para renombrar necesito nombre actual y nuevo nombre. Ejemplo: renombrar <archivo> a <nuevo_nombre>.";
-  }
-  if (extraction.route === "workspace" && extraction.action === "delete") {
-    return "Para borrar necesito ruta o selector. Ejemplo: eliminar archivo <ruta> o eliminar archivos que contienen \"...\".";
-  }
-  if (extraction.route === "connector" && extraction.action === "query") {
-    return "Para consultar LIM necesito first_name, last_name y fuente. Ejemplo: revisar LIM de Juan Perez en account_demo_b_marylin.";
-  }
-  if (extraction.route === "schedule" && (extraction.action === "edit" || extraction.action === "delete")) {
-    return "Necesito referencia de tarea (id, número o 'última').";
-  }
-  if (extraction.route === "gmail-recipients") {
-    return "Para gestionar destinatarios necesito nombre y/o email según la acción.";
+  if (contract?.fallbackClarification) {
+    return contract.fallbackClarification;
   }
   return `Faltan parámetros para ejecutar ${extraction.summary}. ¿Lo reformulas con más detalle?`;
 }
@@ -5102,6 +5467,9 @@ function shouldAbstainByUncertainty(params: {
 function isLikelyMultiIntentUtterance(text: string): boolean {
   const normalized = normalizeIntentText(text);
   if (!normalized) {
+    return false;
+  }
+  if (isLikelyConversationalNarrative(text)) {
     return false;
   }
   return /\b(luego|despues|después|ademas|además|tambien|también|y luego|y despues|y después)\b/.test(normalized);
@@ -5173,34 +5541,88 @@ async function runIntentHardNegativeMining(source: "startup" | "timer" | "manual
     if (labeled.length < Math.max(100, config.intentRouterHardNegativesMaxPerRoute * 20)) {
       return;
     }
-    const addedByRoute = semanticIntentRouter.augmentNegativesFromDataset(
-      labeled,
-      config.intentRouterHardNegativesMaxPerRoute,
-    );
-    const totalAdded = Object.values(addedByRoute).reduce((acc, value) => acc + value, 0);
-    if (totalAdded < config.intentRouterHardNegativesMinAdded) {
-      return;
-    }
-    await semanticIntentRouter.saveToFile(config.intentRouterRoutesFile);
-    const versionId = await saveCurrentRouterSnapshot(
-      `${INTENT_HARD_NEGATIVE_SNAPSHOT_LABEL}-${new Date().toISOString()}`,
-    );
-    observability.increment("intent.router.hard_negatives.applied", totalAdded, {
-      source,
-      routes: Object.keys(addedByRoute).length,
-    });
-    await safeAudit({
-      type: "intent.router.hard_negatives_applied",
-      details: {
+    await withIntentRouterMutationLock(`hard-negatives:${source}`, async () => {
+      const baseRoutes = semanticIntentRouter.listRoutes();
+      const baseRouter = new IntentSemanticRouter({
+        routes: baseRoutes,
+        hybridAlpha: semanticIntentRouter.getHybridAlpha(),
+        minScoreGap: semanticIntentRouter.getMinScoreGap(),
+        routeAlphaOverrides: config.intentRouterRouteAlphaOverrides,
+      });
+      const candidateRouter = new IntentSemanticRouter({
+        routes: baseRoutes,
+        hybridAlpha: semanticIntentRouter.getHybridAlpha(),
+        minScoreGap: semanticIntentRouter.getMinScoreGap(),
+        routeAlphaOverrides: config.intentRouterRouteAlphaOverrides,
+      });
+      const split = splitIntentDatasetByHoldout(labeled, 20);
+      if (
+        split.train.length < Math.max(80, config.intentRouterHardNegativesMaxPerRoute * 12) ||
+        split.holdout.length < 20
+      ) {
+        return;
+      }
+
+      const baselineHoldoutAccuracy = baseRouter.evaluateDataset(split.holdout);
+      const addedByRoute = candidateRouter.augmentNegativesFromDataset(
+        split.train,
+        config.intentRouterHardNegativesMaxPerRoute,
+      );
+      const totalAdded = Object.values(addedByRoute).reduce((acc, value) => acc + value, 0);
+      if (totalAdded < config.intentRouterHardNegativesMinAdded) {
+        return;
+      }
+
+      const candidateHoldoutAccuracy = candidateRouter.evaluateDataset(split.holdout);
+      const holdoutDelta = candidateHoldoutAccuracy - baselineHoldoutAccuracy;
+      if (holdoutDelta < -0.002) {
+        observability.increment("intent.router.hard_negatives.skipped_regression", 1, { source });
+        await safeAudit({
+          type: "intent.router.hard_negatives_skipped_regression",
+          details: {
+            source,
+            totalAdded,
+            perRoute: addedByRoute,
+            holdoutSamples: split.holdout.length,
+            baselineHoldoutAccuracy: Number(baselineHoldoutAccuracy.toFixed(4)),
+            candidateHoldoutAccuracy: Number(candidateHoldoutAccuracy.toFixed(4)),
+            holdoutDelta: Number(holdoutDelta.toFixed(4)),
+          },
+        });
+        logWarn(
+          `Intent hard-negatives (${source}) omitido por regresión holdout: baseline=${baselineHoldoutAccuracy.toFixed(4)} candidate=${candidateHoldoutAccuracy.toFixed(4)} delta=${holdoutDelta.toFixed(4)}`,
+        );
+        return;
+      }
+
+      await candidateRouter.saveToFile(config.intentRouterRoutesFile);
+      await semanticIntentRouter.loadFromFile(config.intentRouterRoutesFile, {
+        createIfMissing: true,
+      });
+      const versionId = await saveCurrentRouterSnapshot(
+        `${INTENT_HARD_NEGATIVE_SNAPSHOT_LABEL}-${new Date().toISOString()}`,
+      );
+      observability.increment("intent.router.hard_negatives.applied", totalAdded, {
         source,
-        totalAdded,
-        perRoute: addedByRoute,
-        versionId,
-      },
+        routes: Object.keys(addedByRoute).length,
+      });
+      await safeAudit({
+        type: "intent.router.hard_negatives_applied",
+        details: {
+          source,
+          totalAdded,
+          perRoute: addedByRoute,
+          holdoutSamples: split.holdout.length,
+          baselineHoldoutAccuracy: Number(baselineHoldoutAccuracy.toFixed(4)),
+          candidateHoldoutAccuracy: Number(candidateHoldoutAccuracy.toFixed(4)),
+          holdoutDelta: Number(holdoutDelta.toFixed(4)),
+          versionId,
+        },
+      });
+      logInfo(
+        `Intent hard-negatives (${source}): added=${totalAdded} routes=${Object.keys(addedByRoute).join(",")} holdout_delta=${holdoutDelta.toFixed(4)} version=${versionId}`,
+      );
     });
-    logInfo(
-      `Intent hard-negatives (${source}): added=${totalAdded} routes=${Object.keys(addedByRoute).join(",")} version=${versionId}`,
-    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     observability.increment("intent.router.hard_negatives.failed", 1, { source });
@@ -5249,29 +5671,46 @@ async function runIntentCanaryGuard(source: "startup" | "timer"): Promise<void> 
     }
     const correct = scoped.filter((entry) => entry.semantic?.handler === entry.finalHandler).length;
     const accuracy = total > 0 ? correct / total : 0;
+    const interval = computeWilsonInterval(correct, total, 1.96);
     observability.increment("intent.router.canary_guard.sampled", total, { source });
     if (accuracy < config.intentRouterCanaryGuardMinAccuracy) {
+      const statisticallyConfidentBreach = interval.upper < config.intentRouterCanaryGuardMinAccuracy;
+      if (!statisticallyConfidentBreach) {
+        intentCanaryGuardConsecutiveBreaches = 0;
+        observability.increment("intent.router.canary_guard.inconclusive", 1, {
+          source,
+          version: canary.versionId,
+        });
+        logInfo(
+          `Canary guard inconcluso: version=${canary.versionId} acc=${(accuracy * 100).toFixed(2)}% ci95=[${(interval.lower * 100).toFixed(2)}%, ${(interval.upper * 100).toFixed(2)}%] threshold=${(config.intentRouterCanaryGuardMinAccuracy * 100).toFixed(2)}%`,
+        );
+        return;
+      }
       intentCanaryGuardConsecutiveBreaches += 1;
       observability.increment("intent.router.canary_guard.breach", 1, {
         source,
         version: canary.versionId,
       });
       if (intentCanaryGuardConsecutiveBreaches >= config.intentRouterCanaryGuardBreachesToDisable) {
-        routerVersionStore.disableCanary();
-        await routerVersionStore.save(config.intentRouterVersionsFile);
+        await withIntentRouterMutationLock(`canary-guard-disable:${canary.versionId}`, async () => {
+          routerVersionStore.disableCanary();
+          await routerVersionStore.save(config.intentRouterVersionsFile);
+        });
         await safeAudit({
           type: "intent.router.canary_auto_disabled",
           details: {
             source,
             versionId: canary.versionId,
             accuracy,
+            ciLower: Number(interval.lower.toFixed(4)),
+            ciUpper: Number(interval.upper.toFixed(4)),
             minAccuracy: config.intentRouterCanaryGuardMinAccuracy,
             samples: total,
             breaches: intentCanaryGuardConsecutiveBreaches,
           },
         });
         logWarn(
-          `Canary auto-disable: version=${canary.versionId} acc=${(accuracy * 100).toFixed(2)}% samples=${total} (threshold ${(config.intentRouterCanaryGuardMinAccuracy * 100).toFixed(2)}%)`,
+          `Canary auto-disable: version=${canary.versionId} acc=${(accuracy * 100).toFixed(2)}% ci95=[${(interval.lower * 100).toFixed(2)}%, ${(interval.upper * 100).toFixed(2)}%] samples=${total} (threshold ${(config.intentRouterCanaryGuardMinAccuracy * 100).toFixed(2)}%)`,
         );
         intentCanaryGuardConsecutiveBreaches = 0;
       }
@@ -5727,7 +6166,7 @@ function detectGmailAutoContentKind(
   if (/\b(reflexion|reflexion\s+estoica|estoic|estoicco|estoic[oa]s?|estoicismo|marco\s+aurelio)\b/.test(textNormalized)) {
     return "stoic";
   }
-  if (/\b(ultimas?|ultimos?|noticias?|news|actualidad|titulares?)\b/.test(textNormalized)) {
+  if (/\b(s?ultim[oa]s?|noticias?|nove(?:dad(?:es)?|ades?)|news|actualidad|titulares?)\b/.test(textNormalized)) {
     return "news";
   }
   if (/\b(recordatorios?|tareas?\s+pendientes?|pendientes?)\b/.test(textNormalized)) {
@@ -5738,8 +6177,13 @@ function detectGmailAutoContentKind(
 
 function buildEmailNewsQueryFromText(text: string): string {
   const cleaned = sanitizeNaturalWebQuery(text)
-    .replace(/\b(enviame|enviarme|envia|enviar|correo|mail|email|gmail)\b/gi, " ")
-    .replace(/\b(ultimas?|ultimos?|noticias?|news|resumen)\b/gi, " ")
+    .replace(/\b(?:a|para)\s+[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+    .replace(/\b(envi\w*|mand\w*)\s+(?:un\s+)?(?:correo|mail|email|gmail)\b/gi, " ")
+    .replace(/\b(correo|mail|email|gmail|asunto|mensaje|cuerpo)\b/gi, " ")
+    .replace(/\b(con)\s+(?:las?|los?)\b/gi, " ")
+    .replace(/\b(s?ultim[oa]s?|noticias?|nove(?:dad(?:es)?|ades?)|news|actualidad|titulares?|resumen)\b/gi, " ")
+    .replace(/^(?:de|sobre|acerca\s+de|lo\s+de)\s+/i, " ")
+    .replace(/[.,;:!?]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   return cleaned || "noticias del dia";
@@ -9626,16 +10070,41 @@ async function maybeHandleNaturalScheduleInstruction(params: {
     if (intent.action === "list") {
       const pending = scheduledTasks.listPending(params.ctx.chat.id);
       if (pending.length === 0) {
-        await params.ctx.reply("No hay tareas programadas pendientes.");
+        const responseText = "No hay tareas programadas pendientes.";
+        await params.ctx.reply(responseText);
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: responseText,
+          source: `${params.source}:schedule-intent`,
+        });
+        await safeAudit({
+          type: "schedule.intent_list",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            count: 0,
+          },
+        });
         return true;
       }
+      const responseText = [
+        `Tareas pendientes (${pending.length}):`,
+        ...formatScheduleTaskLines(pending),
+      ].join("\n\n");
       await replyLong(
         params.ctx,
-        [
-          `Tareas pendientes (${pending.length}):`,
-          ...formatScheduleTaskLines(pending),
-        ].join("\n\n"),
+        responseText,
       );
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: truncateInline(responseText, 2600),
+        source: `${params.source}:schedule-intent`,
+      });
       await safeAudit({
         type: "schedule.intent_list",
         chatId: params.ctx.chat.id,
@@ -10034,9 +10503,89 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
       return true;
     }
 
+    if (intent.action === "read") {
+      let targetPath = intent.path?.trim() ?? "";
+      let usedLastSnapshot = false;
+      if (!targetPath) {
+        const snapshot = lastDocumentByChat.get(params.ctx.chat.id);
+        if (snapshot?.path.trim()) {
+          targetPath = snapshot.path.trim();
+          usedLastSnapshot = true;
+        }
+      }
+
+      if (!targetPath) {
+        await params.ctx.reply(
+          [
+            "Indica el archivo que quieres leer dentro de workspace.",
+            "Ejemplos:",
+            " - ver reporte.txt",
+            " - mostrar contenido de datos.csv",
+          ].join("\n"),
+        );
+        return true;
+      }
+
+      let readPath = targetPath;
+      let readText = "";
+      let readFormat = path.extname(targetPath).replace(/^\./, "").toLowerCase() || "txt";
+      let readExtractor = "workspace-utf8";
+      let readTruncated = false;
+
+      try {
+        const read = await documentReader.readDocument(targetPath);
+        readPath = read.path;
+        readText = read.text;
+        readFormat = read.format;
+        readExtractor = read.extractor;
+        readTruncated = read.truncated;
+      } catch {
+        const resolved = resolveWorkspacePath(targetPath);
+        readPath = resolved.relPath;
+        const raw = await fs.readFile(resolved.fullPath, "utf8");
+        readText = raw;
+      }
+
+      rememberLastDocumentSnapshot(params.ctx.chat.id, readPath, readText);
+      const preview = truncateInline(readText, 3000);
+      const responseText = [
+        `Archivo: ${readPath}`,
+        `Formato: ${readFormat}`,
+        `Extractor: ${readExtractor}`,
+        ...(usedLastSnapshot ? ["referencia: último archivo en contexto"] : []),
+        ...(readTruncated ? ["texto: truncado por límite"] : []),
+        "",
+        preview || "(No se extrajo contenido textual útil)",
+      ].join("\n");
+      await replyLong(params.ctx, responseText);
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: truncateInline(responseText, 2600),
+        source: `${params.source}:workspace-intent`,
+      });
+      await safeAudit({
+        type: "workspace.intent_read",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          path: readPath,
+          format: readFormat,
+          extractor: readExtractor,
+          truncated: readTruncated,
+          usedLastSnapshot,
+          chars: readText.length,
+        },
+      });
+      return true;
+    }
+
     if (intent.action === "write") {
       let filePath = intent.path?.trim() ?? "";
       const formatHint = intent.formatHint ?? detectSimpleTextExtensionHint(params.text);
+      const randomFileNameRequest = extractRandomWorkspaceFileNameRequest(params.text);
       const normalizedWriteRequest = normalizeIntentText(params.text);
       const explicitWriteContentCue =
         /\b(escrib\w*|redact\w*|contenido|texto|poema|poesia|poes[ií]a|chiste|broma|resumen|reflexion|estoic)\b/.test(
@@ -10095,8 +10644,89 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         }
       }
 
-      const autoPathGenerated = !filePath;
+      if (randomFileNameRequest.requested) {
+        if (filePath && isRandomWorkspaceNamePlaceholderPath(filePath)) {
+          filePath = "";
+        }
+        if (typeof content === "string" && isPlaceholderContentForRandomName(content)) {
+          content = undefined;
+        }
+      }
+
       const appendMode = Boolean(intent.append);
+      if (randomFileNameRequest.requested && !filePath && randomFileNameRequest.count > 1) {
+        if (appendMode) {
+          await params.ctx.reply(
+            "No puedo crear varios archivos aleatorios en modo append. Indica crear/generar sin 'append' o 'agregar al final'.",
+          );
+          return true;
+        }
+        const created: Array<{ relPath: string; size: number }> = [];
+        const usedNames = new Set<string>();
+        for (let index = 0; index < randomFileNameRequest.count; index += 1) {
+          let candidatePath = "";
+          for (let attempt = 0; attempt < 25; attempt += 1) {
+            const generated = buildCreativeRandomWorkspaceFilePath(formatHint);
+            if (usedNames.has(generated)) {
+              continue;
+            }
+            const resolvedGenerated = resolveWorkspacePath(generated);
+            const exists = await safePathExists(resolvedGenerated.fullPath);
+            if (!exists) {
+              candidatePath = generated;
+              break;
+            }
+          }
+          if (!candidatePath) {
+            throw new Error("No pude generar un nombre de archivo aleatorio unico.");
+          }
+          const writtenItem = await writeWorkspaceTextFile({
+            relativePath: candidatePath,
+            ...(typeof content === "string" ? { content } : {}),
+          });
+          usedNames.add(writtenItem.relPath);
+          created.push({ relPath: writtenItem.relPath, size: writtenItem.size });
+        }
+        if (typeof content === "string" && content.trim() && created.length > 0) {
+          rememberLastDocumentSnapshot(params.ctx.chat.id, created[0]!.relPath, content);
+        }
+        const responseText = [
+          `Archivos creados en workspace: ${created.length}`,
+          "nombres: aleatorios",
+          ...created.map((item, index) => `${index + 1}. ${item.relPath} (${formatBytes(item.size)})`),
+          ...(typeof autoNumberUsed === "number" ? [`numero: ${autoNumberUsed}`] : []),
+        ].join("\n");
+        await replyLong(params.ctx, responseText);
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: truncateInline(responseText, 3000),
+          source: `${params.source}:workspace-intent`,
+        });
+        await safeAudit({
+          type: "workspace.intent_write",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            path: created[0]?.relPath ?? "",
+            size: created.reduce((acc, item) => acc + item.size, 0),
+            created: true,
+            append: false,
+            overwrite: false,
+            contentChars: typeof content === "string" ? content.length : 0,
+            autoPathGenerated: true,
+            autoRandomNameGenerated: true,
+            randomBatchCount: created.length,
+            autoNumberUsed,
+          },
+        });
+        return true;
+      }
+
+      const autoPathGenerated = !filePath;
+      let autoRandomNameGenerated = false;
       const explicitOverwriteCue =
         /\b(sobrescrib\w*|reemplaz\w*|actualiz\w*|modific\w*|edit\w*|dibuj\w*|traz\w*)\b/.test(normalizedWriteRequest) &&
         !/\b(no\s+sobrescrib\w*|sin\s+sobrescrib\w*)\b/.test(normalizedWriteRequest);
@@ -10110,7 +10740,12 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
       if (!filePath) {
-        filePath = buildAutoWorkspaceFilePath(formatHint);
+        if (randomFileNameRequest.requested) {
+          filePath = buildCreativeRandomWorkspaceFilePath(formatHint);
+          autoRandomNameGenerated = true;
+        } else {
+          filePath = buildAutoWorkspaceFilePath(formatHint);
+        }
       }
       const resolvedWritePath = resolveWorkspacePath(filePath);
       const targetFileExists = await safePathExists(resolvedWritePath.fullPath);
@@ -10134,7 +10769,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
             : overwriteMode
               ? "Archivo sobrescrito en workspace."
               : "Archivo actualizado en workspace.",
-        ...(autoPathGenerated ? ["nombre: autogenerado"] : []),
+        ...(autoRandomNameGenerated ? ["nombre: aleatorio"] : autoPathGenerated ? ["nombre: autogenerado"] : []),
         `ruta: ${written.relPath}`,
         `tamano: ${formatBytes(written.size)}`,
         ...(typeof autoNumberUsed === "number" ? [`numero: ${autoNumberUsed}`] : []),
@@ -10160,6 +10795,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
           overwrite: overwriteMode,
           contentChars: typeof content === "string" ? content.length : 0,
           autoPathGenerated,
+          autoRandomNameGenerated,
           autoNumberUsed,
         },
       });
@@ -11785,7 +12421,7 @@ async function maybeHandleNaturalGmailInstruction(params: {
         }
         body = autoContent.body;
       }
-      if (intent.forceAiByMissingSubject) {
+      if (intent.forceAiByMissingSubject && !intent.autoContentKind) {
         const modeDecision = await classifyMissingSubjectEmailModeWithAi({
           chatId: params.ctx.chat.id,
           userText: params.text,
@@ -12053,6 +12689,13 @@ function isLikelyOperationalInstruction(text: string): boolean {
   return /\b(crea|crear|arma|guardar|guarda|archivo|workspace|carpeta|mueve|elimina|borra|lista|gmail|correo|email|mail|agenda|recordatorio|tarea|web|busca|abrir|readfile|mkfile|selfupdate|selfrestart|shell)\b/.test(
     normalized,
   );
+}
+
+function isLikelyConversationalNarrative(text: string): boolean {
+  return isLikelyConversationalNarrativeDomain({
+    normalizedText: normalizeIntentText(text),
+    hasOperationalCue: isLikelyOperationalInstruction(text),
+  });
 }
 
 function hasActiveStoicSmalltalkSession(chatId: number): boolean {
@@ -12434,7 +13077,9 @@ async function maybeHandleNaturalIntentPipeline(params: {
     return false;
   };
 
-  const chained = splitChainedInstructions(params.text);
+  const normalized = normalizeIntentText(params.text);
+  const conversationalNarrative = isLikelyConversationalNarrative(params.text);
+  const chained = conversationalNarrative ? [] : splitChainedInstructions(params.text);
   if (chained.length >= 2) {
     if (params.persistUserTurn) {
       await appendConversationTurn({
@@ -12491,7 +13136,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
     return true;
   }
 
-  if (!params.source.includes(":seq-step-") && !params.source.includes(":chain-")) {
+  const skipAiSequencedPlan = extractRandomWorkspaceFileNameRequest(params.text).requested || conversationalNarrative;
+  if (!skipAiSequencedPlan && !params.source.includes(":seq-step-") && !params.source.includes(":chain-")) {
     const sequencedPlan = await classifySequencedIntentPlanWithAi({
       chatId: params.ctx.chat.id,
       text: params.text,
@@ -12576,7 +13222,6 @@ async function maybeHandleNaturalIntentPipeline(params: {
     }
   }
 
-  const normalized = normalizeIntentText(params.text);
   const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(normalized);
   const hasMemoryRecallCue =
     /\b(te\s+acordas|te\s+acuerdas|te\s+recordas|te\s+recuerdas|recordas|recuerdas|memoria|memory|habiamos\s+hablado|hablamos)\b/.test(
@@ -12640,12 +13285,14 @@ async function maybeHandleNaturalIntentPipeline(params: {
     indexedListKind: indexedListContext?.kind ?? null,
     hasPendingWorkspaceDelete: hasPendingWorkspaceDeleteConfirmation(params.ctx.chat.id),
   });
-  const layerAllowedCandidates = routerLayerDecision
+  const layerNarrowed = routerLayerDecision
     ? narrowRouteCandidates(
         routeCandidates,
         routerLayerDecision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
+        { strict: routerLayerDecision.strict },
       )
-    : routeCandidates;
+    : { allowed: routeCandidates, exhausted: false };
+  const layerAllowedCandidates = layerNarrowed.allowed;
   hierarchyDecision = buildHierarchicalIntentDecision({
     normalizedText: normalized,
     candidates: layerAllowedCandidates,
@@ -12657,12 +13304,14 @@ async function maybeHandleNaturalIntentPipeline(params: {
       ? lastConnectorContextByChat.get(params.ctx.chat.id)! + CONNECTOR_CONTEXT_TTL_MS > Date.now()
       : false,
   });
-  const hierarchyAllowedCandidates = hierarchyDecision
+  const hierarchyNarrowed = hierarchyDecision
     ? narrowRouteCandidates(
         layerAllowedCandidates,
         hierarchyDecision.allowed as Exclude<NaturalIntentHandlerName, "none">[],
+        { strict: hierarchyDecision.strict },
       )
-    : layerAllowedCandidates;
+    : { allowed: layerAllowedCandidates, exhausted: false };
+  const hierarchyAllowedCandidates = hierarchyNarrowed.allowed;
   const routeFilterDecision = buildIntentRouterContextFilter({
     chatId: params.ctx.chat.id,
     text: params.text,
@@ -12673,6 +13322,45 @@ async function maybeHandleNaturalIntentPipeline(params: {
   const semanticAllowedCandidates = routeFilterDecision
     ? (routeFilterDecision.allowed as Exclude<NaturalIntentHandlerName, "none">[])
     : hierarchyAllowedCandidates;
+  const strictNarrowingExhausted =
+    (routerLayerDecision?.strict && (routerLayerDecision.exhausted || layerNarrowed.exhausted || layerAllowedCandidates.length === 0)) ||
+    (hierarchyDecision?.strict && (hierarchyDecision.exhausted || hierarchyNarrowed.exhausted || hierarchyAllowedCandidates.length === 0)) ||
+    (routeFilterDecision?.strict && (routeFilterDecision.exhausted || semanticAllowedCandidates.length === 0));
+  if (strictNarrowingExhausted || semanticAllowedCandidates.length === 0) {
+    await params.ctx.reply(
+      buildRouteNarrowingClarificationQuestion({
+        routeFilterDecision,
+        routerLayerDecision,
+        hierarchyDecision,
+      }),
+    );
+    await appendIntentRouterDatasetEntry({
+      ts: new Date().toISOString(),
+      chatId: params.ctx.chat.id,
+      ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
+      source: params.source,
+      text: truncateInline(params.text.trim(), 500),
+      hasMailContext,
+      hasMemoryRecallCue,
+      routeCandidates,
+      ...(routeFilterDecision
+        ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed }
+        : routerLayerDecision
+          ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
+          : {}),
+      ...(hierarchyDecision
+        ? {
+            routerHierarchyDomains: hierarchyDecision.domains,
+            routerHierarchyReason: hierarchyDecision.reason,
+            routerHierarchyAllowed: hierarchyDecision.allowed,
+          }
+        : {}),
+      ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
+      finalHandler: "none",
+      handled: true,
+    });
+    return true;
+  }
   const routeScoreBoosts = buildIntentRouterScoreBoosts({
     chatId: params.ctx.chat.id,
     text: params.text,
@@ -12824,7 +13512,12 @@ async function maybeHandleNaturalIntentPipeline(params: {
     return true;
   }
 
-  if (!params.source.includes(":multi-topn-") && isLikelyMultiIntentUtterance(params.text) && ensembleTop.length >= 2) {
+  if (
+    !conversationalNarrative &&
+    !params.source.includes(":multi-topn-") &&
+    isLikelyMultiIntentUtterance(params.text) &&
+    ensembleTop.length >= 2
+  ) {
     const topCandidateNames = ensembleTop
       .slice(0, 3)
       .map((item) => item.name)
@@ -13218,94 +13911,93 @@ bot.command("start", async (ctx) => {
 });
 
 bot.command("help", async (ctx) => {
-  await ctx.reply(
-    [
-      "Comandos:",
-      "/version - Ver versión del agente",
-      "/model [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
-      "/status - Estado del host y tareas en ejecución",
-      "/doctor - Diagnóstico operativo rápido del agente",
-      "/usage [topN|reset] - Métricas de tokens/costo OpenAI desde el arranque",
-      "/domains - Estado de dominios modulares cargados",
-      "/policy - Política agéntica activa (preview/approval/safe blocks)",
-      "/agenticcanary [status|<0-100>] - Rollout runtime de controles agénticos",
-      "/agent - Ver agente activo y lista",
-      "/agent set <nombre> - Cambiar agente activo para este chat",
-      "/ask <pregunta> - Consultar IA de OpenAI",
-      "/readfile <ruta> - Extraer texto de PDF/documentos de oficina",
-      "/askfile <ruta> <pregunta> - Consultar IA sobre archivo local",
-      "/mkfile <ruta> [contenido] - Crear archivo de texto simple en workspace",
-      "/files [limit] - Listar archivos guardados en workspace",
-      "/getfile <ruta|n> - Enviar archivo del workspace al chat",
-      "/images [limit] - Listar imágenes guardadas para este chat",
-      "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
-      "/web <consulta> - Buscar en la web",
-      '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
-      "/crypto [consulta] [limit] - Precios crypto con CoinGecko",
-      "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
-      "/reddit <consulta> [limit] - Buscar posts en Reddit (API)",
-      "/webopen <n|url> [pregunta] - Abrir resultado web y opcionalmente analizarlo",
-      "/webask <consulta> - Buscar + sintetizar respuesta con fuentes",
-      "/agenda ... - Crear/listar/editar/eliminar tareas programadas",
-      "/gmail ... - Consultar/operar tu cuenta Gmail conectada",
-      "/remember <nota> - Guardar nota en memoria diaria",
-      "/memory - Estado de memoria",
-      "/memory search <texto> - Buscar en memoria",
-      "/memory view <path> [from] [lines] - Ver fragmento de memoria",
-      "/interests [status|add|del|clear|suggest] - Gestion de intereses de noticias",
-      "/suggest now|status - Forzar sugerencia o ver cuota/config",
-      "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
-      "/selfskill list - Ver habilidades agregadas",
-      "/selfskill del <n|last> - Eliminar habilidad agregada",
-      "/selfskill draft <start|add|show|apply|cancel> - Armar skill en varios mensajes",
-      "/selfrestart - Reiniciar servicio del agente",
-      "/selfupdate [check] - Actualizar a la última versión del repositorio",
-      "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
-      "/safe on|off|status - Modo determinista para interpretar órdenes precisas",
-      "/intentstats [n] - Métricas de enrutamiento y sugerencias de threshold",
-      "/intentfit [n] [iter] - Ajusta thresholds del router semántico con dataset",
-      "/intentreload - Recarga configuración de rutas semánticas desde archivo",
-      "/intentroutes - Ver rutas/thresholds y parámetros del router semántico",
-      "/intentcalibrate [n] - Reentrena calibración de confianza por bins",
-      "/intentcurate [n] [apply] - Sugiere/promueve utterances desde errores",
-      "/intentab - Estado de experimento A/B del router",
-      "/intentversion [list|save [label]|rollback <id>] - Versionado/rollback de rutas",
-      "/intentcanary [status|set <id> <pct>|off] - Canary rollout de versión de router",
-      "Enviar nota de voz/audio - Se transcribe y se responde con IA",
-      "Enviar archivo (document) - Se guarda en workspace/files/...",
-      "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
-      "/shell <instrucción> - IA propone y ejecuta comando shell",
-      "/shellmode on|off - Habilitar shell IA en chat libre",
-      "/exec <cmd> [args] - Ejecutar comando permitido por el agente",
-      "/reboot - Solicitar reinicio de PC (si está habilitado)",
-      "/adminmode on|off - Requerir aprobación antes de ejecutar",
-      "/approvals - Ver aprobaciones pendientes",
-      "/approve <id> - Aprobar ejecución pendiente",
-      "/deny <id> - Rechazar ejecución pendiente",
-      "/confirm <plan_id> - Confirmar plan preview sensible",
-      "/cancelplan <plan_id> - Cancelar plan preview sensible",
-      "/outbox [status|flush|recover] - Estado/reintento de respuestas pendientes",
-      "/metrics [reset] - Snapshot de observabilidad (counters/timings/colas)",
-      "/panic on|off|status - Bloqueo global de ejecución",
-      "/tasks - Ver tareas activas",
-      "/kill <taskId> - Terminar tarea activa",
-      "",
-      "Chat libre: escribe un mensaje normal (sin /) y responde OpenAI.",
-      "Si mencionas un archivo (.pdf/.docx/.xlsx/etc) y pides leer/analizar, lo procesa automáticamente.",
-      "Si pides recordatorios o tareas con fecha/hora, los agenda y dispara automáticamente.",
-      "Si pides listar/leer/enviar correos o consultar estado/perfil Gmail, lo hace en lenguaje natural.",
-      "Si habilitas integración de LIM, puede operar estado/iniciar/detener/reiniciar app+tunnel en lenguaje natural.",
-      "Si pides buscar en web/internet o compartes una URL para analizar, navega sin comandos.",
-      "Si preguntas 'te acordás/recordás de ...', consulta memoria en lenguaje natural.",
-      "Si pides listar/crear/mover/copiar/pegar/renombrar/eliminar/enviar archivos o carpetas en workspace, lo opera en lenguaje natural.",
-      'También entiende selectores por nombre: "empiezan con", "contienen" o "se llaman".',
-      "Tambien puedes crear archivos simples (.txt/.csv/.json/.md/etc) con lenguaje natural.",
-      "Si pides agregar una habilidad o reiniciar el agente, también puede hacerlo en lenguaje natural.",
-      "Tambien puede armar una habilidad en varios mensajes con borrador natural y sugerir contenido proactivamente segun recurrencia (con cuota diaria).",
-      "Si shellmode=on, el chat libre puede proponer comandos para ejecutar.",
-      "Con adminmode=on, toda ejecución requiere /approve.",
-    ].join("\n"),
-  );
+  const helpText = [
+    "Comandos:",
+    "/version - Ver versión del agente",
+    "/model [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
+    "/status - Estado del host y tareas en ejecución",
+    "/doctor - Diagnóstico operativo rápido del agente",
+    "/usage [topN|reset] - Métricas de tokens/costo OpenAI desde el arranque",
+    "/domains - Estado de dominios modulares cargados",
+    "/policy - Política agéntica activa (preview/approval/safe blocks)",
+    "/agenticcanary [status|<0-100>] - Rollout runtime de controles agénticos",
+    "/agent - Ver agente activo y lista",
+    "/agent set <nombre> - Cambiar agente activo para este chat",
+    "/ask <pregunta> - Consultar IA de OpenAI",
+    "/readfile <ruta> - Extraer texto de PDF/documentos de oficina",
+    "/askfile <ruta> <pregunta> - Consultar IA sobre archivo local",
+    "/mkfile <ruta> [contenido] - Crear archivo de texto simple en workspace",
+    "/files [limit] - Listar archivos guardados en workspace",
+    "/getfile <ruta|n> - Enviar archivo del workspace al chat",
+    "/images [limit] - Listar imágenes guardadas para este chat",
+    "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
+    "/web <consulta> - Buscar en la web",
+    '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
+    "/crypto [consulta] [limit] - Precios crypto con CoinGecko",
+    "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
+    "/reddit <consulta> [limit] - Buscar posts en Reddit (API)",
+    "/webopen <n|url> [pregunta] - Abrir resultado web y opcionalmente analizarlo",
+    "/webask <consulta> - Buscar + sintetizar respuesta con fuentes",
+    "/agenda ... - Crear/listar/editar/eliminar tareas programadas",
+    "/gmail ... - Consultar/operar tu cuenta Gmail conectada",
+    "/remember <nota> - Guardar nota en memoria diaria",
+    "/memory - Estado de memoria",
+    "/memory search <texto> - Buscar en memoria",
+    "/memory view <path> [from] [lines] - Ver fragmento de memoria",
+    "/interests [status|add|del|clear|suggest] - Gestion de intereses de noticias",
+    "/suggest now|status - Forzar sugerencia o ver cuota/config",
+    "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
+    "/selfskill list - Ver habilidades agregadas",
+    "/selfskill del <n|last> - Eliminar habilidad agregada",
+    "/selfskill draft <start|add|show|apply|cancel> - Armar skill en varios mensajes",
+    "/selfrestart - Reiniciar servicio del agente",
+    "/selfupdate [check] - Actualizar a la última versión del repositorio",
+    "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
+    "/safe on|off|status - Modo determinista para interpretar órdenes precisas",
+    "/intentstats [n] - Métricas de enrutamiento y sugerencias de threshold",
+    "/intentfit [n] [iter] - Ajusta thresholds del router semántico con dataset",
+    "/intentreload - Recarga configuración de rutas semánticas desde archivo",
+    "/intentroutes - Ver rutas/thresholds y parámetros del router semántico",
+    "/intentcalibrate [n] - Reentrena calibración de confianza por bins",
+    "/intentcurate [n] [apply] - Sugiere/promueve utterances desde errores",
+    "/intentab - Estado de experimento A/B del router",
+    "/intentversion [list|save [label]|rollback <id>] - Versionado/rollback de rutas",
+    "/intentcanary [status|set <id> <pct>|off] - Canary rollout de versión de router",
+    "Enviar nota de voz/audio - Se transcribe y se responde con IA",
+    "Enviar archivo (document) - Se guarda en workspace/files/...",
+    "Enviar imagen/foto - Se guarda en workspace/images/... y puede analizarse con IA",
+    "/shell <instrucción> - IA propone y ejecuta comando shell",
+    "/shellmode on|off - Habilitar shell IA en chat libre",
+    "/exec <cmd> [args] - Ejecutar comando permitido por el agente",
+    "/reboot - Solicitar reinicio de PC (si está habilitado)",
+    "/adminmode on|off - Requerir aprobación antes de ejecutar",
+    "/approvals - Ver aprobaciones pendientes",
+    "/approve <id> - Aprobar ejecución pendiente",
+    "/deny <id> - Rechazar ejecución pendiente",
+    "/confirm <plan_id> - Confirmar plan preview sensible",
+    "/cancelplan <plan_id> - Cancelar plan preview sensible",
+    "/outbox [status|flush|recover] - Estado/reintento de respuestas pendientes",
+    "/metrics [reset] - Snapshot de observabilidad (counters/timings/colas)",
+    "/panic on|off|status - Bloqueo global de ejecución",
+    "/tasks - Ver tareas activas",
+    "/kill <taskId> - Terminar tarea activa",
+    "",
+    "Chat libre: escribe un mensaje normal (sin /) y responde OpenAI.",
+    "Si mencionas un archivo (.pdf/.docx/.xlsx/etc) y pides leer/analizar, lo procesa automáticamente.",
+    "Si pides recordatorios o tareas con fecha/hora, los agenda y dispara automáticamente.",
+    "Si pides listar/leer/enviar correos o consultar estado/perfil Gmail, lo hace en lenguaje natural.",
+    "Si habilitas integración de LIM, puede operar estado/iniciar/detener/reiniciar app+tunnel en lenguaje natural.",
+    "Si pides buscar en web/internet o compartes una URL para analizar, navega sin comandos.",
+    "Si preguntas 'te acordás/recordás de ...', consulta memoria en lenguaje natural.",
+    "Si pides listar/crear/mover/copiar/pegar/renombrar/eliminar/enviar archivos o carpetas en workspace, lo opera en lenguaje natural.",
+    'También entiende selectores por nombre: "empiezan con", "contienen" o "se llaman".',
+    "Tambien puedes crear archivos simples (.txt/.csv/.json/.md/etc) con lenguaje natural.",
+    "Si pides agregar una habilidad o reiniciar el agente, también puede hacerlo en lenguaje natural.",
+    "Tambien puede armar una habilidad en varios mensajes con borrador natural y sugerir contenido proactivamente segun recurrencia (con cuota diaria).",
+    "Si shellmode=on, el chat libre puede proponer comandos para ejecutar.",
+    "Con adminmode=on, toda ejecución requiere /approve.",
+  ].join("\n");
+  await replyLong(ctx, helpText);
 });
 
 bot.command("version", async (ctx) => {
@@ -13673,12 +14365,20 @@ bot.command("intentfit", async (ctx) => {
       return;
     }
 
-    const fitResult: FitResult = semanticIntentRouter.fitThresholdsFromDataset(labeled, {
-      maxIter,
+    const fitOutcome = await withIntentRouterMutationLock("intentfit:manual", async () => {
+      const fitResult: FitResult = semanticIntentRouter.fitThresholdsFromDataset(labeled, {
+        maxIter,
+      });
+      const negativesAdded = semanticIntentRouter.augmentNegativesFromDataset(labeled, 20);
+      await semanticIntentRouter.saveToFile(config.intentRouterRoutesFile);
+      const versionId = await saveCurrentRouterSnapshot(`fit-${new Date().toISOString()}`);
+      return {
+        fitResult,
+        negativesAdded,
+        versionId,
+      };
     });
-    const negativesAdded = semanticIntentRouter.augmentNegativesFromDataset(labeled, 20);
-    await semanticIntentRouter.saveToFile(config.intentRouterRoutesFile);
-    const versionId = await saveCurrentRouterSnapshot(`fit-${new Date().toISOString()}`);
+    const { fitResult, negativesAdded, versionId } = fitOutcome;
 
     const changedRoutes = Object.keys(fitResult.afterThresholds)
       .filter((name) => fitResult.beforeThresholds[name] !== fitResult.afterThresholds[name])
@@ -13789,17 +14489,20 @@ bot.command("intentcurate", async (ctx) => {
       return;
     }
     if (applyMode) {
-      let addedTotal = 0;
-      const baseRoutes = semanticIntentRouter.listRoutes();
-      for (const suggestion of suggestions) {
-        addedTotal += dynamicIntentRoutes.appendUtterances(
-          ctx.chat.id,
-          suggestion.route as IntentRouteName,
-          suggestion.utterances,
-          baseRoutes,
-        );
-      }
-      await dynamicIntentRoutes.saveToFile(config.intentRouterChatRoutesFile);
+      const addedTotal = await withIntentRouterMutationLock("intentcurate:apply", async () => {
+        let total = 0;
+        const baseRoutes = semanticIntentRouter.listRoutes();
+        for (const suggestion of suggestions) {
+          total += dynamicIntentRoutes.appendUtterances(
+            ctx.chat.id,
+            suggestion.route as IntentRouteName,
+            suggestion.utterances,
+            baseRoutes,
+          );
+        }
+        await dynamicIntentRoutes.saveToFile(config.intentRouterChatRoutesFile);
+        return total;
+      });
       await ctx.reply(
         [
           "Curación aplicada en rutas dinámicas del chat.",
@@ -13896,7 +14599,9 @@ bot.command("intentversion", async (ctx) => {
 
   if (sub === "save") {
     const label = rest.join(" ").trim() || `manual-${new Date().toISOString()}`;
-    const versionId = await saveCurrentRouterSnapshot(label);
+    const versionId = await withIntentRouterMutationLock("intentversion:save", async () => {
+      return await saveCurrentRouterSnapshot(label);
+    });
     await ctx.reply(`Snapshot guardado.\nid: ${versionId}\nlabel: ${label}`);
     return;
   }
@@ -13907,7 +14612,9 @@ bot.command("intentversion", async (ctx) => {
       await ctx.reply("Uso: /intentversion rollback <version_id>");
       return;
     }
-    const ok = await applyRouterSnapshotById(versionId);
+    const ok = await withIntentRouterMutationLock("intentversion:rollback", async () => {
+      return await applyRouterSnapshotById(versionId);
+    });
     if (!ok) {
       await ctx.reply(`No encontré versión: ${versionId}`);
       return;
@@ -13944,8 +14651,10 @@ bot.command("intentcanary", async (ctx) => {
   }
 
   if (sub === "off" || sub === "disable") {
-    routerVersionStore.disableCanary();
-    await routerVersionStore.save(config.intentRouterVersionsFile);
+    await withIntentRouterMutationLock("intentcanary:off", async () => {
+      routerVersionStore.disableCanary();
+      await routerVersionStore.save(config.intentRouterVersionsFile);
+    });
     await ctx.reply("Canary desactivado.");
     return;
   }
@@ -13958,12 +14667,18 @@ bot.command("intentcanary", async (ctx) => {
       await ctx.reply("Uso: /intentcanary set <version_id> <split_percent>");
       return;
     }
-    const ok = routerVersionStore.setCanary(versionId, splitPercent);
+    const ok = await withIntentRouterMutationLock("intentcanary:set", async () => {
+      const setOk = routerVersionStore.setCanary(versionId, splitPercent);
+      if (!setOk) {
+        return false;
+      }
+      await routerVersionStore.save(config.intentRouterVersionsFile);
+      return true;
+    });
     if (!ok) {
       await ctx.reply(`No encontré versión: ${versionId}`);
       return;
     }
-    await routerVersionStore.save(config.intentRouterVersionsFile);
     await ctx.reply(`Canary activado.\nversion: ${versionId}\nsplit: ${splitPercent}%`);
     await safeAudit({
       type: "intent.router.canary",

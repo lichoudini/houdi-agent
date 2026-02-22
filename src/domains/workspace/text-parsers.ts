@@ -68,12 +68,46 @@ export function createWorkspaceTextParsers(options: WorkspaceTextParsersOptions)
   }
 
   function extractWorkspaceDeleteContentsPath(text: string): string {
-    const match = text.match(/\b(?:contenido|contenidos)\s+de\s+(.+)$/i);
-    const candidate = cleanWorkspacePathPhrase(match?.[1] ?? "").trim();
-    if (!candidate) {
+    const rawText = text ?? "";
+    if (!rawText.trim()) {
       return "";
     }
-    return normalizeWorkspaceRelativePath(candidate);
+    const normalized = normalizeIntentText(rawText);
+    const hasContentsCue =
+      /\b(?:contenido|contenidos)\s+de\b/.test(normalized) ||
+      /\b(?:todo|todos|toda|todas)\s+los?\s+archivos?\b/.test(normalized) ||
+      /\barchivos?\s+de\s+la?\s*(?:carpeta|directorio|folder)\b/.test(normalized) ||
+      /\b(?:dentro|adentro)\s+de\s+la?\s*(?:carpeta|directorio|folder)\b/.test(normalized) ||
+      /\bvaciar\b/.test(normalized) ||
+      /\bdejar\s+vaci[ao]s?\b/.test(normalized);
+    if (!hasContentsCue) {
+      return "";
+    }
+
+    const quoted = extractQuotedSegments(rawText);
+    const firstQuoted = quoted[0]?.trim();
+    if (firstQuoted) {
+      const quotedCandidate = normalizeWorkspaceRelativePath(cleanWorkspacePathPhrase(firstQuoted));
+      if (quotedCandidate) {
+        return quotedCandidate;
+      }
+    }
+
+    const rawCandidate =
+      rawText.match(/\b(?:contenido|contenidos)\s+de\s+(.+)$/i)?.[1] ??
+      rawText.match(/\b(?:todo|todos|toda|todas)\s+los?\s+archivos?\s+(?:de|en|dentro(?:\s+de)?)\s+(.+)$/i)?.[1] ??
+      rawText.match(/\barchivos?\s+de\s+la?\s*(?:carpeta|directorio|folder)\s+(.+)$/i)?.[1] ??
+      rawText.match(/\b(?:vaciar|dejar\s+vaci[ao]s?)\s+(.+)$/i)?.[1] ??
+      rawText.match(/\b(?:en|dentro(?:\s+de)?)\s+la?\s*(?:carpeta|directorio|folder)\s+(.+)$/i)?.[1] ??
+      "";
+
+    const candidate = cleanWorkspacePathPhrase(rawCandidate).trim();
+    if (candidate) {
+      return normalizeWorkspaceRelativePath(candidate);
+    }
+
+    const explicitWorkspacePath = rawText.match(/\bworkspace\/([^\s"'`]+)/i)?.[1] ?? "";
+    return normalizeWorkspaceRelativePath(explicitWorkspacePath);
   }
 
   function decodeEscapedInlineText(text: string): string {

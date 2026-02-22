@@ -3,6 +3,8 @@ export type RouterContextListKind = "workspace-list" | "stored-files" | "web-res
 export type RouterContextFilterDecision = {
   allowed: string[];
   reason: string;
+  strict: boolean;
+  exhausted: boolean;
 };
 
 export type RouterContextFilterDeps = {
@@ -21,10 +23,38 @@ function uniqueCandidates(candidates: string[]): string[] {
   return Array.from(new Set(candidates));
 }
 
-function narrowCandidates(base: string[], subset: string[]): string[] {
+function hasMailCue(normalizedText: string): boolean {
+  return /\b(gmail|correo|correos|mail|mails|email|emails|inbox|bandeja)\b/.test(normalizedText);
+}
+
+function hasScheduledMailCue(normalizedText: string): boolean {
+  if (!hasMailCue(normalizedText)) {
+    return false;
+  }
+  const hasScheduleVerb = /\b(programa|programar|agenda|agendar|recorda|recordame|recordarme|recuerda|recuerdame)\b/.test(
+    normalizedText,
+  );
+  const hasTemporalCue =
+    /\b(hoy|manana|esta tarde|esta noche|a las|en \d+\s*(minuto|minutos|hora|horas|dia|dias|semana|semanas))\b/.test(normalizedText) ||
+    /\b\d{1,2}[:.]\d{2}\b/.test(normalizedText) ||
+    /\b\d{1,2}\s*(am|pm)\b/.test(normalizedText);
+  return hasScheduleVerb && hasTemporalCue;
+}
+
+function narrowCandidates(
+  base: string[],
+  subset: string[],
+  options?: { strict?: boolean },
+): { allowed: string[]; exhausted: boolean } {
   const allowedSet = new Set(subset);
   const next = base.filter((candidate) => allowedSet.has(candidate));
-  return next.length > 0 ? next : base;
+  if (next.length > 0) {
+    return { allowed: next, exhausted: false };
+  }
+  if (options?.strict) {
+    return { allowed: [], exhausted: true };
+  }
+  return { allowed: base, exhausted: false };
 }
 
 export function buildIntentRouterContextFilter(
@@ -44,41 +74,49 @@ export function buildIntentRouterContextFilter(
 
   const reasons: string[] = [];
   let allowed = uniqueCandidates(params.candidates);
+  let strict = false;
+  let exhausted = false;
   const now = Date.now();
+  const applyNarrow = (subset: string[], reason: string, options?: { strict?: boolean }) => {
+    const narrowed = narrowCandidates(allowed, subset, options);
+    allowed = narrowed.allowed;
+    reasons.push(reason);
+    if (options?.strict) {
+      strict = true;
+    }
+    if (narrowed.exhausted) {
+      exhausted = true;
+    }
+  };
 
   const pendingDelete = deps.getPendingWorkspaceDelete(params.chatId);
   if (pendingDelete && pendingDelete.expiresAtMs > now) {
     if (/^(si|sí|no|confirmo|confirmar|cancelar|cancela)$/i.test(normalized)) {
-      allowed = narrowCandidates(allowed, ["workspace"]);
-      reasons.push("pending-workspace-delete-confirmation-only");
+      applyNarrow(["workspace"], "pending-workspace-delete-confirmation-only", { strict: true });
     } else {
-      allowed = narrowCandidates(allowed, ["workspace", "document"]);
-      reasons.push("pending-workspace-delete");
+      applyNarrow(["workspace", "document"], "pending-workspace-delete", { strict: true });
     }
   }
   const pendingDeletePath = deps.getPendingWorkspaceDeletePath(params.chatId);
   if (pendingDeletePath && pendingDeletePath.expiresAtMs > now) {
-    allowed = narrowCandidates(allowed, ["workspace"]);
-    reasons.push("pending-workspace-delete-path");
+    applyNarrow(["workspace"], "pending-workspace-delete-path", { strict: true });
   }
 
   const indexedListIntent = deps.parseIndexedListReferenceIntent(params.text);
   const listContext = deps.getIndexedListContext(params.chatId);
+  const scheduledMailCue = hasScheduledMailCue(normalized);
   const ordinalReference =
     /\b(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta|ultimo|ultima|penultimo|penultima|anterior)\b/.test(
       normalized,
-    ) || /\b\d{1,3}\b/.test(normalized);
+    );
   const likelyListReference = indexedListIntent.shouldHandle || ordinalReference;
   if (listContext && likelyListReference) {
     if (listContext.kind === "gmail-list") {
-      allowed = narrowCandidates(allowed, ["gmail", "gmail-recipients"]);
-      reasons.push("indexed-list:gmail");
+      applyNarrow(["gmail", "gmail-recipients"], "indexed-list:gmail", { strict: true });
     } else if (listContext.kind === "web-results") {
-      allowed = narrowCandidates(allowed, ["web"]);
-      reasons.push("indexed-list:web");
+      applyNarrow(["web"], "indexed-list:web", { strict: true });
     } else if (listContext.kind === "workspace-list" || listContext.kind === "stored-files") {
-      allowed = narrowCandidates(allowed, ["workspace", "document"]);
-      reasons.push("indexed-list:workspace");
+      applyNarrow(["workspace", "document"], "indexed-list:workspace", { strict: true });
     }
   }
 
@@ -86,8 +124,7 @@ export function buildIntentRouterContextFilter(
   const followUpPronouns = /\b(ese|esa|eso|este|esta|esto|lo|la|el|ultimo|ultima|anterior)\b/.test(normalized);
   if (isShortFollowUp && followUpPronouns) {
     if (deps.getLastGmailResultsCount(params.chatId) > 0 && !/\b(archivo|carpeta|workspace|pdf|documento)\b/.test(normalized)) {
-      allowed = narrowCandidates(allowed, ["gmail", "gmail-recipients"]);
-      reasons.push("recent-gmail-followup");
+      applyNarrow(["gmail", "gmail-recipients"], "recent-gmail-followup");
     }
     if (
       deps.getLastListedFilesCount(params.chatId) > 0 &&
@@ -95,8 +132,7 @@ export function buildIntentRouterContextFilter(
         normalized,
       )
     ) {
-      allowed = narrowCandidates(allowed, ["workspace", "document"]);
-      reasons.push("recent-workspace-followup");
+      applyNarrow(["workspace", "document"], "recent-workspace-followup");
     }
   }
 
@@ -105,38 +141,40 @@ export function buildIntentRouterContextFilter(
     normalized,
   );
   const explicitLimCue = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
-  const mentionsOtherDomain = /\b(gmail|correo|email|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(
+  const mentionsOtherDomain = /\b(gmail|correo|correos|email|emails|mail|mails|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(
     normalized,
   );
   if (hasRecentConnectorContext && explicitLimCue && connectorControlVerb && !mentionsOtherDomain) {
-    allowed = narrowCandidates(allowed, ["connector"]);
-    reasons.push("recent-connector-context");
+    applyNarrow(["connector"], "recent-connector-context", { strict: true });
   }
 
   if (explicitLimCue && !mentionsOtherDomain) {
-    allowed = narrowCandidates(allowed, ["connector"]);
-    reasons.push("explicit-lim-route");
+    applyNarrow(["connector"], "explicit-lim-route", { strict: true });
   }
 
-  if (/\b(gmail|correo|email|mail|inbox|bandeja)\b/.test(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {
-    allowed = narrowCandidates(allowed, ["gmail", "gmail-recipients"]);
-    reasons.push("explicit-gmail-route");
+  if (hasMailCue(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {
+    if (scheduledMailCue) {
+      applyNarrow(["schedule", "gmail", "gmail-recipients"], "explicit-gmail-schedule-route", { strict: true });
+    } else {
+      applyNarrow(["gmail", "gmail-recipients"], "explicit-gmail-route", { strict: true });
+    }
   }
 
   if (
     /\b(workspace|archivo|carpeta|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized) &&
-    !/\b(gmail|correo|mail|email|lim|web|internet|noticias)\b/.test(normalized)
+    !/\b(gmail|correo|correos|mail|mails|email|emails|lim|web|internet|noticias)\b/.test(normalized)
   ) {
-    allowed = narrowCandidates(allowed, ["workspace", "document"]);
-    reasons.push("explicit-workspace-route");
+    applyNarrow(["workspace", "document"], "explicit-workspace-route", { strict: true });
   }
 
   if (params.hasMailContext && !params.hasMemoryRecallCue) {
-    allowed = narrowCandidates(allowed, ["gmail", "gmail-recipients"]);
-    reasons.push("mail-lexical-cue");
+    if (scheduledMailCue) {
+      applyNarrow(["schedule", "gmail", "gmail-recipients"], "mail-lexical-cue-scheduled");
+    } else {
+      applyNarrow(["gmail", "gmail-recipients"], "mail-lexical-cue");
+    }
   } else if (params.hasMemoryRecallCue) {
-    allowed = narrowCandidates(allowed, ["memory", "stoic-smalltalk"]);
-    reasons.push("memory-recall-cue");
+    applyNarrow(["memory", "stoic-smalltalk"], "memory-recall-cue", { strict: true });
   }
 
   const base = uniqueCandidates(params.candidates);
@@ -147,5 +185,7 @@ export function buildIntentRouterContextFilter(
   return {
     allowed,
     reason: reasons.join(", "),
+    strict,
+    exhausted,
   };
 }

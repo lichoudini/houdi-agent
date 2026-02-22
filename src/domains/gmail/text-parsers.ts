@@ -178,7 +178,9 @@ export function createGmailTextParsers(deps: GmailTextParsersDeps) {
 
   function shouldAvoidLiteralBodyFallback(textNormalized: string): boolean {
     return (
-      /\b(reflexion|estoic|poema|poesia|noticias?|resumen|recordatorios?)\b/.test(textNormalized) &&
+      /\b(reflexion|estoic|poema|poesia|noticias?|nove(?:dad(?:es)?|ades?)|s?ultim[oa]s?|actualidad|titulares?|resumen|recordatorios?)\b/.test(
+        textNormalized,
+      ) &&
       /\b(correo|mail|email|gmail)\b/.test(textNormalized)
     );
   }

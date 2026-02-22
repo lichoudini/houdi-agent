@@ -10,71 +10,145 @@ export type RouteLayerDecision = {
   allowed: string[];
   reason: string;
   layers: string[];
+  strict: boolean;
+  exhausted: boolean;
 };
+
+function hasIndexedListReferenceCue(normalizedText: string): boolean {
+  if (!normalizedText.trim()) {
+    return false;
+  }
+  if (/\b\d{1,2}[:.]\d{2}\b/.test(normalizedText) || /\b\d{1,2}\s*(am|pm)\b/.test(normalizedText)) {
+    return false;
+  }
+  if (
+    /\b(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta|ultimo|ultima|penultimo|penultima|anterior|siguiente)\b/.test(
+      normalizedText,
+    )
+  ) {
+    return true;
+  }
+  if (/\b(item|indice|opcion|resultado|archivo|correo|mensaje|noticia)\s+\d{1,3}\b/.test(normalizedText)) {
+    return true;
+  }
+  if (
+    /\b(abrir|leer|ver|eliminar|borrar|mover|copiar|enviar|mandar)\s+(?:el\s+)?(\d{1,3}|primero|primera|segundo|segunda|tercero|tercera|ultimo|ultima)\b/.test(
+      normalizedText,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function hasMailCue(normalizedText: string): boolean {
+  return /\b(gmail|correo|correos|mail|mails|email|emails|inbox|bandeja)\b/.test(normalizedText);
+}
+
+function hasMailSendCue(normalizedText: string): boolean {
+  if (!hasMailCue(normalizedText)) {
+    return false;
+  }
+  return /\b(envi\w*|mand\w*|redact\w*|escrib\w*|respond\w*)\b/.test(normalizedText);
+}
+
+function hasScheduledMailCue(normalizedText: string): boolean {
+  if (!hasMailCue(normalizedText)) {
+    return false;
+  }
+  const hasScheduleVerb = /\b(programa|programar|agenda|agendar|recorda|recordame|recordarme|recuerda|recuerdame)\b/.test(
+    normalizedText,
+  );
+  const hasTemporalCue =
+    /\b(hoy|manana|esta tarde|esta noche|a las|en \d+\s*(minuto|minutos|hora|horas|dia|dias|semana|semanas))\b/.test(normalizedText) ||
+    /\b\d{1,2}[:.]\d{2}\b/.test(normalizedText) ||
+    /\b\d{1,2}\s*(am|pm)\b/.test(normalizedText);
+  return hasScheduleVerb && hasTemporalCue;
+}
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values));
 }
 
-function narrow(base: string[], subset: string[]): string[] {
+function narrow(
+  base: string[],
+  subset: string[],
+  options?: { strict?: boolean },
+): { allowed: string[]; exhausted: boolean } {
   const allowed = new Set(subset);
   const next = base.filter((item) => allowed.has(item));
-  return next.length > 0 ? next : base;
+  if (next.length > 0) {
+    return { allowed: next, exhausted: false };
+  }
+  if (options?.strict) {
+    return { allowed: [], exhausted: true };
+  }
+  return { allowed: base, exhausted: false };
 }
 
 export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayerContext): RouteLayerDecision | null {
   let allowed = unique(baseCandidates);
   const reasons: string[] = [];
   const layers: string[] = [];
+  let strict = false;
+  let exhausted = false;
+  const listReferenceCue = hasIndexedListReferenceCue(ctx.normalizedText);
+  const scheduledMailCue = hasScheduledMailCue(ctx.normalizedText);
+  const applyNarrow = (subset: string[], reason: string, layer: string, options?: { strict?: boolean }) => {
+    const narrowed = narrow(allowed, subset, options);
+    allowed = narrowed.allowed;
+    reasons.push(reason);
+    layers.push(layer);
+    if (options?.strict) {
+      strict = true;
+    }
+    if (narrowed.exhausted) {
+      exhausted = true;
+    }
+  };
 
   if (ctx.hasPendingWorkspaceDelete) {
-    allowed = narrow(allowed, ["workspace"]);
-    reasons.push("confirmación de borrado pendiente");
-    layers.push("workspace-delete-confirmation");
+    applyNarrow(["workspace"], "confirmación de borrado pendiente", "workspace-delete-confirmation", { strict: true });
   }
 
-  if (ctx.indexedListKind === "gmail-list") {
-    allowed = narrow(allowed, ["gmail", "gmail-recipients"]);
-    reasons.push("contexto de lista Gmail");
-    layers.push("indexed-list-gmail");
-  } else if (ctx.indexedListKind === "workspace-list" || ctx.indexedListKind === "stored-files") {
-    allowed = narrow(allowed, ["workspace", "document"]);
-    reasons.push("contexto de lista workspace");
-    layers.push("indexed-list-workspace");
-  } else if (ctx.indexedListKind === "web-results") {
-    allowed = narrow(allowed, ["web"]);
-    reasons.push("contexto de resultados web");
-    layers.push("indexed-list-web");
+  if (ctx.indexedListKind === "gmail-list" && listReferenceCue) {
+    applyNarrow(["gmail", "gmail-recipients"], "contexto de lista Gmail", "indexed-list-gmail", { strict: true });
+  } else if ((ctx.indexedListKind === "workspace-list" || ctx.indexedListKind === "stored-files") && listReferenceCue) {
+    applyNarrow(["workspace", "document"], "contexto de lista workspace", "indexed-list-workspace", { strict: true });
+  } else if (ctx.indexedListKind === "web-results" && listReferenceCue) {
+    applyNarrow(["web"], "contexto de resultados web", "indexed-list-web", { strict: true });
   }
 
   if (ctx.hasMailContext && !ctx.hasMemoryRecallCue) {
-    allowed = narrow(allowed, ["gmail", "gmail-recipients"]);
-    reasons.push("mail context");
-    layers.push("mail-context");
+    if (scheduledMailCue) {
+      applyNarrow(["schedule", "gmail", "gmail-recipients"], "mail context programado", "mail-context-schedule", {
+        strict: true,
+      });
+    } else {
+      applyNarrow(["gmail", "gmail-recipients"], "mail context", "mail-context", { strict: true });
+    }
   }
 
   if (/\b(recorda|acorda|memoria|memory)\b/.test(ctx.normalizedText)) {
-    allowed = narrow(allowed, ["memory"]);
-    reasons.push("señal fuerte de memoria");
-    layers.push("memory-cue");
+    applyNarrow(["memory"], "señal fuerte de memoria", "memory-cue", { strict: true });
   }
 
   if (/\b(workspace|archivo|carpeta|renombra|mueve|copia|pega|borra)\b/.test(ctx.normalizedText)) {
-    allowed = narrow(allowed, ["workspace", "document"]);
-    reasons.push("señal fuerte de workspace");
-    layers.push("workspace-cue");
+    applyNarrow(["workspace", "document"], "señal fuerte de workspace", "workspace-cue", { strict: true });
   }
 
-  if (/\b(gmail|correo|mail|inbox|bandeja)\b/.test(ctx.normalizedText)) {
-    allowed = narrow(allowed, ["gmail", "gmail-recipients"]);
-    reasons.push("señal fuerte de gmail");
-    layers.push("gmail-cue");
+  if (hasMailCue(ctx.normalizedText)) {
+    if (scheduledMailCue) {
+      applyNarrow(["schedule", "gmail", "gmail-recipients"], "señal fuerte de gmail programado", "gmail-cue-schedule", {
+        strict: true,
+      });
+    } else {
+      applyNarrow(["gmail", "gmail-recipients"], "señal fuerte de gmail", "gmail-cue", { strict: true });
+    }
   }
 
-  if (/\b(web|internet|url|link|reddit|noticias)\b/.test(ctx.normalizedText)) {
-    allowed = narrow(allowed, ["web"]);
-    reasons.push("señal fuerte de web");
-    layers.push("web-cue");
+  if (/\b(web|internet|url|link|reddit|noticias)\b/.test(ctx.normalizedText) && !hasMailSendCue(ctx.normalizedText)) {
+    applyNarrow(["web"], "señal fuerte de web", "web-cue", { strict: true });
   }
 
   if (allowed.length === baseCandidates.length) {
@@ -84,5 +158,7 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
     allowed,
     reason: reasons.join(" + "),
     layers,
+    strict,
+    exhausted,
   };
 }
