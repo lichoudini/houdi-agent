@@ -1,5 +1,8 @@
 # Houdi Agent - Instalación en Otra PC
 
+Versión actual: **0.63b**  
+Autores del repositorio: **Nazareno Tomaselli & Vrand**
+
 Esta guía deja una instalación reproducible para que cualquier persona pueda correr su propia instancia.
 
 ## 1. Requisitos
@@ -39,6 +42,21 @@ TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
 ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build
 ```
 
+Instalación guiada en un comando (wizard paso a paso, sin editar `.env` manualmente):
+
+```bash
+git clone https://github.com/lichoudini/houdi-agent.git && cd houdi-agent && ./scripts/install-houdi-agent.sh
+```
+
+One-command install (bot + WhatsApp bridge):
+
+```bash
+git clone https://github.com/lichoudini/houdi-agent.git && cd houdi-agent && \
+TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
+WHATSAPP_VERIFY_TOKEN="<verify-token>" WHATSAPP_ACCESS_TOKEN="<meta-token>" \
+./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build --with-whatsapp-bridge
+```
+
 Alternativa directa al wizard:
 
 ```bash
@@ -53,6 +71,9 @@ Alias:
 
 Esto genera/actualiza `.env` con todas las variables necesarias.
 El wizard ahora incluye preflight (Node/npm/systemd/proyecto), resumen de riesgos y checklist final con próximos pasos.
+También incluye configuración opcional de bridge WhatsApp (`WHATSAPP_*`) y opción de instalar su servicio `systemd --user`.
+También soporta flags `--with-whatsapp-bridge` y `--with-slack-bridge` para dejar servicios bridge instalados al finalizar.
+Para usuarios no experimentados, este flujo guiado evita editar `.env` de forma manual.
 Si usas `--yes`, toma valores desde:
 1) variables de entorno del proceso, 2) `.env` actual, 3) `.env.example` como fallback.
 Si falta un valor obligatorio, falla con mensaje explícito indicando qué variable definir.
@@ -152,6 +173,33 @@ Capacidades avanzadas habilitadas en el bridge:
 - Reacciones de estado (⏳ mientras procesa, ✅ ok, ❌ error).
 - Fallback a archivo para respuestas largas.
 - Slash command configurable (`SLACK_SLASH_COMMAND`, default `/houdi`).
+
+## 7.2 WhatsApp Cloud API (opcional)
+
+Houdi puede recibir mensajes desde WhatsApp Cloud API por webhook y responder por Graph API (proceso separado).
+
+1. Configurar variables en `.env`:
+   - `WHATSAPP_VERIFY_TOKEN=...`
+   - `WHATSAPP_ACCESS_TOKEN=...`
+   - `WHATSAPP_WEBHOOK_PATH=/webhook/whatsapp` (default)
+   - `WHATSAPP_APP_SECRET=...` (recomendado para validar firma)
+2. Verificar bridge local activo (`HOUDI_LOCAL_API_ENABLED=true`).
+3. Levantar bridge WhatsApp:
+
+```bash
+npm run whatsapp:bridge
+```
+
+Para dejarlo persistente:
+
+```bash
+./scripts/install-systemd-user-whatsapp-bridge.sh
+```
+
+Configurar en Meta Developers:
+- Webhook URL: `https://<tu-dominio>/<WHATSAPP_WEBHOOK_PATH>`
+- Verify token: exactamente igual a `WHATSAPP_VERIFY_TOKEN`
+- Suscripción de eventos de mensajes entrantes
 
 ## 8. Actualización de versión
 

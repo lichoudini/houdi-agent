@@ -53,7 +53,7 @@ const EnvSchema = z.object({
   HOUDI_AGENT_POLICY_FILE: z.string().trim().default("./workspace/state/agent-policy.json"),
   HOUDI_AGENTIC_CANARY_PERCENT: z.coerce.number().int().min(0).max(100).default(100),
   HOUDI_SECURITY_PROFILE: z.string().trim().optional(),
-  HOUDI_AGENT_VERSION: z.string().trim().default("1.1"),
+  HOUDI_AGENT_VERSION: z.string().trim().default("0.63b"),
   HOUDI_SCHEDULE_POLL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
   HOUDI_SELFSKILL_DRAFTS_FILE: z.string().trim().default("./houdi-selfskill-drafts.json"),
   HOUDI_INTERESTS_FILE: z.string().trim().default("./houdi-interests.json"),

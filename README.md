@@ -6,10 +6,14 @@ Repositorio oficial:
 
 - https://github.com/lichoudini/houdi-agent
 
+Versión actual: **0.63b**  
+Autores del repositorio: **Nazareno Tomaselli & Vrand**
+
 ## Posicionamiento y comunicación del proyecto
 
 - Houdi Agent es un proyecto **open source** orientado a operación real: ejecutar, verificar y auditar acciones.
 - Se posiciona como blueprint de agente de implementación rápida (instalador + onboarding).
+- Diferencial operativo: instalación y levantada en un único comando (bot + bridges opcionales).
 - Inspiración de arquitectura: **OpenClaw** + **Aurelio's Semantic Router**.
 - Diferencial: optimización desde el core para interpretar **español operativo** (AR/CL/MX) y casos ambiguos de lenguaje natural.
 - Trabajo recomendado en iteración asistida con **Chat GPT 5.3** para diseño de prompts, pruebas de intención y depuración semántica.
@@ -111,11 +115,32 @@ TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
 ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build
 ```
 
+Instalación guiada en un comando (wizard paso a paso, sin editar `.env` manualmente):
+
+```bash
+git clone https://github.com/lichoudini/houdi-agent.git && cd houdi-agent && ./scripts/install-houdi-agent.sh
+```
+
+Instalación en un comando (bot + WhatsApp bridge):
+
+```bash
+git clone https://github.com/lichoudini/houdi-agent.git && cd houdi-agent && \
+TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
+WHATSAPP_VERIFY_TOKEN="<verify-token>" WHATSAPP_ACCESS_TOKEN="<meta-token>" \
+./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build --with-whatsapp-bridge
+```
+
 Notas de operación del instalador:
 
 - En `--yes`, valida antes de arrancar que existan `TELEGRAM_BOT_TOKEN` y `TELEGRAM_ALLOWED_USER_IDS` (por env o `.env`).
 - Si falla onboarding, el instalador muestra pasos de recuperación accionables.
 - Requiere `Node.js >= 22`.
+- El onboarding ahora incluye configuración opcional de WhatsApp Cloud API (`WHATSAPP_*`).
+- En `service-mode user`, puedes instalar opcionalmente `houdi-slack-bridge.service` y `houdi-whatsapp-bridge.service`.
+- Usuarios no experimentados pueden usar el wizard interactivo para configurar todo sin abrir `.env` directamente.
+- Flags de instalación directa:
+  - `--with-whatsapp-bridge`: instala `houdi-whatsapp-bridge.service` al terminar onboarding.
+  - `--with-slack-bridge`: instala `houdi-slack-bridge.service` al terminar onboarding.
 
 Alias:
 
@@ -310,6 +335,22 @@ cp .env.example .env
 - `SLACK_EVENT_DEDUPE_TTL_MS` (default: `120000`, evita duplicados)
 - `SLACK_SLASH_COMMAND` (default: `houdi`)
 - `SLACK_SLASH_EPHEMERAL` (default: `true`)
+- `WHATSAPP_BRIDGE_HOST` (default: `0.0.0.0`)
+- `WHATSAPP_BRIDGE_PORT` (default: `3390`)
+- `WHATSAPP_WEBHOOK_PATH` (default: `/webhook/whatsapp`)
+- `WHATSAPP_VERIFY_TOKEN` (requerido, token de verificación del webhook)
+- `WHATSAPP_ACCESS_TOKEN` (requerido, token permanente Meta/WhatsApp Cloud API)
+- `WHATSAPP_GRAPH_API_VERSION` (default: `v22.0`)
+- `WHATSAPP_APP_SECRET` (opcional, valida `X-Hub-Signature-256`)
+- `WHATSAPP_BRIDGE_USER_ID` (opcional, fallback: `SLACK_BRIDGE_USER_ID` o primer `TELEGRAM_ALLOWED_USER_IDS`)
+- `WHATSAPP_ALLOWED_FROM` (opcional, CSV de números permitidos, `*` para todos)
+- `WHATSAPP_WEBHOOK_MAX_BYTES` (default: `1000000`)
+- `WHATSAPP_BRIDGE_TIMEOUT_MS` (default: `90000`)
+- `WHATSAPP_BRIDGE_RETRY_COUNT` (default: `2`)
+- `WHATSAPP_BRIDGE_RETRY_DELAY_MS` (default: `500`)
+- `WHATSAPP_REPLY_CHUNK_MAX_CHARS` (default: `1400`)
+- `WHATSAPP_EVENT_DEDUPE_TTL_MS` (default: `120000`)
+- `WHATSAPP_SEND_BRIDGE_ERRORS_TO_USER` (default: `true`)
 - `ADMIN_APPROVAL_TTL_SECONDS` (default: `300`)
 - `AUDIT_LOG_PATH` (default: `./houdi-audit.log`)
 - `ENABLE_REBOOT_COMMAND` (default: `false`)
@@ -342,6 +383,18 @@ Persistir bridge Slack con systemd --user:
 ./scripts/install-systemd-user-slack-bridge.sh
 ```
 
+Bridge WhatsApp (opcional):
+
+```bash
+npm run whatsapp:bridge
+```
+
+Persistir bridge WhatsApp con systemd --user:
+
+```bash
+./scripts/install-systemd-user-whatsapp-bridge.sh
+```
+
 ## Stack tecnológico (librerías clave)
 
 - `grammy`: integración Telegram.
@@ -351,6 +404,7 @@ Persistir bridge Slack con systemd --user:
 - `cheerio`: parsing de contenido web.
 - `pdf-parse`, `mammoth`, `jszip`: lectura de documentos (PDF/Office).
 - `@slack/bolt`: bridge e integración Slack.
+- `Meta Graph API (HTTP)`: bridge de WhatsApp Cloud API (webhook + outbound).
 - `dotenv`, `typescript`, `tsx`: configuración y toolchain de ejecución.
 
 ## Dataset LATAM rapido (intent router)
@@ -422,6 +476,14 @@ Requisitos Slack (Socket Mode, inspirado en flujo OpenClaw):
 Scopes recomendados:
 - Mínimos: `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `chat:write`
 - Avanzados (robustez/capacidades): `commands`, `reactions:write`, `files:write`, `users:read`, `channels:read`, `groups:read`
+
+Requisitos WhatsApp Cloud API:
+1. Crear app en Meta for Developers y habilitar WhatsApp.
+2. Configurar webhook con URL `https://<tu-dominio>/<WHATSAPP_WEBHOOK_PATH>`.
+3. Definir `Verify Token` igual a `WHATSAPP_VERIFY_TOKEN`.
+4. Generar token permanente y guardarlo en `WHATSAPP_ACCESS_TOKEN`.
+5. (Recomendado) Definir `WHATSAPP_APP_SECRET` para validar firma HMAC.
+6. Exponer el puerto del bridge (`WHATSAPP_BRIDGE_PORT`) vía Cloudflare Tunnel/Reverse proxy.
 
 Importante: ejecuta solo **una instancia** del bot a la vez.
 Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de Telegram polling.

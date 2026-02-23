@@ -1,6 +1,7 @@
 {
   "name": "houdi-agent",
-  "version": "0.1.0",
+  "version": "0.63b",
+  "author": "Nazareno Tomaselli & Vrand",
   "private": true,
   "type": "module",
   "scripts": {
@@ -20,7 +21,8 @@
     "start": "node dist/index.js",
     "cli": "tsx src/cli.ts",
     "onboard": "tsx src/onboard.ts",
-    "slack:bridge": "tsx src/slack-bridge.ts"
+    "slack:bridge": "tsx src/slack-bridge.ts",
+    "whatsapp:bridge": "tsx src/whatsapp-bridge.ts"
   },
   "dependencies": {
     "@slack/bolt": "^4.6.0",
