@@ -2,6 +2,37 @@
 
 Proyecto base desde cero para arrancar un asistente de operación de PC por Telegram, con una arquitectura simple que puedas escalar.
 
+Repositorio oficial:
+
+- https://github.com/lichoudini/houdi-agent
+
+## Posicionamiento y comunicación del proyecto
+
+- Houdi Agent es un proyecto **open source** orientado a operación real: ejecutar, verificar y auditar acciones.
+- Se posiciona como blueprint de agente de implementación rápida (instalador + onboarding).
+- Inspiración de arquitectura: **OpenClaw** + **Aurelio's Semantic Router**.
+- Diferencial: optimización desde el core para interpretar **español operativo** (AR/CL/MX) y casos ambiguos de lenguaje natural.
+- Trabajo recomendado en iteración asistida con **Chat GPT 5.3** para diseño de prompts, pruebas de intención y depuración semántica.
+
+## Compatibilidad de entorno
+
+- Linux (incluyendo Ubuntu): compatible.
+- macOS: compatible.
+- Windows: compatible a través de WSL.
+- Recomendación operativa: ejecutar preferentemente en **Docker** para minimizar problemas de compatibilidad por entorno.
+
+## Advertencia de seguridad de despliegue
+
+Houdi Agent puede ejecutar acciones reales (archivos, tareas, shell y servicios según perfil).  
+Por seguridad, se recomienda instalarlo en entornos aislados y controlados: VMs, mini PC dedicadas o equipos segregados del entorno principal.
+
+Buenas prácticas mínimas:
+
+- Evitar instalación en equipos con datos sensibles no relacionados.
+- Aplicar principio de mínimo privilegio en agentes y allowlists.
+- Activar confirmaciones (`/adminmode on`) en entornos compartidos.
+- Revisar logs/auditoría durante las primeras semanas de operación.
+
 ## Documentación
 
 - `docs/PROJECT.md`: visión general del proyecto
@@ -111,6 +142,56 @@ npm run onboard -- --yes --accept-risk --service-mode none
 npm run onboard -- --yes --accept-risk --service-mode user --install-deps --build
 npm run onboard -- --yes --accept-risk --service-mode system --force-system-install
 ```
+
+### Instalación detallada recomendada (paso a paso)
+
+1. Preparar entorno aislado:
+
+- VM / mini PC / host dedicado.
+- Node.js 22+ y npm instalados.
+
+2. Clonar repositorio:
+
+```bash
+git clone https://github.com/lichoudini/houdi-agent.git
+cd houdi-agent
+```
+
+3. Ejecutar instalador guiado:
+
+```bash
+./scripts/install-houdi-agent.sh
+```
+
+4. Completar variables mínimas:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_ALLOWED_USER_IDS`
+
+5. Validar build y estado local:
+
+```bash
+npm run build
+npm run cli -- memory status
+```
+
+6. Levantar runtime:
+
+```bash
+npm run start
+```
+
+7. Prueba funcional rápida en Telegram:
+
+- `/status`
+- crear una tarea
+- ejecutar una acción simple de workspace
+
+8. Endurecimiento inicial recomendado:
+
+- `/adminmode on`
+- revisar perfil de agente activo y allowlist
+- habilitar solo capacidades necesarias
 
 Configuración manual:
 
@@ -260,6 +341,17 @@ Persistir bridge Slack con systemd --user:
 ```bash
 ./scripts/install-systemd-user-slack-bridge.sh
 ```
+
+## Stack tecnológico (librerías clave)
+
+- `grammy`: integración Telegram.
+- `openai`: capacidades de IA (chat/audio/razonamiento operativo).
+- `zod`: validación de contratos y estructura de datos.
+- `googleapis`: integración Gmail.
+- `cheerio`: parsing de contenido web.
+- `pdf-parse`, `mammoth`, `jszip`: lectura de documentos (PDF/Office).
+- `@slack/bolt`: bridge e integración Slack.
+- `dotenv`, `typescript`, `tsx`: configuración y toolchain de ejecución.
 
 ## Dataset LATAM rapido (intent router)
 
