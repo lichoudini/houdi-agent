@@ -7677,6 +7677,21 @@ function purgeExpiredPendingIntentClarifications(): void {
   }
 }
 
+function sanitizeClarificationOriginalText(raw: string): string {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        !/^\[intent_clarification_applied\]$/i.test(line) &&
+        !/^contexto previo:/i.test(line) &&
+        !/^aclaraci[oó]n del usuario:/i.test(line),
+    );
+  const compact = lines.join(" ").replace(/\s+/g, " ").trim();
+  return truncateInline(compact || raw.trim(), 800);
+}
+
 function registerPendingIntentClarification(params: {
   chatId: number;
   userId?: number;
@@ -7696,7 +7711,7 @@ function registerPendingIntentClarification(params: {
     requestedAtMs: now,
     expiresAtMs: now + INTENT_CLARIFICATION_TTL_MS,
     source: params.source,
-    originalText: truncateInline(params.originalText, 3000),
+    originalText: sanitizeClarificationOriginalText(params.originalText),
     question: truncateInline(params.question, 1000),
     routeHints: (params.routeHints ?? []).slice(0, 6),
     ...(params.preferredRoute ? { preferredRoute: params.preferredRoute } : {}),
@@ -7746,6 +7761,7 @@ function shouldTreatAsClarificationReply(params: {
   if (raw.startsWith("/")) {
     return false;
   }
+  const normalizedRaw = normalizeIntentText(raw);
   const replyRef = params.replyReferenceText?.trim() ?? "";
   if (replyRef) {
     const refNormalized = normalizeIntentText(replyRef);
@@ -7757,15 +7773,38 @@ function shouldTreatAsClarificationReply(params: {
       return true;
     }
   }
-  if (raw.length <= 200) {
+
+  if (/^(si|sí|no|ok|dale|listo|cancelar|cancela|confirmar|confirmo|afirmativo|negativo)$/i.test(normalizedRaw)) {
     return true;
   }
-  if (/\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|web|lim|memoria|recordatorio|tarea)\b/i.test(raw)) {
+
+  if (
+    params.pending.preferredRoute &&
+    (normalizedRaw === params.pending.preferredRoute || normalizedRaw.includes(params.pending.preferredRoute))
+  ) {
     return true;
   }
-  if (params.pending.routeHints.some((route) => normalizeIntentText(raw).includes(route))) {
+  if (params.pending.routeHints.some((route) => normalizedRaw === route || normalizedRaw.includes(route))) {
     return true;
   }
+
+  const missing = new Set((params.pending.missing ?? []).map((item) => normalizeIntentText(item)));
+  if (missing.has("taskref") && /\btsk[-_#]?[a-z0-9._-]{2,}\b/i.test(raw)) {
+    return true;
+  }
+  if (missing.has("to") && /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw)) {
+    return true;
+  }
+  if (
+    (missing.has("path") || missing.has("source") || missing.has("target")) &&
+    /(^|[\s"'`])(\.?\/?[a-z0-9._-]+\/)*[a-z0-9._-]+\.[a-z0-9]{1,8}([\s"'`]|$)/i.test(raw)
+  ) {
+    return true;
+  }
+  if (missing.size > 0 && /\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|email|web|lim|memoria|recordatorio|tarea)\b/i.test(raw)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -14749,7 +14788,17 @@ async function maybeHandleNaturalIntentPipeline(params: {
         { strict: hierarchyDecision.strict },
       )
     : { allowed: layerAllowedCandidates, exhausted: false };
-  const hierarchyAllowedCandidates = hierarchyNarrowed.allowed;
+  let effectiveHierarchyDecision = hierarchyDecision;
+  let hierarchyAllowedCandidates = hierarchyNarrowed.allowed;
+  if (
+    hierarchyAllowedCandidates.length === 0 &&
+    layerAllowedCandidates.length > 0 &&
+    routerLayerDecision &&
+    routerLayerDecision.strict
+  ) {
+    hierarchyAllowedCandidates = layerAllowedCandidates;
+    effectiveHierarchyDecision = null;
+  }
   const routeFilterDecision = buildIntentRouterContextFilter({
     chatId: params.ctx.chat.id,
     text: params.text,
@@ -14762,13 +14811,14 @@ async function maybeHandleNaturalIntentPipeline(params: {
     : hierarchyAllowedCandidates;
   const strictNarrowingExhausted =
     (routerLayerDecision?.strict && (routerLayerDecision.exhausted || layerNarrowed.exhausted || layerAllowedCandidates.length === 0)) ||
-    (hierarchyDecision?.strict && (hierarchyDecision.exhausted || hierarchyNarrowed.exhausted || hierarchyAllowedCandidates.length === 0)) ||
+    (effectiveHierarchyDecision?.strict &&
+      (effectiveHierarchyDecision.exhausted || hierarchyNarrowed.exhausted || hierarchyAllowedCandidates.length === 0)) ||
     (routeFilterDecision?.strict && (routeFilterDecision.exhausted || semanticAllowedCandidates.length === 0));
   if (strictNarrowingExhausted || semanticAllowedCandidates.length === 0) {
     const clarificationQuestion = buildRouteNarrowingClarificationQuestion({
       routeFilterDecision,
       routerLayerDecision,
-      hierarchyDecision,
+      hierarchyDecision: effectiveHierarchyDecision,
     });
     const clarificationHints = semanticAllowedCandidates.slice(0, 3);
     registerPendingIntentClarification({
@@ -14795,11 +14845,11 @@ async function maybeHandleNaturalIntentPipeline(params: {
         : routerLayerDecision
           ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
           : {}),
-      ...(hierarchyDecision
+      ...(effectiveHierarchyDecision
         ? {
-            routerHierarchyDomains: hierarchyDecision.domains,
-            routerHierarchyReason: hierarchyDecision.reason,
-            routerHierarchyAllowed: hierarchyDecision.allowed,
+            routerHierarchyDomains: effectiveHierarchyDecision.domains,
+            routerHierarchyReason: effectiveHierarchyDecision.reason,
+            routerHierarchyAllowed: effectiveHierarchyDecision.allowed,
           }
         : {}),
       ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
@@ -14938,11 +14988,11 @@ async function maybeHandleNaturalIntentPipeline(params: {
       ...(routeFilterDecision
         ? { routeFilterReason: routeFilterDecision.reason, routeFilterAllowed: routeFilterDecision.allowed }
         : {}),
-      ...(hierarchyDecision
+      ...(effectiveHierarchyDecision
         ? {
-            routerHierarchyDomains: hierarchyDecision.domains,
-            routerHierarchyReason: hierarchyDecision.reason,
-            routerHierarchyAllowed: hierarchyDecision.allowed,
+            routerHierarchyDomains: effectiveHierarchyDecision.domains,
+            routerHierarchyReason: effectiveHierarchyDecision.reason,
+            routerHierarchyAllowed: effectiveHierarchyDecision.allowed,
           }
         : {}),
       ...(semanticRouteDecision
@@ -15043,11 +15093,11 @@ async function maybeHandleNaturalIntentPipeline(params: {
             : routerLayerDecision
               ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
               : {}),
-          ...(hierarchyDecision
+          ...(effectiveHierarchyDecision
             ? {
-                routerHierarchyDomains: hierarchyDecision.domains,
-                routerHierarchyReason: hierarchyDecision.reason,
-                routerHierarchyAllowed: hierarchyDecision.allowed,
+                routerHierarchyDomains: effectiveHierarchyDecision.domains,
+                routerHierarchyReason: effectiveHierarchyDecision.reason,
+                routerHierarchyAllowed: effectiveHierarchyDecision.allowed,
               }
             : {}),
           ...(semanticRouteDecision
@@ -15111,11 +15161,11 @@ async function maybeHandleNaturalIntentPipeline(params: {
           : routerLayerDecision
             ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
             : {}),
-        ...(hierarchyDecision
+        ...(effectiveHierarchyDecision
           ? {
-              routerHierarchyDomains: hierarchyDecision.domains,
-              routerHierarchyReason: hierarchyDecision.reason,
-              routerHierarchyAllowed: hierarchyDecision.allowed,
+              routerHierarchyDomains: effectiveHierarchyDecision.domains,
+              routerHierarchyReason: effectiveHierarchyDecision.reason,
+              routerHierarchyAllowed: effectiveHierarchyDecision.allowed,
             }
           : {}),
         ...(semanticRouteDecision
@@ -15187,7 +15237,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
           memoryRecallCue: hasMemoryRecallCue,
           routeCandidates,
           routeFilterReason: routeFilterDecision?.reason ?? routerLayerDecision?.reason ?? null,
-          routeHierarchyReason: hierarchyDecision?.reason ?? null,
+          routeHierarchyReason: effectiveHierarchyDecision?.reason ?? null,
           routeFilterAllowed: routeFilterDecision?.allowed ?? null,
           routeLayers: routerLayerDecision?.layers ?? null,
           semanticRouterSelected: semanticRouteDecision?.handler ?? null,
@@ -15218,11 +15268,11 @@ async function maybeHandleNaturalIntentPipeline(params: {
           : routerLayerDecision
             ? { routeFilterReason: routerLayerDecision.reason, routeFilterAllowed: routerLayerDecision.allowed }
             : {}),
-        ...(hierarchyDecision
+        ...(effectiveHierarchyDecision
           ? {
-              routerHierarchyDomains: hierarchyDecision.domains,
-              routerHierarchyReason: hierarchyDecision.reason,
-              routerHierarchyAllowed: hierarchyDecision.allowed,
+              routerHierarchyDomains: effectiveHierarchyDecision.domains,
+              routerHierarchyReason: effectiveHierarchyDecision.reason,
+              routerHierarchyAllowed: effectiveHierarchyDecision.allowed,
             }
           : {}),
         ...(semanticRouteDecision

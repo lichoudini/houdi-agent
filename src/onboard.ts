@@ -587,7 +587,7 @@ async function main(): Promise<void> {
         "  npm run onboard -- --yes --accept-risk --service-mode user --install-deps --build",
         "",
         "Qué hace:",
-        "- Configura .env paso a paso (Telegram, OpenAI, Gmail, workspace, bridge local).",
+        "- Configura .env paso a paso (Telegram, OpenAI, Gmail, workspace, bridge local y WhatsApp bridge).",
         "- Configura integración externa opcional (LIM).",
         "- Opcionalmente ejecuta npm install, npm run build e instala servicio systemd.",
         "",
@@ -630,6 +630,7 @@ async function main(): Promise<void> {
   process.stdout.write("- TELEGRAM_ALLOWED_USER_IDS (tu user id o lista CSV)\n");
   process.stdout.write("- OPENAI_API_KEY (opcional)\n");
   process.stdout.write("- Credenciales Gmail OAuth (solo si lo vas a usar)\n\n");
+  process.stdout.write("- Credenciales Meta WhatsApp Cloud API (opcional)\n\n");
 
   let rlClosed = false;
   const closeReadline = (): void => {
@@ -754,6 +755,22 @@ async function main(): Promise<void> {
       "HOUDI_LOCAL_API_HOST",
       "HOUDI_LOCAL_API_PORT",
       "HOUDI_LOCAL_API_TOKEN",
+      "WHATSAPP_BRIDGE_HOST",
+      "WHATSAPP_BRIDGE_PORT",
+      "WHATSAPP_WEBHOOK_PATH",
+      "WHATSAPP_VERIFY_TOKEN",
+      "WHATSAPP_ACCESS_TOKEN",
+      "WHATSAPP_GRAPH_API_VERSION",
+      "WHATSAPP_APP_SECRET",
+      "WHATSAPP_BRIDGE_USER_ID",
+      "WHATSAPP_ALLOWED_FROM",
+      "WHATSAPP_WEBHOOK_MAX_BYTES",
+      "WHATSAPP_BRIDGE_TIMEOUT_MS",
+      "WHATSAPP_BRIDGE_RETRY_COUNT",
+      "WHATSAPP_BRIDGE_RETRY_DELAY_MS",
+      "WHATSAPP_REPLY_CHUNK_MAX_CHARS",
+      "WHATSAPP_EVENT_DEDUPE_TTL_MS",
+      "WHATSAPP_SEND_BRIDGE_ERRORS_TO_USER",
       "ENABLE_LIM_CONTROL",
       "LIM_APP_DIR",
       "LIM_APP_SERVICE",
@@ -908,7 +925,70 @@ async function main(): Promise<void> {
       envMap.set("HOUDI_LOCAL_API_TOKEN", localApiToken);
     }
 
-    printHeading("\nPaso 6/7 - Integración externa opcional");
+    printHeading("\nPaso 6/8 - Bridge WhatsApp (opcional)");
+    process.stdout.write("Permite recibir mensajes por webhook de WhatsApp Cloud API y responder vía bridge local.\n\n");
+    const hasWhatsAppConfigured = Boolean((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim());
+    const configureWhatsApp = await resolveYesNo("Configurar bridge WhatsApp", hasWhatsAppConfigured);
+    if (configureWhatsApp) {
+      const whatsappVerifyToken = await resolveLine("WHATSAPP_VERIFY_TOKEN", {
+        defaultValue: envMap.get("WHATSAPP_VERIFY_TOKEN") || "",
+        required: true,
+        displayDefault: false,
+      }, "WHATSAPP_VERIFY_TOKEN");
+      const whatsappAccessToken = await resolveLine("WHATSAPP_ACCESS_TOKEN", {
+        defaultValue: envMap.get("WHATSAPP_ACCESS_TOKEN") || "",
+        required: true,
+        displayDefault: false,
+      }, "WHATSAPP_ACCESS_TOKEN");
+      const whatsappAppSecret = await resolveLine("WHATSAPP_APP_SECRET (opcional, recomendado para firma)", {
+        defaultValue: envMap.get("WHATSAPP_APP_SECRET") || "",
+        displayDefault: false,
+      }, "WHATSAPP_APP_SECRET");
+      const whatsappBridgeHost = await resolveLine("WHATSAPP_BRIDGE_HOST", {
+        defaultValue: envMap.get("WHATSAPP_BRIDGE_HOST") || "0.0.0.0",
+        required: true,
+      }, "WHATSAPP_BRIDGE_HOST");
+      const whatsappBridgePort = await resolveLine("WHATSAPP_BRIDGE_PORT", {
+        defaultValue: envMap.get("WHATSAPP_BRIDGE_PORT") || "3390",
+        required: true,
+        validate: (value) => {
+          if (!/^\d+$/.test(value)) {
+            return "Debe ser número entero.";
+          }
+          const parsed = Number.parseInt(value, 10);
+          if (parsed < 1 || parsed > 65535) {
+            return "Puerto fuera de rango (1-65535).";
+          }
+          return null;
+        },
+      }, "WHATSAPP_BRIDGE_PORT");
+      const whatsappWebhookPath = await resolveLine("WHATSAPP_WEBHOOK_PATH", {
+        defaultValue: envMap.get("WHATSAPP_WEBHOOK_PATH") || "/webhook/whatsapp",
+        required: true,
+      }, "WHATSAPP_WEBHOOK_PATH");
+      const whatsappAllowedFrom = await resolveLine("WHATSAPP_ALLOWED_FROM (csv opcional, * para todos)", {
+        defaultValue: envMap.get("WHATSAPP_ALLOWED_FROM") || "",
+      }, "WHATSAPP_ALLOWED_FROM");
+      const whatsappBridgeUserId = await resolveLine("WHATSAPP_BRIDGE_USER_ID (opcional)", {
+        defaultValue: envMap.get("WHATSAPP_BRIDGE_USER_ID") || "",
+      }, "WHATSAPP_BRIDGE_USER_ID");
+      const whatsappApiVersion = await resolveLine("WHATSAPP_GRAPH_API_VERSION", {
+        defaultValue: envMap.get("WHATSAPP_GRAPH_API_VERSION") || "v22.0",
+        required: true,
+      }, "WHATSAPP_GRAPH_API_VERSION");
+
+      envMap.set("WHATSAPP_VERIFY_TOKEN", whatsappVerifyToken);
+      envMap.set("WHATSAPP_ACCESS_TOKEN", whatsappAccessToken);
+      envMap.set("WHATSAPP_APP_SECRET", whatsappAppSecret);
+      envMap.set("WHATSAPP_BRIDGE_HOST", whatsappBridgeHost);
+      envMap.set("WHATSAPP_BRIDGE_PORT", whatsappBridgePort);
+      envMap.set("WHATSAPP_WEBHOOK_PATH", whatsappWebhookPath);
+      envMap.set("WHATSAPP_ALLOWED_FROM", whatsappAllowedFrom);
+      envMap.set("WHATSAPP_BRIDGE_USER_ID", whatsappBridgeUserId);
+      envMap.set("WHATSAPP_GRAPH_API_VERSION", whatsappApiVersion);
+    }
+
+    printHeading("\nPaso 7/8 - Integración externa opcional");
     const enableLim = await resolveYesNo(
       "Habilitar control de LIM externo",
       (envMap.get("ENABLE_LIM_CONTROL") || "false").toLowerCase() === "true",
@@ -945,7 +1025,7 @@ async function main(): Promise<void> {
       envMap.set("LIM_PUBLIC_HEALTH_URL", limPublicHealth);
     }
 
-    printHeading("\nPaso 7/7 - Confirmación");
+    printHeading("\nPaso 8/8 - Confirmación");
     process.stdout.write(
       [
         `- Workspace: ${envMap.get("HOUDI_WORKSPACE_DIR")}`,
@@ -954,6 +1034,7 @@ async function main(): Promise<void> {
         `- OpenAI key: ${maskSecret(envMap.get("OPENAI_API_KEY") || "")}`,
         `- Gmail: ${envMap.get("ENABLE_GMAIL_ACCOUNT") === "true" ? "on" : "off"}`,
         `- Bridge local: ${envMap.get("HOUDI_LOCAL_API_ENABLED") === "true" ? "on" : "off"}`,
+        `- Bridge WhatsApp: ${((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim()) ? "configurado" : "off"}`,
         `- LIM externo: ${envMap.get("ENABLE_LIM_CONTROL") === "true" ? "on" : "off"}`,
         "",
       ].join("\n"),
@@ -1015,8 +1096,28 @@ async function main(): Promise<void> {
     );
     const serviceModeDefault = runtimeOptions.serviceMode ?? "none";
     const serviceMode = await resolveChoice("Instalación de servicio", ["none", "user", "system"], serviceModeDefault);
+    let installedSlackBridgeService = false;
+    let installedWhatsAppBridgeService = false;
     if (serviceMode === "user") {
       await runCommand("bash", ["./scripts/install-systemd-user-service.sh"], PROJECT_DIR);
+      const hasSlackTokens = Boolean((envMap.get("SLACK_BOT_TOKEN") || "").trim() && (envMap.get("SLACK_APP_TOKEN") || "").trim());
+      const installSlackBridge = await resolveYesNo(
+        "¿Instalar servicio Slack bridge (systemd --user)?",
+        hasSlackTokens,
+      );
+      if (installSlackBridge) {
+        await runCommand("bash", ["./scripts/install-systemd-user-slack-bridge.sh"], PROJECT_DIR);
+        installedSlackBridgeService = true;
+      }
+      const hasWhatsAppTokens = Boolean((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim());
+      const installWhatsAppBridge = await resolveYesNo(
+        "¿Instalar servicio WhatsApp bridge (systemd --user)?",
+        hasWhatsAppTokens,
+      );
+      if (installWhatsAppBridge) {
+        await runCommand("bash", ["./scripts/install-systemd-user-whatsapp-bridge.sh"], PROJECT_DIR);
+        installedWhatsAppBridgeService = true;
+      }
     } else if (serviceMode === "system") {
       const confirmSystem = runtimeOptions.forceSystemInstall
         ? true
@@ -1042,6 +1143,12 @@ async function main(): Promise<void> {
       nextSteps.push("1) Inicia el bot manualmente: npm start");
     } else if (serviceMode === "user") {
       nextSteps.push("1) Verifica servicio user: systemctl --user status houdi-agent.service --no-pager");
+      if (installedSlackBridgeService) {
+        nextSteps.push("2) Verifica Slack bridge: systemctl --user status houdi-slack-bridge.service --no-pager");
+      }
+      if (installedWhatsAppBridgeService) {
+        nextSteps.push("3) Verifica WhatsApp bridge: systemctl --user status houdi-whatsapp-bridge.service --no-pager");
+      }
     } else {
       nextSteps.push("1) Verifica servicio system: systemctl status houdi-agent.service --no-pager");
       nextSteps.push("2) Logs del servicio: sudo journalctl -u houdi-agent.service -f");

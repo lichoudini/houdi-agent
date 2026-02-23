@@ -14,8 +14,12 @@
   - Comandos de memoria (`memory status/search/view`, `remember`)
 - `src/onboard.ts`
   - Wizard interactivo de instalación (`npm run onboard`)
-  - Setup guiado de `.env` (Telegram, Gmail, workspace, bridge local y conector externo opcional)
+  - Setup guiado de `.env` (Telegram, Gmail, workspace, bridge local, WhatsApp bridge y conector externo opcional)
   - Opcionalmente instala dependencias/build y servicio systemd
+- `src/whatsapp-bridge.ts`
+  - Bridge de WhatsApp Cloud API (webhook verify + inbound + outbound)
+  - Forward al pipeline principal vía `POST /internal/cli/message`
+  - Dedupe de eventos y validación opcional de firma HMAC (`X-Hub-Signature-256`)
 - `src/config.ts`
   - Carga y validación de `.env`
 - `src/agents.ts`
@@ -102,7 +106,7 @@
   - Snapshot/restore de estado runtime crítico por chat y global (modos, modelo, acciones pendientes)
 
 ## Flujo de ejecución
-1. Mensaje llega por Telegram.
+1. Mensaje llega por Telegram/Slack/WhatsApp (según canal activo).
 2. Se valida `userId` autorizado.
 3. Según comando:
    - consulta IA

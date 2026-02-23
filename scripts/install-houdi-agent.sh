@@ -45,11 +45,14 @@ Houdi Agent Installer
 Uso:
   ./scripts/install-houdi-agent.sh
   ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build
+  ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build --with-whatsapp-bridge
   ./scripts/install-houdi-agent.sh --help
 
 Qué hace:
   - Ejecuta el wizard de onboarding.
   - Ayuda a configurar .env, dependencias, build y servicio (opcional).
+  - Incluye opciones de bridge Slack/WhatsApp durante el onboarding.
+  - Permite instalar bridges automáticamente con flags (one-command install).
 
 Tips:
   - Interactivo recomendado para primera instalación.
@@ -57,6 +60,10 @@ Tips:
 
 Ayuda avanzada del wizard:
   npm run onboard -- --help
+
+Flags extra del instalador:
+  --with-whatsapp-bridge  Instala houdi-whatsapp-bridge.service al terminar
+  --with-slack-bridge     Instala houdi-slack-bridge.service al terminar
 EOF
 }
 
@@ -98,12 +105,39 @@ if [[ "$non_interactive" == "true" ]]; then
   log "Variables mínimas presentes para ejecución no interactiva."
 fi
 
+with_slack_bridge=false
+with_whatsapp_bridge=false
+if has_flag "--with-slack-bridge" "$@"; then
+  with_slack_bridge=true
+fi
+if has_flag "--with-whatsapp-bridge" "$@"; then
+  with_whatsapp_bridge=true
+fi
+
+if [[ "$with_slack_bridge" == "true" && "$non_interactive" == "true" ]]; then
+  slack_bot_token="$(resolve_setting "SLACK_BOT_TOKEN")"
+  slack_app_token="$(resolve_setting "SLACK_APP_TOKEN")"
+  [[ -n "$slack_bot_token" ]] || fail "Con --with-slack-bridge falta SLACK_BOT_TOKEN (env o .env)."
+  [[ -n "$slack_app_token" ]] || fail "Con --with-slack-bridge falta SLACK_APP_TOKEN (env o .env)."
+fi
+
+if [[ "$with_whatsapp_bridge" == "true" && "$non_interactive" == "true" ]]; then
+  whatsapp_verify_token="$(resolve_setting "WHATSAPP_VERIFY_TOKEN")"
+  whatsapp_access_token="$(resolve_setting "WHATSAPP_ACCESS_TOKEN")"
+  [[ -n "$whatsapp_verify_token" ]] || fail "Con --with-whatsapp-bridge falta WHATSAPP_VERIFY_TOKEN (env o .env)."
+  [[ -n "$whatsapp_access_token" ]] || fail "Con --with-whatsapp-bridge falta WHATSAPP_ACCESS_TOKEN (env o .env)."
+fi
+
 echo "Flujo recomendado (interactivo):"
 echo "  ./scripts/install-houdi-agent.sh"
 echo
 echo "Flujo automatizado (sin preguntas):"
 echo "  TELEGRAM_BOT_TOKEN=... TELEGRAM_ALLOWED_USER_IDS=123456 \\"
 echo "  ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build"
+echo
+echo "Flujo one-command (bot + bridge WhatsApp):"
+echo "  TELEGRAM_BOT_TOKEN=... TELEGRAM_ALLOWED_USER_IDS=123456 WHATSAPP_VERIFY_TOKEN=... WHATSAPP_ACCESS_TOKEN=... \\"
+echo "  ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build --with-whatsapp-bridge"
 echo
 
 log "Lanzando wizard de onboarding..."
@@ -117,9 +151,25 @@ if ! "${NPM_BIN}" run onboard -- "$@"; then
   exit 1
 fi
 
+if [[ "$with_slack_bridge" == "true" ]]; then
+  log "Instalando servicio Slack bridge..."
+  bash "./scripts/install-systemd-user-slack-bridge.sh"
+fi
+
+if [[ "$with_whatsapp_bridge" == "true" ]]; then
+  log "Instalando servicio WhatsApp bridge..."
+  bash "./scripts/install-systemd-user-whatsapp-bridge.sh"
+fi
+
 echo
 log "Instalación completada."
 echo "Próximos pasos recomendados:"
 echo "  1) Ver estado de memoria/contexto: npm run cli -- memory status"
 echo "  2) Iniciar servicio (si aplica): systemctl --user status houdi-agent.service --no-pager"
 echo "  3) Probar en Telegram con /status"
+if [[ "$with_slack_bridge" == "true" ]]; then
+  echo "  4) Verificar Slack bridge: systemctl --user status houdi-slack-bridge.service --no-pager"
+fi
+if [[ "$with_whatsapp_bridge" == "true" ]]; then
+  echo "  5) Verificar WhatsApp bridge: systemctl --user status houdi-whatsapp-bridge.service --no-pager"
+fi

@@ -890,7 +890,6 @@ Formatos soportados:
 
 - PDF: `.pdf` (via `pdf-parse`)
 - Word: `.docx` (via `mammoth`)
-- Hojas de cálculo: `.xls`, `.xlsx`, `.ods` (via `xlsx`)
 - Presentaciones: `.pptx`, `.odp` (extracción XML)
 - Texto OpenDocument: `.odt`
 - Rich text: `.rtf`
