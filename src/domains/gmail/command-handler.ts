@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { relative, resolve as resolvePath } from "node:path";
 import {
   isGmailRecipientsSubcommand,
@@ -193,12 +194,34 @@ function normalizeAttachmentInputs(rawPaths: string[]): { path: string }[] {
   }
   const workspaceRoot = process.cwd();
   return rawPaths.map((rawPath) => {
-    const absolute = resolvePath(rawPath);
-    const rel = relative(workspaceRoot, absolute);
-    if (rel.startsWith("..")) {
-      throw new Error(`Adjunto fuera del workspace permitido: ${rawPath}`);
+    const normalized = rawPath.trim();
+    if (!normalized) {
+      throw new Error("Ruta de adjunto vacia.");
     }
-    return { path: absolute };
+
+    const candidates: string[] = [resolvePath(normalized)];
+    if (normalized.startsWith("/")) {
+      candidates.push(resolvePath(workspaceRoot, normalized.slice(1)));
+    }
+
+    const inWorkspace = candidates.filter((candidate) => {
+      const rel = relative(workspaceRoot, candidate);
+      return rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+    });
+    if (inWorkspace.length === 0) {
+      throw new Error(
+        `Adjunto fuera del workspace permitido: ${rawPath}. Usa una ruta dentro de ${workspaceRoot}/workspace`,
+      );
+    }
+
+    const existing = inWorkspace.find((candidate) => existsSync(candidate));
+    if (!existing) {
+      throw new Error(
+        `Adjunto no encontrado: ${rawPath}. Verifica ruta (ej: workspace/pino.txt o ./workspace/pino.txt).`,
+      );
+    }
+
+    return { path: existing };
   });
 }
 

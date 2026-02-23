@@ -1309,6 +1309,91 @@ function truncateInline(text: string, maxChars: number): string {
   return `${text.slice(0, usable)}${marker}`;
 }
 
+const TOUCH_LINK_BASE = "https://copy.vrand.ai";
+
+type TouchTokenKind = "approval" | "plan" | "gmail-message" | "gmail-thread" | "gmail-draft" | "run" | "file";
+
+function buildTouchLink(kind: TouchTokenKind, value: string): string {
+  return `${TOUCH_LINK_BASE}/${kind}/${encodeURIComponent(value)}`;
+}
+
+function collectTouchTokensFromLine(line: string): Array<{ kind: TouchTokenKind; value: string }> {
+  const tokens: Array<{ kind: TouchTokenKind; value: string }> = [];
+  const seen = new Set<string>();
+  const push = (kind: TouchTokenKind, value: string) => {
+    const normalized = value.trim();
+    if (!normalized) {
+      return;
+    }
+    const key = `${kind}:${normalized}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    tokens.push({ kind, value: normalized });
+  };
+
+  const labeledRegex = /\b(plan[_-]?id|approval[_-]?id|messageid|threadid|draftid|run[_-]?id)\s*[:=]\s*([A-Za-z0-9._-]+)/gi;
+  let labeledMatch: RegExpExecArray | null;
+  while ((labeledMatch = labeledRegex.exec(line)) !== null) {
+    const rawLabel = labeledMatch[1]?.toLowerCase() ?? "";
+    const value = labeledMatch[2] ?? "";
+    if (!value) {
+      continue;
+    }
+    if (rawLabel.includes("approval")) {
+      push("approval", value);
+    } else if (rawLabel.includes("plan")) {
+      push("plan", value);
+    } else if (rawLabel.includes("thread")) {
+      push("gmail-thread", value);
+    } else if (rawLabel.includes("draft")) {
+      push("gmail-draft", value);
+    } else if (rawLabel.includes("message")) {
+      push("gmail-message", value);
+    } else if (rawLabel.includes("run")) {
+      push("run", value);
+    }
+  }
+
+  const approvalTextRegex = /\bAprobaci[oó]n\s+([0-9]{3,})\b/gi;
+  let approvalTextMatch: RegExpExecArray | null;
+  while ((approvalTextMatch = approvalTextRegex.exec(line)) !== null) {
+    push("approval", approvalTextMatch[1] ?? "");
+  }
+
+  const planTextRegex = /\bPlan\s+([0-9]{3,})\b/gi;
+  let planTextMatch: RegExpExecArray | null;
+  while ((planTextMatch = planTextRegex.exec(line)) !== null) {
+    push("plan", planTextMatch[1] ?? "");
+  }
+
+  const fileRegex = /(?:^|[\s(])((?:workspace|files|images)\/[A-Za-z0-9._\-\/]+)/g;
+  let fileMatch: RegExpExecArray | null;
+  while ((fileMatch = fileRegex.exec(line)) !== null) {
+    push("file", fileMatch[1] ?? "");
+  }
+
+  return tokens;
+}
+
+function makeTouchFriendlyText(text: string): string {
+  if (!text.trim() || text.includes(`${TOUCH_LINK_BASE}/`)) {
+    return text;
+  }
+  return text
+    .split("\n")
+    .map((line) => {
+      const tokens = collectTouchTokensFromLine(line);
+      if (tokens.length === 0) {
+        return line;
+      }
+      const links = tokens.map((token) => `link: ${buildTouchLink(token.kind, token.value)}`).join(" ");
+      return `${line} ${links}`;
+    })
+    .join("\n");
+}
+
 function rememberIndexedListContext(params: {
   chatId: number;
   kind: IndexedListKind;
@@ -7293,8 +7378,9 @@ async function reliableReply(
     allowOutbox?: boolean;
   },
 ): Promise<void> {
+  const formattedText = makeTouchFriendlyText(text);
   try {
-    await ctx.reply(text);
+    await ctx.reply(formattedText);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const allowOutbox = options?.allowOutbox ?? true;
@@ -7303,7 +7389,7 @@ async function reliableReply(
         const failedAttempt = 1;
         sqliteState.enqueueOutboxMessage({
           chatId: ctx.chat.id,
-          text,
+          text: formattedText,
           source: options?.source ?? "reply",
           createdAtMs: Date.now(),
           attempts: failedAttempt,
@@ -8959,6 +9045,18 @@ startRuntimeStatePersistenceWorker();
 const bot = new Bot(config.telegramBotToken);
 let scheduleDeliveryLoopRunning = false;
 let spontaneousSuggestionLoopRunning = false;
+
+bot.use(async (ctx, next) => {
+  const originalReply = ctx.reply.bind(ctx);
+  ctx.reply = (async (...args: Parameters<typeof ctx.reply>) => {
+    const [text, ...rest] = args;
+    if (typeof text === "string") {
+      return originalReply(makeTouchFriendlyText(text), ...(rest as []));
+    }
+    return originalReply(...args);
+  }) as typeof ctx.reply;
+  await next();
+});
 
 function parseScheduledEmailPayload(raw?: string): { to?: string; instruction?: string } | null {
   if (!raw || !raw.trim()) {

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import dotenv from "dotenv";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import process from "node:process";
 import { App } from "@slack/bolt";
 
@@ -29,6 +31,16 @@ type SlackMessageEvent = {
   channel_type?: string;
   ts?: string;
   thread_ts?: string;
+  files?: SlackMessageFile[];
+};
+
+type SlackMessageFile = {
+  id?: string;
+  name?: string;
+  mimetype?: string;
+  filetype?: string;
+  size?: number;
+  url_private_download?: string;
 };
 
 type SlackBridgeConfig = {
@@ -50,6 +62,19 @@ type SlackBridgeConfig = {
   slashEphemeral: boolean;
   allowedSlackUsers: Set<string>;
   allowedSlackChannels: Set<string>;
+  maxAttachmentBytes: number;
+};
+
+type SavedSlackAttachment = {
+  relPath: string;
+  mimeType: string;
+  size: number;
+  kind: "image" | "file";
+};
+
+type ThreadAttachmentContext = {
+  saved: SavedSlackAttachment[];
+  updatedAt: number;
 };
 
 function readRequiredEnv(name: string): string {
@@ -88,6 +113,14 @@ function parseNumericEnv(name: string, defaultValue: number): number {
     throw new Error(`Valor inválido en ${name}: ${raw}`);
   }
   return parsed;
+}
+
+function parseNumericEnvWithRange(name: string, defaultValue: number, minValue: number, maxValue: number): number {
+  const value = parseNumericEnv(name, defaultValue);
+  if (value < minValue || value > maxValue) {
+    throw new Error(`Valor fuera de rango en ${name}: ${value}`);
+  }
+  return value;
 }
 
 function parseCsvSet(raw: string | undefined): Set<string> {
@@ -196,6 +229,42 @@ function splitSlackChunks(text: string, maxChars: number): string[] {
     chunks.push(cursor);
   }
   return chunks;
+}
+
+function sanitizeFileName(raw: string): string {
+  const base = path.basename(raw || "archivo");
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/^_+/, "");
+  return cleaned || "archivo";
+}
+
+function inferFileExtension(fileName: string, mimeType: string): string {
+  const ext = path.extname(fileName).trim().toLowerCase();
+  if (ext) {
+    return ext;
+  }
+  if (mimeType === "image/jpeg") return ".jpg";
+  if (mimeType === "image/png") return ".png";
+  if (mimeType === "image/webp") return ".webp";
+  if (mimeType === "application/pdf") return ".pdf";
+  if (mimeType === "text/plain") return ".txt";
+  return "";
+}
+
+function isImageMimeType(mimeType: string): boolean {
+  return mimeType.toLowerCase().startsWith("image/");
+}
+
+function makeAttachmentPath(kind: "image" | "file", originalName: string, mimeType: string): { fullPath: string; relPath: string } {
+  const rootDir = path.join(process.cwd(), "workspace", kind === "image" ? "images" : "files");
+  const safeName = sanitizeFileName(originalName || "archivo");
+  const ext = inferFileExtension(safeName, mimeType);
+  const base = ext ? safeName.slice(0, Math.max(1, safeName.length - ext.length)) : safeName;
+  const stamp = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 8);
+  const finalName = `${stamp}-${rand}-${base}${ext}`;
+  const fullPath = path.join(rootDir, finalName);
+  const relPath = path.relative(process.cwd(), fullPath).replace(/\\/g, "/");
+  return { fullPath, relPath };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -338,7 +407,97 @@ function buildConfig(): SlackBridgeConfig {
     slashEphemeral: parseBooleanEnv("SLACK_SLASH_EPHEMERAL", true),
     allowedSlackUsers: parseCsvSet(process.env.SLACK_ALLOWED_USER_IDS),
     allowedSlackChannels: parseCsvSet(process.env.SLACK_ALLOWED_CHANNEL_IDS),
+    maxAttachmentBytes: parseNumericEnvWithRange("SLACK_MAX_ATTACHMENT_BYTES", 25 * 1024 * 1024, 1024, 200 * 1024 * 1024),
   };
+}
+
+async function resolveSlackFileDownloadUrl(app: App, file: SlackMessageFile): Promise<string> {
+  if (file.url_private_download?.trim()) {
+    return file.url_private_download.trim();
+  }
+  const fileId = file.id?.trim();
+  if (!fileId) {
+    throw new Error("Archivo Slack sin id/url_private_download");
+  }
+  const info = await app.client.files.info({ file: fileId });
+  const enriched = info.file as { url_private_download?: string } | undefined;
+  const url = enriched?.url_private_download?.trim();
+  if (!url) {
+    throw new Error(`No pude resolver URL de descarga para file=${fileId}`);
+  }
+  return url;
+}
+
+async function downloadSlackAttachment(app: App, token: string, file: SlackMessageFile, maxBytes: number): Promise<SavedSlackAttachment> {
+  const mimeType = (file.mimetype || "application/octet-stream").trim().toLowerCase();
+  const kind: "image" | "file" = isImageMimeType(mimeType) ? "image" : "file";
+  const downloadUrl = await resolveSlackFileDownloadUrl(app, file);
+  const response = await fetch(downloadUrl, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new Error(`No pude descargar adjunto (${response.status})`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length <= 0) {
+    throw new Error("Adjunto vacío");
+  }
+  if (buffer.length > maxBytes) {
+    throw new Error(`Adjunto supera límite (${buffer.length} bytes > ${maxBytes})`);
+  }
+
+  const fileName = file.name?.trim() || `slack-file-${Date.now()}`;
+  const { fullPath, relPath } = makeAttachmentPath(kind, fileName, mimeType);
+  await mkdir(path.dirname(fullPath), { recursive: true });
+  await writeFile(fullPath, buffer);
+  return { relPath, mimeType, size: buffer.length, kind };
+}
+
+async function materializeSlackAttachments(
+  app: App,
+  token: string,
+  files: SlackMessageFile[],
+  maxBytes: number,
+): Promise<SavedSlackAttachment[]> {
+  const saved: SavedSlackAttachment[] = [];
+  for (const file of files) {
+    try {
+      const one = await downloadSlackAttachment(app, token, file, maxBytes);
+      saved.push(one);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`Slack adjunto ignorado: ${message}\n`);
+    }
+  }
+  return saved;
+}
+
+function buildAttachmentContextPrompt(saved: SavedSlackAttachment[]): string {
+  if (saved.length === 0) {
+    return "";
+  }
+  const lines = saved.map((item, idx) => `${idx + 1}. ${item.relPath} (${item.mimeType}, ${item.size} bytes)`);
+  return `Archivos adjuntos recibidos desde Slack:\n${lines.join("\n")}`;
+}
+
+function shouldReuseAttachmentContext(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  if (normalized.length <= 24) {
+    return true;
+  }
+  return /analiz|resum|leer|revis|describ|extrae|interpret|tradu|que ves|que dice|procesa|explic/.test(normalized);
+}
+
+function cleanupAttachmentContextCache(cache: Map<string, ThreadAttachmentContext>, ttlMs: number): void {
+  const now = Date.now();
+  for (const [key, value] of cache.entries()) {
+    if (now - value.updatedAt > ttlMs) {
+      cache.delete(key);
+    }
+  }
 }
 
 function cleanupDedupeCache(cache: Map<string, number>, now: number, ttlMs: number): void {
@@ -460,6 +619,8 @@ async function main(): Promise<void> {
   const auth = await app.client.auth.test({ token: cfg.slackBotToken });
   const botUserId = auth.user_id?.trim() || "";
   const dedupeCache = new Map<string, number>();
+  const attachmentContextCache = new Map<string, ThreadAttachmentContext>();
+  const attachmentContextTtlMs = 2 * 60 * 60 * 1000;
 
   const processInbound = async (params: {
     source: string;
@@ -468,9 +629,39 @@ async function main(): Promise<void> {
     messageTs: string;
     threadTs?: string;
     requestId: string;
+    files?: SlackMessageFile[];
   }): Promise<void> => {
     const normalizedText = removeSlackMentions(params.text);
-    if (!normalizedText) {
+    const stableThreadRef = params.threadTs || "main";
+    const contextKey = `${params.channel}:${stableThreadRef}`;
+    cleanupAttachmentContextCache(attachmentContextCache, attachmentContextTtlMs);
+    const incomingAttachments =
+      params.files && params.files.length > 0
+        ? await materializeSlackAttachments(app, cfg.slackBotToken, params.files, cfg.maxAttachmentBytes)
+        : [];
+    if (incomingAttachments.length > 0) {
+      attachmentContextCache.set(contextKey, { saved: incomingAttachments, updatedAt: Date.now() });
+    }
+    const cachedAttachments = attachmentContextCache.get(contextKey)?.saved || [];
+    const savedAttachments =
+      incomingAttachments.length > 0
+        ? incomingAttachments
+        : cachedAttachments.length > 0 && shouldReuseAttachmentContext(normalizedText)
+          ? cachedAttachments
+          : [];
+    const attachmentBlock = buildAttachmentContextPrompt(savedAttachments);
+    const effectiveText =
+      normalizedText && attachmentBlock
+        ? `${normalizedText}\n\n${attachmentBlock}`
+        : normalizedText
+          ? normalizedText
+          : attachmentBlock
+            ? savedAttachments.some((item) => item.kind === "image")
+              ? `Analiza estas imágenes y responde en español.\n\n${attachmentBlock}`
+              : `Lee y resume estos archivos adjuntos.\n\n${attachmentBlock}`
+            : "";
+
+    if (!effectiveText) {
       return;
     }
 
@@ -483,8 +674,8 @@ async function main(): Promise<void> {
         baseUrl: cfg.bridgeBaseUrl,
         headers: cfg.bridgeHeaders,
         timeoutMs: cfg.bridgeTimeoutMs,
-        text: normalizedText,
-        chatId: resolveChatIdForEvent({ channel: params.channel, threadTs: params.threadTs || params.messageTs }),
+        text: effectiveText,
+        chatId: resolveChatIdForEvent({ channel: params.channel, threadTs: params.threadTs }),
         userId: cfg.bridgeUserId,
         requestId: params.requestId,
         source: params.source,
@@ -543,7 +734,8 @@ async function main(): Promise<void> {
     }
 
     const text = message.text?.trim() || "";
-    if (!text) {
+    const files = Array.isArray(message.files) ? message.files : [];
+    if (!text && files.length === 0) {
       return;
     }
 
@@ -554,12 +746,13 @@ async function main(): Promise<void> {
       messageTs: message.ts,
       threadTs: message.thread_ts,
       requestId: resolveRequestId("slack:mention", message.channel, message.ts),
+      files,
     });
   });
 
   app.event("message", async ({ event }) => {
     const message = event as SlackMessageEvent;
-    if (message.subtype || message.bot_id || !message.user) {
+    if ((message.subtype && message.subtype !== "file_share") || message.bot_id || !message.user) {
       return;
     }
     if (cfg.allowedSlackUsers.size > 0 && !cfg.allowedSlackUsers.has(message.user)) {
@@ -585,12 +778,17 @@ async function main(): Promise<void> {
     }
 
     const text = (message.text || "").trim();
-    if (!text) {
+    const files = Array.isArray(message.files) ? message.files : [];
+    if (!text && files.length === 0) {
       return;
     }
 
     if (isChannelLike && cfg.requireMentionInChannels) {
-      if (!botUserId || !text.includes(`<@${botUserId}>`)) {
+      const hasMention = !!botUserId && text.includes(`<@${botUserId}>`);
+      const threadRef = message.thread_ts || "main";
+      cleanupAttachmentContextCache(attachmentContextCache, attachmentContextTtlMs);
+      const hasThreadAttachmentContext = attachmentContextCache.has(`${message.channel}:${threadRef}`);
+      if (!hasMention && files.length === 0 && !hasThreadAttachmentContext) {
         return;
       }
     }
@@ -602,6 +800,7 @@ async function main(): Promise<void> {
       messageTs: message.ts,
       threadTs: message.thread_ts,
       requestId: resolveRequestId("slack:message", message.channel, message.ts),
+      files,
     });
   });
 
