@@ -1,6 +1,6 @@
 {
   "name": "operator",
-  "description": "Agente operativo con permisos administrativos (equivalente a admin)",
+  "description": "Agente operativo restringido (sin privilegios administrativos)",
   "cwd": "./workspace",
   "workspaceOnly": true,
   "allowCommands": [
@@ -17,11 +17,6 @@
     "cat",
     "head",
     "tail",
-    "gmail-api",
-    "sudo",
-    "systemctl",
-    "shutdown",
-    "journalctl",
-    "*"
+    "gmail-api"
   ]
 }

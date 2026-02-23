@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { IntentSemanticRouter } from "../src/intent-semantic-router.js";
+import { IntentSemanticRouter } from "../../src/intent-semantic-router.js";
 
 type Row = {
   text: string;

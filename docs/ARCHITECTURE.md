@@ -90,7 +90,7 @@
   - Flush de continuidad antes de razonar para reducir pérdida de contexto
   - Escritura de memoria diaria (`/remember`)
 - `src/admin-security.ts`
-  - `adminmode`, aprobaciones y `panic mode` (con restore desde estado persistido)
+  - aprobaciones y `panic mode` (con restore desde estado persistido)
 - `src/audit-log.ts`
   - Registro de eventos en formato JSONL
 - `src/doctor.ts`
@@ -118,7 +118,7 @@
    - operación Gmail (`/gmail ...`)
 4. Para ejecutar:
    - se valida allowlist del agente activo
-   - si `adminmode=on`, se encola aprobación
+   - para acciones sensibles, se encola aprobación
    - si se aprueba, se ejecuta y se reporta resultado
 5. Para consultas IA:
    - se arma contexto de workspace

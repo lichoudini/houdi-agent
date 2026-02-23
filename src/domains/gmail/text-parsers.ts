@@ -117,6 +117,12 @@ export function createGmailTextParsers(deps: GmailTextParsersDeps) {
       return true;
     }
 
+    // Common natural phrasing: "enviar correo ... sobre temas de marketing"
+    // implies the user wants drafted/generated content, not a literal body.
+    if (/\bsobre\s+(?:temas?\s+de\s+)?[a-z0-9]/.test(textNormalized)) {
+      return true;
+    }
+
     return /\b(asunto\s+vinculado|listado\s+de\s+las?\s+ultimas?\s+noticias)\b/.test(textNormalized);
   }
 

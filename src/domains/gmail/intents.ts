@@ -65,6 +65,30 @@ export type GmailIntentDeps = {
   gmailAccountEmail?: string;
 };
 
+function inferCcBccFromEmailContext(
+  original: string,
+  emailCandidates: string[],
+): { cc: string; bcc: string } {
+  const ccSet = new Set<string>();
+  const bccSet = new Set<string>();
+  for (const email of emailCandidates) {
+    const escaped = email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = original.match(new RegExp(`([\\s\\S]{0,32})\\b${escaped}\\b`, "i"));
+    const prefix = (match?.[1] ?? "").toLowerCase();
+    if (/\bbcc\b[\s:=]*$|\bbcc\b/.test(prefix)) {
+      bccSet.add(email);
+      continue;
+    }
+    if (/\bcc\b[\s:=]*(?:a\s*)?$|\bcc\b/.test(prefix)) {
+      ccSet.add(email);
+    }
+  }
+  return {
+    cc: [...ccSet].join(", "),
+    bcc: [...bccSet].join(", "),
+  };
+}
+
 export function detectGmailRecipientNaturalIntent(text: string, deps: GmailIntentDeps): GmailRecipientNaturalIntent {
   const original = text.trim();
   if (!original) {
@@ -226,7 +250,9 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
       subject = explicitNaturalSubject;
     }
     const subjectWasExplicit = Boolean(subject.trim());
-    const forceAiDraftByMissingSubject = !subjectWasExplicit && !autoContentKind;
+    // If we already inferred a drafting instruction, keep draft flow and avoid
+    // the missing-subject classifier that can fallback to literal body.
+    const forceAiDraftByMissingSubject = !subjectWasExplicit && !autoContentKind && !draftInstruction.trim();
     if (forceAiDraftByMissingSubject) {
       draftInstruction = deps.buildGmailDraftInstruction(original) || original.trim();
       body = "";
@@ -243,6 +269,29 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
     }
     if (!bcc) {
       bcc = original.match(/\bbcc\s*[:=]\s*([^\n]+)$/i)?.[1]?.trim() ?? "";
+    }
+    if (!cc || !bcc) {
+      const inferred = inferCcBccFromEmailContext(original, emailCandidates);
+      if (!cc) {
+        cc = inferred.cc;
+      }
+      if (!bcc) {
+        bcc = inferred.bcc;
+      }
+    }
+    if (cc) {
+      const ccList = deps
+        .extractEmailAddresses(cc)
+        .filter((item) => item && item !== to)
+        .join(", ");
+      cc = ccList;
+    }
+    if (bcc) {
+      const bccList = deps
+        .extractEmailAddresses(bcc)
+        .filter((item) => item && item !== to)
+        .join(", ");
+      bcc = bccList;
     }
 
     return {

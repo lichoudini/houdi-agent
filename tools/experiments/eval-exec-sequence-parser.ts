@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { normalizeExecCommandSequence } from "../src/domains/shell/command-sequence.js";
+import { normalizeExecCommandSequence } from "../../src/domains/shell/command-sequence.js";
 
 type Row = {
   text: string;

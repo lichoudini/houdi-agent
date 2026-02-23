@@ -1,8 +1,8 @@
 # Houdi Agent - Runbook Operativo
 
 ## 0. Perfiles de operación
-- `full-control` (host propio): `DEFAULT_AGENT=admin`, habilitar solo integraciones necesarias y monitorear `journalctl`.
-- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false`/`ENABLE_LIM_CONTROL=false` salvo necesidad, usar `/adminmode on` para cambios sensibles.
+- `full-control` (host propio): mantener `DEFAULT_AGENT=operator` y usar `/agent set admin` solo para acciones puntuales de alto privilegio. Monitorear `journalctl`.
+- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false`/`ENABLE_LIM_CONTROL=false` salvo necesidad.
 
 ## 1. Arranque normal
 ```bash
@@ -35,7 +35,7 @@ Alternativa desde Telegram:
 
 - `/selfupdate check` para ver si hay nueva versión.
 - `/selfupdate` para aplicar update in-place (`git pull --ff-only`, `npm install` si cambia `package*.json`, `npm run build` y reinicio).
-- Si `adminmode` está activo, requerirá `/approve <id>`.
+- Para acciones sensibles, puede requerir `/approve <id>`.
 
 ## 5. Validación funcional mínima (Telegram)
 1. `/status`
@@ -47,13 +47,14 @@ Alternativa desde Telegram:
 7. Probar acción sensible y confirmar con `/confirm <plan_id>`
 8. `/outbox status`
 9. `/agent`
-10. `/adminmode on`
+10. `/agent set admin`
 11. `/exec date` -> debe pedir aprobación
 12. `/approve <id>`
-13. `/reboot status`
-14. `/intentroutes`
-15. `/intentstats 2000`
-16. `/intentcanary status`
+13. `/agent set operator`
+14. `/reboot status`
+15. `/intentroutes`
+16. `/intentstats 2000`
+17. `/intentcanary status`
 
 ## 6. Incidentes frecuentes
 - Bot no responde:

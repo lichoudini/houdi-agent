@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { detectScheduledAutomationIntent } from "../src/domains/schedule/automation-intent.js";
+import { detectScheduledAutomationIntent } from "../../src/domains/schedule/automation-intent.js";
 
 type Row = {
   text: string;

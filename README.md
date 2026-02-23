@@ -34,7 +34,7 @@ Buenas prácticas mínimas:
 
 - Evitar instalación en equipos con datos sensibles no relacionados.
 - Aplicar principio de mínimo privilegio en agentes y allowlists.
-- Activar confirmaciones (`/adminmode on`) en entornos compartidos.
+- Mantener `DEFAULT_AGENT=operator` como valor por defecto y operar con mínimo privilegio.
 - Revisar logs/auditoría durante las primeras semanas de operación.
 
 ## Documentación
@@ -69,16 +69,16 @@ Este proyecto puede operar con privilegios altos si así lo configuras.
 Perfil `full-control` (equipo propio y de confianza):
 
 - Objetivo: máxima autonomía operativa.
-- Sugerido: `DEFAULT_AGENT=admin`.
+- Mantener `DEFAULT_AGENT=operator` y cambiar temporalmente a `admin` solo para acciones puntuales.
 - Sugerido: habilitar solo lo que realmente uses (`ENABLE_REBOOT_COMMAND`, `ENABLE_LIM_CONTROL`, `ENABLE_GMAIL_ACCOUNT`).
 - Ejecutar en host dedicado y con monitoreo de logs.
 
 Perfil `moderated` (entorno compartido o más estricto):
 
 - Objetivo: minimizar riesgo de ejecución accidental.
-- Sugerido: `DEFAULT_AGENT=operator`.
+- Requerido: `DEFAULT_AGENT=operator` (default del proyecto).
 - Sugerido: mantener `ENABLE_REBOOT_COMMAND=false` y `ENABLE_LIM_CONTROL=false` si no son imprescindibles.
-- Activar confirmaciones con `/adminmode on` antes de tareas sensibles.
+- Para tareas sensibles, cambiar agente temporalmente: `/agent set admin` y luego volver a `/agent set operator`.
 - Reducir allowlists en `agents/operator.json` y reservar `agents/admin.json` para casos puntuales.
 
 ## Requisitos
@@ -214,7 +214,7 @@ npm run start
 
 8. Endurecimiento inicial recomendado:
 
-- `/adminmode on`
+- validar `DEFAULT_AGENT=operator` en `.env`
 - revisar perfil de agente activo y allowlist
 - habilitar solo capacidades necesarias
 
@@ -541,7 +541,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/shellmode on|off`
 - `/exec <comando> [args]`
 - `/reboot` (`/reboot status`)
-- `/adminmode on|off`
+- `/adminmode` (deprecado, usar `/agent set <admin|operator>`)
 - `/approvals`
 - `/approve <id>`
 - `/deny <id>`
@@ -595,7 +595,7 @@ Configuración relacionada:
 - `/usage reset`: reinicia contadores locales de uso OpenAI.
 - `/metrics`: snapshot de observabilidad (counters/timings/colas/outbox).
 - `/domains`: lista dominios modulares activos (router/workspace/gmail) y sus capacidades.
-- Estado runtime crítico persistente en SQLite: aprobaciones, planes pendientes, confirmaciones de borrado, modo admin/panic y settings por chat (agente activo, shellmode, eco, safe y modelo OpenAI).
+- Estado runtime crítico persistente en SQLite: aprobaciones, planes pendientes, confirmaciones de borrado, panic mode y settings por chat (agente activo, shellmode, eco, safe y modelo OpenAI).
 
 ## CLI local
 
@@ -691,7 +691,7 @@ Puedes sumar habilidades persistentes sin tocar código fuente manualmente:
 - `/selfskill list`: muestra las últimas habilidades agregadas.
 - `/selfskill del <n|last>`: elimina una habilidad por índice (o la última).
 - `/selfskill draft ...`: permite construir una habilidad en varios mensajes y aplicarla al final.
-- `/selfrestart`: reinicia el servicio del agente (respeta `adminmode` si está activo).
+- `/selfrestart`: reinicia el servicio del agente respetando el perfil de seguridad activo.
 - `/selfupdate [check]`: revisa o aplica actualización a la última versión del repo (`git pull --ff-only`, `npm install` si cambia `package*.json`, `npm run build` y reinicio).
 
 Ejemplos:
@@ -796,7 +796,7 @@ Modo natural (sin comandos):
 
 Nota de seguridad:
 
-- El bot exige que el agente activo tenga `gmail-api` en `allowCommands` (incluido en `admin`).
+- El bot exige que el agente activo tenga `gmail-api` en `allowCommands` (incluido en `operator` y `admin`).
 
 ## Control LIM (natural)
 
@@ -925,24 +925,26 @@ Comportamiento:
 - Puedes guardar notas rápidas con `/remember`.
 - En chat libre puedes preguntar: `te acordás de ...`, `recordás ...`, `buscá en memoria sobre ...`.
 
-## Modo Admin Seguro
+## Operación Segura por Agente
 
-1. Activa aprobación previa:
+1. Mantén `operator` como modo normal (default).
+
+2. Cuando necesites privilegios altos, cambia temporalmente a `admin`:
 
 ```bash
-/adminmode on
+/agent set admin
 ```
 
-2. Cuando pidas ejecución (`/exec` o shell IA), el bot creará una solicitud con ID.
+3. Para ejecuciones sensibles (`/exec` o shell IA), el bot crea una solicitud con ID.
 
-3. Acepta o rechaza:
+4. Acepta o rechaza:
 
 ```bash
 /approve <id>
 /deny <id>
 ```
 
-4. Si necesitas corte total:
+5. Si necesitas corte total:
 
 ```bash
 /panic on
@@ -959,13 +961,13 @@ ENABLE_REBOOT_COMMAND=true
 REBOOT_COMMAND=sudo -n /usr/bin/systemctl reboot
 ```
 
-2. Usa `adminmode` para exigir confirmación:
+2. Cambia temporalmente a `admin` para operar reboot con permisos elevados:
 
 ```bash
-/adminmode on
 /agent set admin
 /reboot
 /approve <id>
+/agent set operator
 ```
 
 El bot nunca ejecuta `/reboot` directo: siempre genera aprobación primero.

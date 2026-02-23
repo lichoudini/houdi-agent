@@ -104,3 +104,27 @@ test("gmail send with explicit subject/body keeps explicit values", () => {
   assert.equal(intent.subject, "Hola");
   assert.equal(intent.body, "Te escribo para confirmar.");
 });
+
+test("gmail send parses natural cc syntax without labels", () => {
+  const intent = detectGmailNaturalIntent(
+    "Enviar un correo a nazareno.tomaselli@vrand.biz cc a patagonads@gmail.com",
+    deps,
+  );
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "send");
+  assert.equal(intent.to, "nazareno.tomaselli@vrand.biz");
+  assert.equal(intent.cc, "patagonads@gmail.com");
+});
+
+test("gmail send with 'sobre temas de' requests auto-generated body flow", () => {
+  const intent = detectGmailNaturalIntent(
+    "Enviar correo a nazareno.tomaselli@vrand.biz con cc patagonads@gmail.com sobre temas de marketing",
+    deps,
+  );
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "send");
+  assert.equal(intent.to, "nazareno.tomaselli@vrand.biz");
+  assert.equal(intent.cc, "patagonads@gmail.com");
+  assert.equal(intent.draftRequested, true);
+  assert.notEqual(intent.forceAiByMissingSubject, true);
+});

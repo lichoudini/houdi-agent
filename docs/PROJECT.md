@@ -11,7 +11,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 - Runtime principal en Node.js + TypeScript, con transporte Telegram y bridge opcional para Slack y WhatsApp Cloud API.
 - Pipeline de intención híbrido (reglas + router semántico + fallback IA) para operar en lenguaje natural.
 - Persistencia de estado en SQLite para contexto crítico de operación.
-- Modo de seguridad por agentes (`operator`, `admin`) con allowlist y aprobaciones explícitas.
+- Modo de seguridad por agentes (`operator` por defecto, `admin` para elevación puntual) con allowlist y aprobaciones explícitas.
 - Integraciones productivas: Gmail, web browsing/documentos, tareas programadas, memoria y control LIM.
 
 ## Capacidades funcionales
@@ -34,7 +34,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
   - Aprendizaje local de intereses y sugerencias proactivas con cuota diaria.
   - Self-skill pipeline para crear, listar y eliminar habilidades dinámicas.
 - Seguridad y gobernanza:
-  - `adminmode`, planes pendientes y aprobaciones (`/approvals`, `/approve`, `/deny`).
+  - Control por perfil de agente (`/agent set operator|admin`), planes pendientes y aprobaciones (`/approvals`, `/approve`, `/deny`).
   - `safe mode`, `panic mode`, auditoría estructurada (`houdi-audit.log`) y métricas de observabilidad.
   - Protección de idempotencia/outbox para evitar efectos duplicados ante reintentos.
 

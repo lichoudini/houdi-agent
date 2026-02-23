@@ -1301,7 +1301,7 @@ async function buildRuntimeHealthSnapshot(): Promise<{
 }
 
 function isAdminApprovalRequired(chatId: number): boolean {
-  return config.securityProfile.forceApprovalMode || adminSecurity.isAdminModeEnabled(chatId);
+  return config.securityProfile.forceApprovalMode;
 }
 
 function buildAgentVersionText(): string {
@@ -4538,6 +4538,16 @@ function parseScheduleTime(normalized: string): { hour: number; minute: number }
     return { hour, minute: 0 };
   }
 
+  // Common compact Spanish format: "15hs" / "15 h" / "a las 15hs"
+  const compactHour = normalized.match(/\b(?:a\s+las\s+)?(\d{1,2})\s*(h|hs)\b/);
+  if (compactHour) {
+    const hour = Number.parseInt(compactHour[1] ?? "", 10);
+    if (!Number.isFinite(hour) || hour < 0 || hour > 23) {
+      return null;
+    }
+    return { hour, minute: 0 };
+  }
+
   return null;
 }
 
@@ -6821,8 +6831,7 @@ function resolveGmailMessageIdForChat(params: {
 function getGmailAccessIssue(ctx: ChatReplyContext): string | null {
   const activeAgentName = getActiveAgent(ctx.chat.id);
   const activeProfile = agentRegistry.require(activeAgentName);
-  const hasGmailPermission =
-    activeProfile.allowCommands.includes("gmail-api") || activeAgentName === "operator";
+  const hasGmailPermission = activeProfile.allowCommands.includes("gmail-api");
   if (!hasGmailPermission) {
     return [
       `El agente activo (${activeProfile.name}) no permite Gmail API.`,
@@ -14127,7 +14136,13 @@ async function maybeHandleNaturalGmailInstruction(params: {
           ctx: params.ctx,
           kind: "gmail-send",
           capability: "gmail.send",
-          summary: [`to: ${to}`, `subject: ${subject}`, `body_chars: ${body.length}`].join("\n"),
+          summary: [
+            `to: ${to}`,
+            ...(intent.cc?.trim() ? [`cc: ${intent.cc.trim()}`] : []),
+            ...(intent.bcc?.trim() ? ["bcc: [set]"] : []),
+            `subject: ${subject}`,
+            `body_chars: ${body.length}`,
+          ].join("\n"),
           payload: {
             to,
             subject,
@@ -14627,8 +14642,17 @@ async function maybeHandleNaturalIntentPipeline(params: {
   }
 
   const hasWorkspaceImageReferences = extractWorkspaceImageReferences(params.text).length > 0;
+  const scheduleIntentPreview = detectScheduleNaturalIntent(params.text);
+  const hasStrongScheduledAutomationCue =
+    scheduleIntentPreview.shouldHandle &&
+    scheduleIntentPreview.action === "create" &&
+    Boolean(scheduleIntentPreview.dueAt) &&
+    Boolean(scheduleIntentPreview.automationInstruction?.trim());
   const skipAiSequencedPlan =
-    extractRandomWorkspaceFileNameRequest(params.text).requested || conversationalNarrative || hasWorkspaceImageReferences;
+    extractRandomWorkspaceFileNameRequest(params.text).requested ||
+    conversationalNarrative ||
+    hasWorkspaceImageReferences ||
+    hasStrongScheduledAutomationCue;
   if (!skipAiSequencedPlan && !params.source.includes(":seq-step-") && !params.source.includes(":chain-")) {
     const sequencedPlan = await classifySequencedIntentPlanWithAi({
       chatId: params.ctx.chat.id,
@@ -15465,7 +15489,7 @@ bot.command("start", async (ctx) => {
       `Shell IA: ${shellMode}`,
       `ECO mode: ${ecoMode}`,
       `SAFE mode: ${safeMode}`,
-      `Admin mode: ${adminMode}`,
+      `Approval mode: ${adminMode}`,
       `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${panicMode}`,
       "Usa /help para ver comandos.",
@@ -15553,7 +15577,7 @@ bot.command("help", async (ctx) => {
     "/shellmode on|off - Habilitar shell IA en chat libre",
     "/exec <cmd> [args] - Ejecutar comando permitido por el agente",
     "/reboot - Solicitar reinicio de PC (si está habilitado)",
-    "/adminmode on|off - Requerir aprobación antes de ejecutar",
+    "/adminmode - (deprecado) usa /agent set <admin|operator>",
     "/approvals - Ver aprobaciones pendientes",
     "/approve - Aprobar ejecución pendiente (última en este chat)",
     "/deny - Rechazar ejecución pendiente (última en este chat)",
@@ -15696,7 +15720,7 @@ bot.command("status", async (ctx) => {
       `ECO mode: ${isEcoModeEnabled(ctx.chat.id) ? `on (max ${config.openAiEcoMaxOutputTokens} tok)` : "off"}`,
       `SAFE mode: ${isSafeModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `Agentic canary: ${agenticCanary.getRolloutPercent()}% (chat=${isAgenticCanaryEnabled(ctx.chat.id) ? "on" : "off"})`,
-      `Admin mode: ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
+      `Approval mode: ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
       `Perfil seguridad: ${config.securityProfile.name}`,
       `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"} (${rebootAllowedInAgent ? "permitido en agente actual" : "no permitido en agente actual"})`,
@@ -16752,7 +16776,7 @@ bot.command("reboot", async (ctx) => {
       [
         `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"}`,
         `Comando configurado: ${config.rebootCommand}`,
-        `Admin mode (chat): ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
+        `Approval mode (chat): ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"}`,
         `Perfil seguridad: ${config.securityProfile.name}`,
         `Panic mode: ${adminSecurity.isPanicModeEnabled() ? "on" : "off"}`,
       ].join("\n"),
@@ -18569,38 +18593,15 @@ bot.command("shell", async (ctx) => {
 });
 
 bot.command("adminmode", async (ctx) => {
-  const raw = String(ctx.match ?? "").trim().toLowerCase();
-
-  if (!raw || raw === "status") {
-    await ctx.reply(
-      `Admin mode está ${isAdminApprovalRequired(ctx.chat.id) ? "on" : "off"} (perfil: ${config.securityProfile.name}).`,
-    );
-    return;
-  }
-
-  if (raw !== "on" && raw !== "off") {
-    await ctx.reply("Uso: /adminmode on|off");
-    return;
-  }
-
-  const enabled = raw === "on";
-  adminSecurity.setAdminMode(ctx.chat.id, enabled);
-  persistRuntimeStateSnapshot("runtime:setAdminMode");
+  const active = getActiveAgent(ctx.chat.id);
   await ctx.reply(
     [
-      `Admin mode ahora está ${enabled ? "on" : "off"}.`,
-      enabled
-        ? "Cada ejecución de shell requerirá /approve antes de correr."
-        : "Las ejecuciones vuelven a correr directo (si panic mode está off).",
+      "Este comando quedó deprecado.",
+      "Los privilegios ahora dependen del agente activo del chat.",
+      `Agente actual: ${active}`,
+      "Usa: /agent set admin  o  /agent set operator",
     ].join("\n"),
   );
-
-  await safeAudit({
-    type: "adminmode.toggle",
-    chatId: ctx.chat.id,
-    userId: ctx.from?.id,
-    details: { enabled },
-  });
 });
 
 bot.command("approvals", async (ctx) => {

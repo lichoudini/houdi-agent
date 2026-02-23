@@ -136,6 +136,27 @@ test("workspace files service resolves two-dot placeholder when match is unique"
   await fs.rm(tempDir, { recursive: true, force: true });
 });
 
+test("workspace files service resolves compact ellipsis prefix by ordered letters", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-compact-prefix-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+
+  await service.createWorkspaceDirectory("images");
+  await service.createWorkspaceDirectory("docs");
+
+  const resolved = await service.resolveEllipsisPathPlaceholder("img...");
+  assert.equal(resolved.resolvedPath, "images");
+  assert.equal(resolved.expanded, true);
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
 test("workspace files service resolves existing exact candidate", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-exact-"));
   const service = new WorkspaceFilesService(

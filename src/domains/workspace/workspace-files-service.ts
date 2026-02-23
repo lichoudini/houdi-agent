@@ -79,7 +79,7 @@ export class WorkspaceFilesService {
       }
 
       const normalizedPrefix = normalizeForPathMatch(prefix);
-      const matches = baseDirEntries
+      let matches = baseDirEntries
         .map((entry) => entry.name)
         .filter((entryName) => {
           if (!normalizedPrefix) {
@@ -88,6 +88,15 @@ export class WorkspaceFilesService {
           return normalizeForPathMatch(entryName).startsWith(normalizedPrefix);
         })
         .sort((a, b) => a.localeCompare(b, "es", { sensitivity: "base" }));
+
+      // Fallback for compact prefixes (e.g. "img..." -> "images") where users
+      // omit letters but preserve order.
+      if (matches.length === 0 && normalizedPrefix) {
+        matches = baseDirEntries
+          .map((entry) => entry.name)
+          .filter((entryName) => isOrderedSubsequence(normalizedPrefix, normalizeForPathMatch(entryName)))
+          .sort((a, b) => a.localeCompare(b, "es", { sensitivity: "base" }));
+      }
 
       if (matches.length === 0) {
         throw new Error(`No encontré coincidencias para "${segment}" en ${baseDirResolved.relPath}.`);
@@ -282,4 +291,20 @@ function normalizeForPathMatch(value: string): string {
     .replace(/\p{Diacritic}/gu, "")
     .toLowerCase()
     .trim();
+}
+
+function isOrderedSubsequence(needle: string, haystack: string): boolean {
+  if (!needle) {
+    return true;
+  }
+  let index = 0;
+  for (const ch of haystack) {
+    if (ch === needle[index]) {
+      index += 1;
+      if (index >= needle.length) {
+        return true;
+      }
+    }
+  }
+  return false;
 }

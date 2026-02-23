@@ -143,8 +143,9 @@ echo
 echo "Smoke test manual en Telegram:"
 echo "  /status"
 echo "  /agent"
-echo "  /adminmode on"
+echo "  /agent set admin"
 echo "  /reboot status"
+echo "  /agent set operator"
 
 if [[ "${fail_count}" -gt 0 ]]; then
   exit 1
