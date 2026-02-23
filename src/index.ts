@@ -325,6 +325,7 @@ type RecentConversationTurn = {
 const lastAssistantReplyByChat = new Map<number, AssistantReplySnapshot>();
 const assistantReplyHistoryByChat = new Map<number, AssistantReplySnapshot[]>();
 const recentConversationByChat = new Map<number, RecentConversationTurn[]>();
+const lastObservedReplyAtByChat = new Map<number, number>();
 const intentRouterDatasetFilePath = path.resolve(process.cwd(), config.intentRouterDatasetFile);
 const intentRouterStatsRepository = new IntentRouterStatsRepository(intentRouterDatasetFilePath, (message) => logWarn(message));
 const lastGmailResultsByChat = new Map<number, GmailMessageSummary[]>();
@@ -405,6 +406,14 @@ type PendingPlannedAction = {
 const pendingWorkspaceDeleteByChat = new Map<number, PendingWorkspaceDeleteConfirmation>();
 const pendingWorkspaceDeletePathByChat = new Map<number, PendingWorkspaceDeletePathRequest>();
 const pendingIntentClarificationByChat = new Map<number, PendingIntentClarification>();
+type IntentActionOutcome = {
+  route: string;
+  source: string;
+  success: boolean;
+  error?: string;
+  atMs: number;
+};
+const pendingIntentActionOutcomeByChat = new Map<number, IntentActionOutcome>();
 const workspaceClipboardByChat = new Map<number, WorkspaceClipboardState>();
 const pendingPlannedActionsById = new Map<string, PendingPlannedAction>();
 const incomingMessageQueue = new ChatMessageQueue();
@@ -430,7 +439,7 @@ const AI_SEQUENCE_ROUTER_MAX_STEPS = 6;
 const WORKSPACE_DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const PLANNED_ACTION_TTL_MS = 5 * 60 * 1000;
 const WORKSPACE_DELETE_PATH_PROMPT_TTL_MS = 5 * 60 * 1000;
-const INTENT_CLARIFICATION_TTL_MS = 5 * 60 * 1000;
+const INTENT_CLARIFICATION_TTL_MS = config.intentClarificationTtlMs;
 const INDEXED_LIST_CONTEXT_TTL_MS = 2 * 60 * 60 * 1000;
 const INDEXED_LIST_ACTION_MAX_ITEMS = 5;
 const ASSISTANT_REPLY_HISTORY_LIMIT = 30;
@@ -1565,6 +1574,16 @@ type IntentRouterDatasetEntry = {
     required: string[];
     summary: string;
   };
+  actionSuccess?: boolean;
+  actionError?: string;
+  shadow?: {
+    handler: string;
+    score: number;
+    reason: string;
+    alternatives: Array<{ name: string; score: number }>;
+    alpha: number;
+    minScoreGap: number;
+  };
   finalHandler: Exclude<NaturalIntentHandlerName, "none"> | "indexed-list-reference" | "none" | `multi:${string}`;
   handled: boolean;
 };
@@ -1610,18 +1629,14 @@ function makeTouchFriendlyText(text: string): string {
           /\b(messageId|threadId|draftId)\s*[:=]\s*`?([A-Za-z0-9._-]{6,})`?/gi,
           (_full, labelInput: string, value: string) => {
             const label = labelInput.trim();
-            const lower = label.toLowerCase();
-            const anchorPrefix = lower === "messageid" ? "msg" : lower === "threadid" ? "thr" : "drf";
-            return `${label}: #${anchorPrefix}_${value} (\`${value}\`)`;
+            return `${label}: #${value} (\`${value}\`)`;
           },
         )
         .replace(
           /\b(id|thread)\s*:\s*`?([A-Za-z0-9._-]{10,})`?/gi,
           (_full, labelInput: string, value: string) => {
             const label = labelInput.trim();
-            const lower = label.toLowerCase();
-            const anchorPrefix = lower === "thread" ? "thr" : "id";
-            return `${label}: #${anchorPrefix}_${value} (\`${value}\`)`;
+            return `${label}: #${value} (\`${value}\`)`;
           },
         );
     })
@@ -3986,7 +4001,7 @@ function detectWebIntent(text: string): WebIntent {
   const webQualifier = /\b(web|internet|google|online|link|links|enlace|enlaces|fuente|fuentes)\b/.test(
     normalized,
   );
-  const searchVerb = /\b(busca|buscar|búscame|buscame|investiga|averigua|googlea|navega|consulta|encontra|encuentra)\b/.test(
+  const searchVerb = /\b(busca(?:r|me)?|búscame|buscame|investiga(?:r|me)?|averigua(?:r|me)?|googlea(?:r)?|navega(?:r)?|consulta(?:r)?|encontra(?:r)?|encuentra)\b/.test(
     normalized,
   );
   const newsNoun = /\b(noticias?|novedades?|titulares?|actualidad)\b/.test(normalized);
@@ -4709,11 +4724,11 @@ function parseNaturalScheduleDateTime(text: string, nowInput?: Date): { dueAt?: 
 function stripScheduleTemporalPhrases(text: string): string {
   return text
     .replace(
-      /\b(?:en|dentro\s+de)\s+(\d{1,3}|un|una|media)\s*(?:minuto|minutos|min|mins|hora|horas|h|hs|dia|dias|semana|semanas)\b/gi,
+      /\b(?:en|dentro\s+de)\s+(\d{1,3}|un|una|media)\s*(?:minuto|minutos|min|mins|hora|horas|h|hs|d[ií]a|d[ií]as|semana|semanas)\b/gi,
       " ",
     )
-    .replace(/\bpasado\s+manana\b/gi, " ")
-    .replace(/\bmanana\b/gi, " ")
+    .replace(/\bpasado\s+ma(?:ñ|n)ana\b/gi, " ")
+    .replace(/\bma(?:ñ|n)ana\b/gi, " ")
     .replace(/\bhoy\b/gi, " ")
     .replace(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/g, " ")
     .replace(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/g, " ")
@@ -4721,8 +4736,8 @@ function stripScheduleTemporalPhrases(text: string): string {
       /\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(?:\s+de\s+(\d{2,4}))?\b/gi,
       " ",
     )
-    .replace(/\b(?:(proximo)\s+)?(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/gi, " ")
-    .replace(/\bmediodia\b/gi, " ")
+    .replace(/\b(?:(proximo)\s+)?(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/gi, " ")
+    .replace(/\bmediod[ií]a\b/gi, " ")
     .replace(/\bmedianoche\b/gi, " ")
     .replace(/\b(?:a\s+las\s+)?(\d{1,2})(?::|\.)(\d{2})\s*(?:am|pm)?\b/gi, " ")
     .replace(/\b(?:a\s+las\s+)?(\d{1,2})\s*(?:am|pm)\b/gi, " ")
@@ -4762,15 +4777,12 @@ function extractTaskTitleForCreate(text: string): string {
     return sanitizeScheduleTitle(quoted.join(" "));
   }
 
-  const cleaned = stripScheduleTemporalPhrases(text)
+  const cleaned = stripScheduleTemporalPhrases(normalizeIntentText(text))
     .replace(
-      /\b(recordame|recordarme|recuerda|recuerdame|recordar|agenda|agendame|agendar|programa|programar|crea|crear|genera|generar|tarea|tareas|recordatorio|recordatorios|por favor|porfa)\b/gi,
+      /\b(record(?:a|á)(?:me|rme|r)?|recuerd(?:a|á)(?:me|r)?|agend(?:a|á)(?:me|r)?|program(?:a|á)(?:r)?|cre(?:a|á)(?:r)?|gener(?:a|á)(?:r)?|tareas?|recordatorios?|por\s+favor|porfa)\b/gi,
       " ",
     )
-    .replace(
-      /\b(haceme|hacerme|hace(?:r)?me)\s+acordar\b/gi,
-      " ",
-    )
+    .replace(/\b(hac(?:e|é)(?:r)?me)\s+acordar\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
   return sanitizeScheduleTitle(cleaned);
@@ -4793,10 +4805,10 @@ function extractScheduledEmailInstruction(text: string): string {
     return truncateInline(quoted.join(" ").trim(), 1000);
   }
 
-  const cleaned = stripScheduleTemporalPhrases(text)
+  const cleaned = stripScheduleTemporalPhrases(normalizeIntentText(text))
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
     .replace(
-      /\b(enviame|enviarme|envia|enviar|manda|mandar|mandame|mandarme|correo|mail|email|gmail|a|para|hoy|esta tarde|esta noche|esta manana|esta mañana)\b/gi,
+      /\b(envi(?:a|á)(?:me|rme|r)?|manda(?:me|rme|r)?|correo|mail|email|gmail|a|para|hoy|esta\s+tarde|esta\s+noche|esta\s+ma(?:ñ|n)ana)\b/gi,
       " ",
     )
     .replace(/\b(con asunto|asunto|mensaje|cuerpo|texto)\s*[:=-]?\s*/gi, " ")
@@ -4820,9 +4832,9 @@ function extractTaskTitleForEdit(text: string): string {
     return sanitizeScheduleTitle(explicit);
   }
 
-  const cleaned = stripScheduleTemporalPhrases(text)
+  const cleaned = stripScheduleTemporalPhrases(normalizeIntentText(text))
     .replace(
-      /\b(edita|editar|cambia|cambiar|modifica|modificar|reprograma|reprogramar|mueve|mover|actualiza|actualizar|pospone|posponer|tarea|recordatorio|numero|nro|#)\b/gi,
+      /\b(edit(?:a|á|ar)|cambi(?:a|á|ar)|modific(?:a|á|ar)|reprogram(?:a|á|ar)|muev(?:e|é|er)|actualiz(?:a|á|ar)|pospon(?:e|é|er)|tarea|recordatorio|numero|nro|#)\b/gi,
       " ",
     )
     .replace(/\btsk[-_][a-z0-9._-]*\.{0,}\b/gi, " ")
@@ -5327,6 +5339,17 @@ function buildIntentRouterForChat(chatId: number): {
   };
 }
 
+function shouldRunIntentShadowMode(chatId: number, text: string): boolean {
+  if (!config.intentShadowModeEnabled || config.intentShadowSamplePercent <= 0) {
+    return false;
+  }
+  if (config.intentShadowSamplePercent >= 100) {
+    return true;
+  }
+  const bucket = stableTextHash(`${chatId}:${normalizeIntentText(text)}`) % 100;
+  return bucket < config.intentShadowSamplePercent;
+}
+
 function shouldRunAiJudgeForEnsemble(decision: SemanticRouteDecision | null): boolean {
   if (!decision) {
     return true;
@@ -5617,7 +5640,15 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
       }
       const required: string[] = [];
       const missing: string[] = [];
-      if (intent.action === "edit" || intent.action === "delete") {
+      if (intent.action === "create") {
+        required.push("dueAt", "taskTitle");
+        if (!intent.dueAt || !Number.isFinite(intent.dueAt.getTime())) {
+          missing.push("dueAt");
+        }
+        if (!intent.taskTitle?.trim()) {
+          missing.push("taskTitle");
+        }
+      } else if (intent.action === "edit" || intent.action === "delete") {
         required.push("taskRef");
         if (!intent.taskRef?.trim()) {
           missing.push("taskRef");
@@ -5630,8 +5661,92 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
       };
     },
     clarificationsByAction: {
+      create: "Necesito fecha/hora y descripción de la tarea. Ejemplo: 'recordame mañana 09:00 pagar expensas'.",
       edit: "Necesito referencia de tarea (id, número o 'última').",
       delete: "Necesito referencia de tarea (id, número o 'última').",
+    },
+  },
+  memory: {
+    extract: (text) => {
+      const intent = detectMemoryNaturalIntent(text);
+      if (!intent.shouldHandle || !intent.action) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.action === "recall") {
+        required.push("query");
+        const query = intent.query?.trim() ?? "";
+        if (!query || isGenericMemoryQuery(query)) {
+          missing.push("query");
+        }
+      }
+      return {
+        action: intent.action,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      recall: "Necesito el tema puntual para buscar en memoria. Ejemplo: 'buscá en memoria sobre tareas programadas'.",
+    },
+  },
+  document: {
+    extract: (text) => {
+      const supportedFormats = documentReader.getSupportedFormats();
+      const intent = detectDocumentIntent(text, supportedFormats);
+      const normalized = normalizeIntentText(text);
+      const hasDocumentCue = /\b(archivo|documento|pdf|docx?|xlsx?|pptx?|txt|csv|json|md)\b/.test(normalized);
+      const hasReadOrAnalyzeCue = /\b(leer|lee|abrir|abre|revisar|revisa|analiza|analizar|resumir|resumen|explica)\b/.test(
+        normalized,
+      );
+      if (!intent.shouldHandle && !(hasDocumentCue && hasReadOrAnalyzeCue)) {
+        return null;
+      }
+      const references = intent.references;
+      const required = ["reference"];
+      const missing = references.length > 0 ? [] : ["reference"];
+      const action = intent.analysisRequested ? "analyze" : "read";
+      return {
+        action,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      read: "Necesito archivo/ruta del documento. Ejemplo: 'leer documento contrato.pdf'.",
+      analyze: "Necesito archivo/ruta del documento para analizar. Ejemplo: 'analizá contrato.pdf'.",
+    },
+  },
+  web: {
+    extract: (text) => {
+      const intent = detectWebIntent(text);
+      if (!intent.shouldHandle) {
+        return null;
+      }
+      const required: string[] = [];
+      const missing: string[] = [];
+      if (intent.mode === "open") {
+        required.push("target");
+        if (!intent.url?.trim() && typeof intent.sourceIndex !== "number") {
+          missing.push("target");
+        }
+      } else {
+        required.push("query");
+        const normalizedQuery = normalizeWebCommandQuery(intent.query || text);
+        if (!normalizedQuery || normalizedQuery.length < 3) {
+          missing.push("query");
+        }
+      }
+      return {
+        action: intent.mode,
+        required,
+        missing,
+      };
+    },
+    clarificationsByAction: {
+      search: "Necesito consulta web más concreta. Ejemplo: 'buscar noticias de IA en Argentina hoy'.",
+      open: "Necesito URL o índice de resultado para abrir. Ejemplo: 'abrí resultado 2' o 'abrí https://...'.",
     },
   },
   "self-maintenance": {
@@ -5689,6 +5804,11 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
         missing,
       };
     },
+    clarificationsByAction: {
+      add: "Para agregar destinatario necesito nombre y email. Ejemplo: 'agregá destinatario Carla carla@empresa.com'.",
+      update: "Para actualizar destinatario necesito nombre y email. Ejemplo: 'actualizá destinatario Carla con carla.ops@empresa.com'.",
+      delete: "Para eliminar destinatario necesito el nombre o alias. Ejemplo: 'eliminá destinatario Carla'.",
+    },
     fallbackClarification: "Para gestionar destinatarios necesito nombre y/o email según la acción.",
   },
 };
@@ -5745,7 +5865,17 @@ function buildTypedRouteClarificationQuestion(extraction: TypedRouteExtraction):
 }
 
 function isSensitiveIntentRoute(route: Exclude<NaturalIntentHandlerName, "none">): boolean {
-  return ["gmail", "workspace", "lim", "self-maintenance", "schedule"].includes(route);
+  return [
+    "gmail",
+    "gmail-recipients",
+    "workspace",
+    "lim",
+    "self-maintenance",
+    "schedule",
+    "memory",
+    "document",
+    "web",
+  ].includes(route);
 }
 
 function shouldAbstainByUncertainty(params: {
@@ -5753,11 +5883,18 @@ function shouldAbstainByUncertainty(params: {
   calibratedConfidence: number | null;
   gap: number | null;
   ensembleTop: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }>;
+  aiSelected?: NaturalIntentHandlerName;
   text: string;
 }): boolean {
   const top = params.semantic;
   if (!top) {
     return false;
+  }
+  if (params.aiSelected && params.aiSelected !== "none" && params.aiSelected === top.handler) {
+    const calibratedMatch = typeof params.calibratedConfidence === "number" ? params.calibratedConfidence : top.score;
+    if (calibratedMatch >= 0.3) {
+      return false;
+    }
   }
   const calibrated = typeof params.calibratedConfidence === "number" ? params.calibratedConfidence : top.score;
   const gap = typeof params.gap === "number" ? params.gap : 1;
@@ -7524,6 +7661,39 @@ type ChatReplyContext = {
   replyWithDocument?: (document: InputFile, options?: { caption?: string }) => Promise<unknown>;
 };
 
+function withReplyTracking(
+  ctx: ChatReplyContext,
+  onReplyObserved: () => void,
+): ChatReplyContext {
+  // Preserve the original runtime context/prototype (grammY getters/methods),
+  // and only override reply methods for observability.
+  const tracked = Object.create(ctx) as ChatReplyContext;
+  tracked.reply = async (text: string) => {
+    onReplyObserved();
+    return ctx.reply(text);
+  };
+  if (typeof ctx.replyWithDocument === "function") {
+    tracked.replyWithDocument = async (document: InputFile, options?: { caption?: string }) => {
+      onReplyObserved();
+      return ctx.replyWithDocument!(document, options);
+    };
+  }
+  return tracked;
+}
+
+function hasAssistantResponseSince(chatId: number, sinceMs: number): boolean {
+  const lastReplyAtMs = lastObservedReplyAtByChat.get(chatId) ?? 0;
+  if (lastReplyAtMs >= sinceMs) {
+    return true;
+  }
+  const assistantSnapshot = lastAssistantReplyByChat.get(chatId);
+  if (assistantSnapshot && assistantSnapshot.atMs >= sinceMs) {
+    return true;
+  }
+  const recentTurns = recentConversationByChat.get(chatId) ?? [];
+  return recentTurns.some((turn) => turn.role === "assistant" && turn.atMs >= sinceMs);
+}
+
 function getActor(ctx: ChatReplyContext): { chatId: number; userId: number } {
   return {
     chatId: ctx.chat.id,
@@ -7758,6 +7928,87 @@ function clearPendingIntentClarification(chatId: number, userId?: number): void 
   pendingIntentClarificationByChat.delete(chatId);
 }
 
+function setIntentActionOutcome(params: {
+  chatId: number;
+  route: Exclude<NaturalIntentHandlerName, "none">;
+  source: string;
+  success: boolean;
+  error?: string;
+}): void {
+  pendingIntentActionOutcomeByChat.set(params.chatId, {
+    route: params.route,
+    source: params.source,
+    success: params.success,
+    ...(params.error ? { error: truncateInline(params.error, 500) } : {}),
+    atMs: Date.now(),
+  });
+}
+
+function consumeIntentActionOutcome(params: {
+  chatId: number;
+  route: Exclude<NaturalIntentHandlerName, "none">;
+  delegatedSource: string;
+}): IntentActionOutcome | null {
+  const outcome = pendingIntentActionOutcomeByChat.get(params.chatId);
+  if (!outcome) {
+    return null;
+  }
+  if (outcome.route !== params.route) {
+    return null;
+  }
+  if (
+    outcome.source !== params.delegatedSource &&
+    !outcome.source.startsWith(`${params.delegatedSource}:`) &&
+    !params.delegatedSource.startsWith(`${outcome.source}:`)
+  ) {
+    return null;
+  }
+  pendingIntentActionOutcomeByChat.delete(params.chatId);
+  return outcome;
+}
+
+function isSimpleConfirmationReply(normalizedText: string): boolean {
+  return /^(si|sí|no|ok|dale|listo|cancelar|cancela|confirmar|confirmo|afirmativo|negativo)$/i.test(normalizedText);
+}
+
+function hasLikelyPathInClarificationReply(raw: string): boolean {
+  if (
+    /(^|[\s"'`])(\.?\/?[a-z0-9._-]+\/)*[a-z0-9._-]+\.[a-z0-9]{1,12}([\s"'`]|$)/i.test(raw) ||
+    /(^|[\s"'`])(?:\/|\.{0,2}\/)[a-z0-9._/-]*\.{2,}[a-z0-9._/-]*([\s"'`]|$)/i.test(raw) ||
+    /(^|[\s"'`])[a-z0-9._-]+\/[a-z0-9._/-]*([\s"'`]|$)/i.test(raw)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function hasLikelyTemporalClarificationSignal(raw: string): boolean {
+  const normalized = normalizeIntentText(raw);
+  return (
+    /\b(hoy|manana|mañana|pasado manana|pasado mañana|esta tarde|esta noche|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b/.test(
+      normalized,
+    ) ||
+    /\b(en\s+\d{1,3}\s*(min|mins|minutos|hora|horas|dias|d[ií]as))\b/i.test(normalized) ||
+    /\b(a\s+las?\s+\d{1,2}(?::\d{2})?)\b/i.test(normalized) ||
+    /\b\d{1,2}:\d{2}\b/.test(raw)
+  );
+}
+
+function looksLikeNaturalNameClarification(raw: string): boolean {
+  const cleaned = raw.trim().replace(/^["'`]+|["'`]+$/g, "");
+  if (!cleaned || /[@/\\]/.test(cleaned)) {
+    return false;
+  }
+  const words = cleaned
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter(Boolean);
+  if (words.length < 1 || words.length > 4) {
+    return false;
+  }
+  return words.every((word) => /^[\p{L}][\p{L}'-]{1,}$/u.test(word));
+}
+
 function shouldTreatAsClarificationReply(params: {
   text: string;
   pending: PendingIntentClarification;
@@ -7783,7 +8034,7 @@ function shouldTreatAsClarificationReply(params: {
     }
   }
 
-  if (/^(si|sí|no|ok|dale|listo|cancelar|cancela|confirmar|confirmo|afirmativo|negativo)$/i.test(normalizedRaw)) {
+  if (isSimpleConfirmationReply(normalizedRaw)) {
     return true;
   }
 
@@ -7798,15 +8049,65 @@ function shouldTreatAsClarificationReply(params: {
   }
 
   const missing = new Set((params.pending.missing ?? []).map((item) => normalizeIntentText(item)));
-  if (missing.has("taskref") && /\btsk[-_#]?[a-z0-9._-]{2,}\b/i.test(raw)) {
+  const hasEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw);
+  const hasTaskRef =
+    /\btsk[-_#]?[a-z0-9._-]{2,}\b/i.test(raw) ||
+    /\b(?:ultima|última|ultimo|último|last)\b/i.test(raw) ||
+    /\b(?:tarea|recordatorio)\s*(?:numero|nro|#)?\s*\d{1,3}\b/i.test(raw) ||
+    /\b(?:numero|nro|#)\s*\d{1,3}\b/i.test(raw);
+  if (missing.has("taskref") && hasTaskRef) {
     return true;
   }
-  if (missing.has("to") && /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw)) {
+  if ((missing.has("to") || missing.has("email")) && hasEmail) {
+    return true;
+  }
+  if (missing.has("name") && looksLikeNaturalNameClarification(raw)) {
     return true;
   }
   if (
-    (missing.has("path") || missing.has("source") || missing.has("target")) &&
-    /(^|[\s"'`])(\.?\/?[a-z0-9._-]+\/)*[a-z0-9._-]+\.[a-z0-9]{1,8}([\s"'`]|$)/i.test(raw)
+    (missing.has("path") || missing.has("source") || missing.has("target") || missing.has("reference")) &&
+    hasLikelyPathInClarificationReply(raw)
+  ) {
+    return true;
+  }
+  if (missing.has("dueat") && hasLikelyTemporalClarificationSignal(raw)) {
+    return true;
+  }
+  if (missing.has("tasktitle")) {
+    const hasUsefulTitleText = normalizedRaw.length >= 4 && !isSimpleConfirmationReply(normalizedRaw);
+    if (hasUsefulTitleText) {
+      return true;
+    }
+  }
+  if (missing.has("query")) {
+    const hasUsefulQuery = normalizedRaw.length >= 4 && !isSimpleConfirmationReply(normalizedRaw);
+    if (hasUsefulQuery) {
+      return true;
+    }
+  }
+  if (
+    missing.has("skillreforindex") &&
+    (/\b(?:habilidad|skill)\s*(?:numero|nro|#)?\s*\d{1,3}\b/i.test(raw) ||
+      /\bsk[-_][a-z0-9._-]{2,}\b/i.test(raw) ||
+      /\b(?:ultima|última|ultimo|último|last)\b/i.test(raw))
+  ) {
+    return true;
+  }
+  if (
+    (missing.has("firstname") || missing.has("lastname")) &&
+    /\b[\p{L}]{2,}\s+[\p{L}]{2,}\b/u.test(raw)
+  ) {
+    return true;
+  }
+  if (
+    missing.has("sourcename") &&
+    (/\bfuente\b/i.test(raw) || /\b[a-z0-9]+_[a-z0-9._-]+\b/i.test(raw))
+  ) {
+    return true;
+  }
+  if (
+    missing.has("target") &&
+    (/\bresultado\s+\d{1,2}\b/i.test(raw) || /\bhttps?:\/\/\S+/i.test(raw))
   ) {
     return true;
   }
@@ -7815,6 +8116,28 @@ function shouldTreatAsClarificationReply(params: {
   }
 
   return false;
+}
+
+function shouldDropPendingClarificationForFreshIntent(text: string): boolean {
+  const raw = text.trim();
+  if (!raw) {
+    return false;
+  }
+  if (raw.startsWith("/")) {
+    return true;
+  }
+  const normalized = normalizeIntentText(raw);
+  if (normalized.length < 10) {
+    return false;
+  }
+  if (isSimpleConfirmationReply(normalized)) {
+    return false;
+  }
+  const verbs =
+    /\b(ver|mostrar|lista|listar|crear|crea|editar|edita|enviar|enviame|buscar|busca|abrir|abre|eliminar|borra|programa|recorda|recordar|ejecuta|revisar|consulta|analiza|resumi|resumir|actualiza|modifica|mueve|renombra)\b/;
+  const domains =
+    /\b(gmail|correo|email|destinatario|workspace|archivo|carpeta|documento|pdf|tarea|task|tsk|web|url|noticia|memoria|lim|shell|exec|comando|skill|habilidad)\b/;
+  return verbs.test(normalized) || domains.test(normalized);
 }
 
 function buildClarificationFollowupText(params: {
@@ -7902,6 +8225,7 @@ async function reliableReply(
   const formattedText = makeTouchFriendlyText(text);
   try {
     await ctx.reply(formattedText);
+    lastObservedReplyAtByChat.set(ctx.chat.id, Date.now());
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const allowOutbox = options?.allowOutbox ?? true;
@@ -10652,6 +10976,21 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
   if (!text) {
     return false;
   }
+  const markSuccess = () =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "self-maintenance",
+      source: params.source,
+      success: true,
+    });
+  const markFailure = (error: string) =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "self-maintenance",
+      source: params.source,
+      success: false,
+      error,
+    });
   const normalizedText = normalizeIntentText(text);
   let persistedUserTurn = false;
   const persistUserTurnIfNeeded = async () => {
@@ -10684,6 +11023,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
             lines: activeDraft.lines.length,
           },
         });
+        markSuccess();
         return true;
       }
 
@@ -10697,6 +11037,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
             "Di 'listo, crea la habilidad' para aplicarlo o 'cancelar habilidad' para descartar.",
           ].join("\n"),
         );
+        markSuccess();
         return true;
       }
 
@@ -10712,6 +11053,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
         }
         const instruction = sanitizeSelfSkillText(selfSkillDrafts.buildInstruction(params.ctx.chat.id));
         if (!instruction) {
+          markFailure("selfskill-draft-empty");
           await params.ctx.reply(
             "El borrador esta vacio. Agrega una linea primero (ej: 'agrega: responder siempre en bullets').",
           );
@@ -10738,6 +11080,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
             length: instruction.length,
           },
         });
+        markSuccess();
         return true;
       }
 
@@ -10763,9 +11106,11 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           lines: updated.lines.length,
         },
       });
+      markSuccess();
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      markFailure(message);
       await params.ctx.reply(`No pude procesar el borrador de habilidad: ${message}`);
       await safeAudit({
         type: "selfskill.draft_failed",
@@ -10792,6 +11137,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
       const result = await selfSkillStore.listInstructions();
       if (result.entries.length === 0) {
         await params.ctx.reply("No hay habilidades dinámicas agregadas todavía.");
+        markSuccess();
         return true;
       }
       await replyLong(
@@ -10810,6 +11156,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           count: result.entries.length,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -10845,6 +11192,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
             seed: Boolean(instruction),
           },
         });
+        markSuccess();
         return true;
       }
 
@@ -10867,6 +11215,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           relPath: saved.relPath,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -10876,6 +11225,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
       const hasSkillRef = Boolean(skillRef);
       const hasSkillIndex = typeof skillIndex === "number" && Number.isFinite(skillIndex) && skillIndex !== 0;
       if (!hasSkillRef && !hasSkillIndex) {
+        markFailure("selfskill-delete-missing-ref");
         await params.ctx.reply(
           "Indica qué habilidad eliminar. Ejemplos: 'elimina la habilidad 2', 'elimina la última habilidad' o 'elimina la habilidad #sk-abc123'.",
         );
@@ -10901,6 +11251,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           remaining: removed.remaining,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -10918,6 +11269,7 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           source: params.source,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -10936,10 +11288,12 @@ async function maybeHandleNaturalSelfMaintenanceInstruction(params: {
           source: params.source,
         },
       });
+      markSuccess();
       return true;
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    markFailure(message);
     await params.ctx.reply(`No pude aplicar auto-mantenimiento: ${message}`);
     await safeAudit({
       type: "selfmaintenance.intent_failed",
@@ -11365,6 +11719,21 @@ async function maybeHandleNaturalScheduleInstruction(params: {
   if (!intent.shouldHandle || !intent.action) {
     return false;
   }
+  const markSuccess = () =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "schedule",
+      source: params.source,
+      success: true,
+    });
+  const markFailure = (error: string) =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "schedule",
+      source: params.source,
+      success: false,
+      error,
+    });
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -11398,6 +11767,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
             count: 0,
           },
         });
+        markSuccess();
         return true;
       }
       const responseText = [
@@ -11424,11 +11794,13 @@ async function maybeHandleNaturalScheduleInstruction(params: {
           count: pending.length,
         },
       });
+      markSuccess();
       return true;
     }
 
     if (intent.action === "create") {
       if (!intent.dueAt || !Number.isFinite(intent.dueAt.getTime())) {
+        markFailure("schedule-create-missing-datetime");
         await params.ctx.reply(
           "No pude inferir fecha/hora. Ejemplos: 'recordame mañana a las 10 pagar expensas' o 'en 2 horas llamo a Juan'.",
         );
@@ -11436,6 +11808,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
       }
       const dueAt = intent.dueAt;
       if (dueAt.getTime() <= Date.now() + 10_000) {
+        markFailure("schedule-create-datetime-past");
         await params.ctx.reply(
           "La fecha/hora quedó en pasado o demasiado cerca. Indícame una hora futura (ej: en 10 minutos).",
         );
@@ -11443,6 +11816,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
       }
       const title = intent.taskTitle?.trim() ?? "";
       if (!title) {
+        markFailure("schedule-create-missing-title");
         await params.ctx.reply("No pude inferir la tarea. Ejemplo: 'recordame mañana a las 10 pagar expensas'.");
         return true;
       }
@@ -11452,6 +11826,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
       if (intent.scheduleEmail) {
         const accessIssue = getGmailAccessIssue(params.ctx);
         if (accessIssue) {
+          markFailure("schedule-create-email-access-blocked");
           await params.ctx.reply(accessIssue);
           return true;
         }
@@ -11459,6 +11834,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
 
       const scheduledEmailTo = intent.emailTo?.trim() || "";
       if (intent.scheduleEmail && !scheduledEmailTo && !config.gmailAccountEmail?.trim()) {
+        markFailure("schedule-create-email-missing-recipient");
         await params.ctx.reply(
           "No tengo destinatario para el email programado. Configura GMAIL_ACCOUNT_EMAIL o indícalo en el mensaje.",
         );
@@ -11516,17 +11892,20 @@ async function maybeHandleNaturalScheduleInstruction(params: {
           dueAt: created.dueAt,
         },
       });
+      markSuccess();
       return true;
     }
 
     if (intent.action === "delete") {
       const ref = intent.taskRef?.trim() ?? "";
       if (!ref) {
+        markFailure("schedule-delete-missing-ref");
         await params.ctx.reply("Indica qué tarea eliminar. Ejemplos: 'elimina tarea 2' o 'borra la última tarea'.");
         return true;
       }
       const target = scheduledTasks.resolveTaskByRef(params.ctx.chat.id, ref);
       if (!target) {
+        markFailure("schedule-delete-ref-not-found");
         await params.ctx.reply("No encontré esa tarea pendiente. Usa 'lista mis tareas' para ver índices.");
         return true;
       }
@@ -11542,17 +11921,20 @@ async function maybeHandleNaturalScheduleInstruction(params: {
           taskId: canceled.id,
         },
       });
+      markSuccess();
       return true;
     }
 
     if (intent.action === "edit") {
       const ref = intent.taskRef?.trim() ?? "";
       if (!ref) {
+        markFailure("schedule-edit-missing-ref");
         await params.ctx.reply("Indica qué tarea editar. Ejemplo: 'edita tarea 2 para mañana 18:30'.");
         return true;
       }
       const target = scheduledTasks.resolveTaskByRef(params.ctx.chat.id, ref);
       if (!target) {
+        markFailure("schedule-edit-ref-not-found");
         await params.ctx.reply("No encontré esa tarea pendiente. Usa 'lista mis tareas' para ver índices.");
         return true;
       }
@@ -11563,6 +11945,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
       }
       if (intent.dueAt && Number.isFinite(intent.dueAt.getTime())) {
         if (intent.dueAt.getTime() <= Date.now() + 10_000) {
+          markFailure("schedule-edit-datetime-past");
           await params.ctx.reply("La nueva fecha/hora debe ser futura.");
           return true;
         }
@@ -11570,6 +11953,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
       }
 
       if (!changes.title && !changes.dueAt) {
+        markFailure("schedule-edit-no-changes");
         await params.ctx.reply(
           "No detecté cambios. Ejemplos: 'edita tarea 2 para mañana 18' o 'edita tarea 2 texto: llamar a Juan'.",
         );
@@ -11595,10 +11979,13 @@ async function maybeHandleNaturalScheduleInstruction(params: {
           changedTitle: Boolean(changes.title),
         },
       });
+      markSuccess();
       return true;
     }
+    markFailure("schedule-action-not-implemented");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    markFailure(message);
     await params.ctx.reply(`No pude gestionar la tarea programada: ${message}`);
     await safeAudit({
       type: "schedule.intent_failed",
@@ -11627,6 +12014,21 @@ async function maybeHandleNaturalMemoryInstruction(params: {
   if (!intent.shouldHandle || !intent.action) {
     return false;
   }
+  const markSuccess = () =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "memory",
+      source: params.source,
+      success: true,
+    });
+  const markFailure = (error: string) =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "memory",
+      source: params.source,
+      success: false,
+      error,
+    });
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -11673,11 +12075,13 @@ async function maybeHandleNaturalMemoryInstruction(params: {
           backendFallbackCount: status.backendFallbackCount,
         },
       });
+      markSuccess();
       return true;
     }
 
     const query = intent.query?.trim() ?? "";
     if (!query || isGenericMemoryQuery(query)) {
+      markFailure("memory-missing-query");
       await params.ctx.reply(
         [
           "Puedo buscar en memoria, pero necesito el tema.",
@@ -11726,6 +12130,7 @@ async function maybeHandleNaturalMemoryInstruction(params: {
           query,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -11748,9 +12153,11 @@ async function maybeHandleNaturalMemoryInstruction(params: {
         hits: hits.length,
       },
     });
+    markSuccess();
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    markFailure(message);
     await params.ctx.reply(`No pude consultar memoria: ${message}`);
     await safeAudit({
       type: "memory.intent_failed",
@@ -11777,6 +12184,21 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
   if (!intent.shouldHandle || !intent.action) {
     return false;
   }
+  const markSuccess = () =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "workspace",
+      source: params.source,
+      success: true,
+    });
+  const markFailure = (error: string) =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "workspace",
+      source: params.source,
+      success: false,
+      error,
+    });
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -11788,6 +12210,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
     });
   }
 
+  markSuccess();
   try {
     const autocompleteNotices: string[] = [];
     const resolveMaybeAutocompletePath = async (rawPath: string | undefined, label: string): Promise<string | undefined> => {
@@ -12776,6 +13199,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    markFailure(message);
     await params.ctx.reply(`No pude operar workspace: ${message}`);
     await safeAudit({
       type: "workspace.intent_failed",
@@ -13102,6 +13526,31 @@ async function maybeHandleNaturalDocumentInstruction(params: {
   if (!intent.shouldHandle) {
     return false;
   }
+  const markSuccess = () =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "document",
+      source: params.source,
+      success: true,
+    });
+  const markFailure = (error: string) =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "document",
+      source: params.source,
+      success: false,
+      error,
+    });
+  const replyAndPersist = async (text: string): Promise<void> => {
+    await replyLong(params.ctx, text);
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(text, 2600),
+      source: `${params.source}:doc-intent`,
+    });
+  };
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -13115,7 +13564,8 @@ async function maybeHandleNaturalDocumentInstruction(params: {
 
   const resolvedPath = await resolveDocumentReference(intent.references, intent.preferWorkspace);
   if (!resolvedPath) {
-    await params.ctx.reply(
+    markFailure("document-reference-not-found");
+    await replyAndPersist(
       [
         `Detecté intención de leer documento, pero no encontré: ${intent.references.join(", ")}`,
         "Prueba con ruta explícita o usa /readfile.",
@@ -13140,7 +13590,8 @@ async function maybeHandleNaturalDocumentInstruction(params: {
     rememberLastDocumentSnapshot(params.ctx.chat.id, documentResult.path, documentResult.text);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await params.ctx.reply(`No pude leer ${resolvedPath}: ${message}`);
+    markFailure(message);
+    await replyAndPersist(`No pude leer ${resolvedPath}: ${message}`);
     await safeAudit({
       type: "doc.intent_read_failed",
       chatId: params.ctx.chat.id,
@@ -13156,32 +13607,31 @@ async function maybeHandleNaturalDocumentInstruction(params: {
 
   if (!openAi.isConfigured()) {
     const preview = truncateInline(documentResult.text, 3000);
-    await replyLong(
-      params.ctx,
+    const responseText =
       [
         `Documento: ${documentResult.path}`,
         `Formato: ${documentResult.format}`,
         `Extractor: ${documentResult.extractor}`,
         "",
         preview || "(No se extrajo texto útil)",
-      ].join("\n"),
-    );
+      ].join("\n");
+    await replyAndPersist(responseText);
+    markSuccess();
     return true;
   }
 
   const shouldAnalyze = intent.analysisRequested || !intent.readRequested;
   if (!shouldAnalyze) {
     const preview = truncateInline(documentResult.text, 3000);
-    await replyLong(
-      params.ctx,
+    const responseText =
       [
         `Documento: ${documentResult.path}`,
         `Formato: ${documentResult.format}`,
         `Extractor: ${documentResult.extractor}`,
         "",
         preview || "(No se extrajo texto útil)",
-      ].join("\n"),
-    );
+      ].join("\n");
+    await replyAndPersist(responseText);
     await safeAudit({
       type: "doc.intent_read_only",
       chatId: params.ctx.chat.id,
@@ -13192,6 +13642,7 @@ async function maybeHandleNaturalDocumentInstruction(params: {
         format: documentResult.format,
       },
     });
+    markSuccess();
     return true;
   }
 
@@ -13213,14 +13664,7 @@ async function maybeHandleNaturalDocumentInstruction(params: {
       chatId: params.ctx.chat.id,
     });
     const answer = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
-    await replyLong(params.ctx, answer);
-    await appendConversationTurn({
-      chatId: params.ctx.chat.id,
-      userId: params.userId,
-      role: "assistant",
-      text: answer,
-      source: `${params.source}:doc-intent`,
-    });
+    await replyAndPersist(answer);
 
     await safeAudit({
       type: "doc.intent_handled",
@@ -13234,19 +13678,31 @@ async function maybeHandleNaturalDocumentInstruction(params: {
         answerLength: answer.length,
       },
     });
+    markSuccess();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await params.ctx.reply(`No pude analizar el documento con OpenAI: ${message}`);
+    const preview = truncateInline(documentResult.text, 2800);
+    const fallbackText = [
+      `No pude analizar el documento con OpenAI: ${message}`,
+      "Te dejo una vista previa para continuar:",
+      "",
+      `Documento: ${documentResult.path}`,
+      `Formato: ${documentResult.format}`,
+      preview || "(No se extrajo texto útil)",
+    ].join("\n");
+    await replyAndPersist(fallbackText);
     await safeAudit({
-      type: "doc.intent_analyze_failed",
+      type: "doc.intent_analyze_fallback",
       chatId: params.ctx.chat.id,
       userId: params.userId,
       details: {
         source: params.source,
         path: documentResult.path,
+        fallback: true,
         error: message,
       },
     });
+    markSuccess();
   }
 
   return true;
@@ -13424,6 +13880,31 @@ async function maybeHandleNaturalWebInstruction(params: {
   if (!intent.shouldHandle) {
     return false;
   }
+  const markSuccess = () =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "web",
+      source: params.source,
+      success: true,
+    });
+  const markFailure = (error: string) =>
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "web",
+      source: params.source,
+      success: false,
+      error,
+    });
+  const replyAndPersist = async (text: string): Promise<void> => {
+    await replyLong(params.ctx, text);
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(text, 2600),
+      source: `${params.source}:web-intent`,
+    });
+  };
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -13436,6 +13917,7 @@ async function maybeHandleNaturalWebInstruction(params: {
   }
 
   if (!config.enableWebBrowse) {
+    markFailure("web-disabled");
     await params.ctx.reply("Navegación web deshabilitada por configuración (ENABLE_WEB_BROWSE=false).");
     await safeAudit({
       type: "web.intent_disabled",
@@ -13456,9 +13938,11 @@ async function maybeHandleNaturalWebInstruction(params: {
       if (intent.sourceIndex >= 1 && intent.sourceIndex <= lastResults.length) {
         targetUrl = lastResults[intent.sourceIndex - 1]?.url;
       } else if (lastResults.length === 0) {
+        markFailure("web-open-missing-list-context");
         await params.ctx.reply("No hay resultados web previos en este chat. Ejecuta una búsqueda primero.");
         return true;
       } else {
+        markFailure("web-open-index-out-of-range");
         await params.ctx.reply(`Índice fuera de rango. Usa 1..${lastResults.length}.`);
         return true;
       }
@@ -13508,6 +13992,7 @@ async function maybeHandleNaturalWebInstruction(params: {
             sourceIndex: intent.sourceIndex ?? null,
           },
         });
+        markSuccess();
         return true;
       }
 
@@ -13537,35 +14022,65 @@ async function maybeHandleNaturalWebInstruction(params: {
           : ["Al final, incluye una línea de fuente con la URL usada."]),
       ].join("\n");
 
-      const promptContext = await buildPromptContextForQuery(`${params.text}\n${page.title}`, {
-        chatId: params.ctx.chat.id,
-      });
-      const answerRaw = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
-      const answer = ecoEnabled ? truncateInline(answerRaw, 900) : answerRaw;
-      await replyLong(params.ctx, answer);
-      await params.ctx.reply(`Fuente: ${page.finalUrl}`);
-      await appendConversationTurn({
-        chatId: params.ctx.chat.id,
-        userId: params.userId,
-        role: "assistant",
-        text: `${answer}\nFuente: ${page.finalUrl}`,
-        source: `${params.source}:web-intent`,
-      });
-      await safeAudit({
-        type: "web.intent_open",
-        chatId: params.ctx.chat.id,
-        userId: params.userId,
-        details: {
-          source: params.source,
-          url: targetUrl,
-          finalUrl: page.finalUrl,
-          analyzed: true,
-          sourceIndex: intent.sourceIndex ?? null,
-        },
-      });
-      return true;
+      try {
+        const promptContext = await buildPromptContextForQuery(`${params.text}\n${page.title}`, {
+          chatId: params.ctx.chat.id,
+        });
+        const answerRaw = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
+        const answer = ecoEnabled ? truncateInline(answerRaw, 900) : answerRaw;
+        await replyLong(params.ctx, answer);
+        await params.ctx.reply(`Fuente: ${page.finalUrl}`);
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: `${answer}\nFuente: ${page.finalUrl}`,
+          source: `${params.source}:web-intent`,
+        });
+        await safeAudit({
+          type: "web.intent_open",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            url: targetUrl,
+            finalUrl: page.finalUrl,
+            analyzed: true,
+            sourceIndex: intent.sourceIndex ?? null,
+          },
+        });
+        markSuccess();
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const preview = truncateInline(page.text, 3200);
+        const fallbackText = [
+          header,
+          "",
+          preview || "(sin contenido textual útil)",
+          "",
+          `No pude completar el análisis con IA: ${message}`,
+          `Fuente: ${page.finalUrl}`,
+        ].join("\n");
+        await replyAndPersist(fallbackText);
+        await safeAudit({
+          type: "web.intent_open_ai_fallback",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            url: targetUrl,
+            finalUrl: page.finalUrl,
+            sourceIndex: intent.sourceIndex ?? null,
+            error: message,
+          },
+        });
+        markSuccess();
+        return true;
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      markFailure(message);
       await params.ctx.reply(`No pude abrir esa URL: ${message}`);
       await safeAudit({
         type: "web.intent_open_failed",
@@ -13615,6 +14130,7 @@ async function maybeHandleNaturalWebInstruction(params: {
           newsRequested: intent.newsRequested,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -13653,6 +14169,7 @@ async function maybeHandleNaturalWebInstruction(params: {
           results: hits.length,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -13689,6 +14206,7 @@ async function maybeHandleNaturalWebInstruction(params: {
           results: hits.length,
         },
       });
+      markSuccess();
       return true;
     }
 
@@ -13740,36 +14258,70 @@ async function maybeHandleNaturalWebInstruction(params: {
       ...(ecoEnabled ? [] : ["Incluye al final una sección 'Fuentes usadas:' con las URLs en viñetas."]),
     ].join("\n");
 
-    const promptContext = await buildPromptContextForQuery(params.text, {
-      chatId: params.ctx.chat.id,
-    });
-    const answerRaw = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
-    const answer = ecoEnabled ? truncateInline(answerRaw, 1200) : answerRaw;
-    await replyLong(params.ctx, answer);
-    await appendConversationTurn({
-      chatId: params.ctx.chat.id,
-      userId: params.userId,
-      role: "assistant",
-      text: answer,
-      source: `${params.source}:web-intent`,
-    });
-    await safeAudit({
-      type: "web.intent_search_synth",
-      chatId: params.ctx.chat.id,
-      userId: params.userId,
-      details: {
-        source: params.source,
-        query,
-        rawQuery,
-        usedFallbackQuery,
-        newsRequested: intent.newsRequested,
-        results: hits.length,
-        sources: sources.length,
-      },
-    });
-    return true;
+    try {
+      const promptContext = await buildPromptContextForQuery(params.text, {
+        chatId: params.ctx.chat.id,
+      });
+      const answerRaw = await askOpenAiForChat({ chatId: params.ctx.chat.id, prompt, context: promptContext });
+      const answer = ecoEnabled ? truncateInline(answerRaw, 1200) : answerRaw;
+      await replyLong(params.ctx, answer);
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: answer,
+        source: `${params.source}:web-intent`,
+      });
+      await safeAudit({
+        type: "web.intent_search_synth",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          query,
+          rawQuery,
+          usedFallbackQuery,
+          newsRequested: intent.newsRequested,
+          results: hits.length,
+          sources: sources.length,
+        },
+      });
+      markSuccess();
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const fallbackText = [
+        `No pude sintetizar con IA: ${message}`,
+        "Te dejo resultados directos para continuar:",
+        "",
+        buildWebResultsListText({
+          query: rawQuery.trim() || query,
+          hits: top,
+          newsRequested: intent.newsRequested,
+        }),
+      ].join("\n");
+      await replyAndPersist(fallbackText);
+      await safeAudit({
+        type: "web.intent_search_synth_fallback",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          query,
+          rawQuery,
+          usedFallbackQuery,
+          newsRequested: intent.newsRequested,
+          results: hits.length,
+          sources: sources.length,
+          error: message,
+        },
+      });
+      markSuccess();
+      return true;
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    markFailure(message);
     await params.ctx.reply(`No pude buscar en web: ${message}`);
     await safeAudit({
       type: "web.intent_search_failed",
@@ -13795,6 +14347,36 @@ async function maybeHandleNaturalGmailRecipientsInstruction(params: {
   userId?: number;
   persistUserTurn: boolean;
 }): Promise<boolean> {
+  const replyAndPersist = async (text: string): Promise<void> => {
+    await reliableReply(params.ctx, text, { source: `${params.source}:gmail-recipients-intent` });
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(text, 2600),
+      source: `${params.source}:gmail-recipients-intent`,
+    });
+  };
+  const markFailure = (message: string) => {
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "gmail-recipients",
+      source: params.source,
+      success: false,
+      error: message,
+    });
+  };
+  const isSuspiciousRecipientName = (raw: string): boolean => {
+    const normalized = normalizeIntentText(raw);
+    if (!normalized) {
+      return true;
+    }
+    if (normalized.includes("@")) {
+      return true;
+    }
+    return /\b(con|para|correo|mail|email|gmail|destinatari[oa]|contacto)\b/.test(normalized);
+  };
+
   const intent = detectGmailRecipientNaturalIntent(params.text);
   if (!intent.shouldHandle || !intent.action) {
     return false;
@@ -13814,26 +14396,76 @@ async function maybeHandleNaturalGmailRecipientsInstruction(params: {
     if (intent.action === "list") {
       const list = listEmailRecipients(params.ctx.chat.id);
       if (list.length === 0) {
-        await params.ctx.reply("No hay destinatarios guardados.");
+        await replyAndPersist("No hay destinatarios guardados.");
+        setIntentActionOutcome({
+          chatId: params.ctx.chat.id,
+          route: "gmail-recipients",
+          source: params.source,
+          success: true,
+        });
         return true;
       }
       const lines = list.map((item, idx) => `${idx + 1}. ${item.name} <${item.email}>`);
-      await replyLong(params.ctx, [`Destinatarios guardados (${list.length}):`, ...lines].join("\n"));
+      const responseText = [`Destinatarios guardados (${list.length}):`, ...lines].join("\n");
+      await replyLong(params.ctx, responseText);
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: truncateInline(responseText, 2600),
+        source: `${params.source}:gmail-recipients-intent`,
+      });
+      await safeAudit({
+        type: "gmail.recipients_list",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          count: list.length,
+        },
+      });
+      setIntentActionOutcome({
+        chatId: params.ctx.chat.id,
+        route: "gmail-recipients",
+        source: params.source,
+        success: true,
+      });
       return true;
     }
 
     if (intent.action === "delete") {
       const name = intent.name?.trim() ?? "";
       if (!name) {
-        await params.ctx.reply("Indica el nombre a eliminar. Ejemplo: elimina destinatario Maria.");
+        const message = "Indica el nombre a eliminar. Ejemplo: elimina destinatario Maria.";
+        await replyAndPersist(message);
+        markFailure("missing-name");
         return true;
       }
       const removed = await deleteEmailRecipient(params.ctx.chat.id, name);
       if (!removed) {
-        await params.ctx.reply(`No encontré destinatario "${name}".`);
+        const message = `No encontré destinatario "${name}".`;
+        await replyAndPersist(message);
+        markFailure("recipient-not-found");
         return true;
       }
-      await params.ctx.reply(`Destinatario eliminado: ${removed.name} <${removed.email}>`);
+      const responseText = `Destinatario eliminado: ${removed.name} <${removed.email}>`;
+      await replyAndPersist(responseText);
+      await safeAudit({
+        type: "gmail.recipients_delete",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          name: removed.name,
+          email: removed.email,
+        },
+      });
+      setIntentActionOutcome({
+        chatId: params.ctx.chat.id,
+        route: "gmail-recipients",
+        source: params.source,
+        success: true,
+      });
       return true;
     }
 
@@ -13841,9 +14473,40 @@ async function maybeHandleNaturalGmailRecipientsInstruction(params: {
       const name = intent.name?.trim() ?? "";
       const email = intent.email?.trim() ?? "";
       if (!name || !email) {
-        await params.ctx.reply(
-          "Faltan datos. Ejemplo: agrega destinatario Maria maria@empresa.com",
-        );
+        const message = "Faltan datos. Ejemplo: agrega destinatario Maria maria@empresa.com";
+        await replyAndPersist(message);
+        markFailure("missing-name-or-email");
+        await safeAudit({
+          type: "gmail.recipients_validation_failed",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            action: intent.action,
+            reason: "missing-name-or-email",
+          },
+        });
+        return true;
+      }
+      if (isSuspiciousRecipientName(name)) {
+        const message = [
+          `No guardé el destinatario porque el nombre parece ambiguo: "${name}".`,
+          "Ejemplo correcto: Agregá destinatario Carla carla@empresa.com",
+        ].join("\n");
+        await replyAndPersist(message);
+        markFailure("ambiguous-recipient-name");
+        await safeAudit({
+          type: "gmail.recipients_validation_failed",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            action: intent.action,
+            reason: "ambiguous-recipient-name",
+            name,
+            email,
+          },
+        });
         return true;
       }
       const result = await upsertEmailRecipient({
@@ -13851,16 +14514,44 @@ async function maybeHandleNaturalGmailRecipientsInstruction(params: {
         name,
         email,
       });
-      await params.ctx.reply(
-        result.created
-          ? `Destinatario agregado: ${result.row.name} <${result.row.email}>`
-          : `Destinatario actualizado: ${result.row.name} <${result.row.email}>`,
-      );
+      const responseText = result.created
+        ? `Destinatario agregado: ${result.row.name} <${result.row.email}>`
+        : `Destinatario actualizado: ${result.row.name} <${result.row.email}>`;
+      await replyAndPersist(responseText);
+      await safeAudit({
+        type: "gmail.recipients_upsert",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          action: intent.action,
+          created: result.created,
+          name: result.row.name,
+          email: result.row.email,
+        },
+      });
+      setIntentActionOutcome({
+        chatId: params.ctx.chat.id,
+        route: "gmail-recipients",
+        source: params.source,
+        success: true,
+      });
       return true;
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await params.ctx.reply(`No pude operar destinatarios: ${message}`);
+    markFailure(message);
+    await replyAndPersist(`No pude operar destinatarios: ${message}`);
+    await safeAudit({
+      type: "gmail.recipients_failed",
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        action: intent.action,
+        error: message,
+      },
+    });
     return true;
   }
 
@@ -13925,7 +14616,21 @@ async function maybeHandleNaturalGmailInstruction(params: {
 
     const accessIssue = getGmailAccessIssue(params.ctx);
     if (accessIssue) {
-      await params.ctx.reply(accessIssue);
+      await reliableReply(params.ctx, accessIssue, { source: `${params.source}:gmail-intent` });
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: truncateInline(accessIssue, 2600),
+        source: `${params.source}:gmail-intent`,
+      });
+      setIntentActionOutcome({
+        chatId: params.ctx.chat.id,
+        route: "gmail",
+        source: params.source,
+        success: false,
+        error: "gmail-access-blocked",
+      });
       await safeAudit({
         type: "gmail.intent_blocked",
         chatId: params.ctx.chat.id,
@@ -13973,15 +14678,50 @@ async function maybeHandleNaturalGmailInstruction(params: {
     if (intent.action === "list") {
       const query = intent.query?.trim() || undefined;
       await replyProgress(params.ctx, `Consultando Gmail${query ? ` (query: ${query})` : ""}...`);
-      const messages = await gmailAccount.listMessages(query, intent.limit);
+      let messages: GmailMessageSummary[] = [];
+      let effectiveQuery = query;
+      let queryFallbackApplied = false;
+      try {
+        messages = await gmailAccount.listMessages(query, intent.limit);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const metadataQueryIssue = /metadata scope does not support 'q' parameter/i.test(message);
+        if (!query || !metadataQueryIssue) {
+          throw error;
+        }
+        queryFallbackApplied = true;
+        effectiveQuery = undefined;
+        await replyProgress(params.ctx, "Gmail no permite query con este scope; reintentando inbox sin filtro...");
+        messages = await gmailAccount.listMessages(undefined, intent.limit);
+        await safeAudit({
+          type: "gmail.intent_list_query_fallback",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            query,
+            reason: message,
+          },
+        });
+      }
       if (messages.length === 0) {
-        await params.ctx.reply("Sin mensajes para ese filtro.");
+        const responseText = queryFallbackApplied
+          ? "Sin mensajes para ese filtro (reintenté inbox sin query por limitación de scope)."
+          : "Sin mensajes para ese filtro.";
+        await reliableReply(params.ctx, responseText, { source: `${params.source}:gmail-intent` });
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: responseText,
+          source: `${params.source}:gmail-intent`,
+        });
         return true;
       }
       rememberGmailListResults(params.ctx.chat.id, messages);
       rememberGmailListContext({
         chatId: params.ctx.chat.id,
-        title: `Gmail: ${query || "inbox"}`,
+        title: `Gmail: ${effectiveQuery || "inbox"}`,
         messages,
         source: `${params.source}:gmail-intent`,
       });
@@ -13996,7 +14736,10 @@ async function maybeHandleNaturalGmailInstruction(params: {
           .filter(Boolean)
           .join("\n"),
       );
-      const responseText = [`Mensajes (${messages.length}):`, ...lines].join("\n\n");
+      const responseHeader = queryFallbackApplied
+        ? `Mensajes (${messages.length}) [fallback inbox sin query por scope metadata]:`
+        : `Mensajes (${messages.length}):`;
+      const responseText = [responseHeader, ...lines].join("\n\n");
       await replyLong(params.ctx, responseText);
       await appendConversationTurn({
         chatId: params.ctx.chat.id,
@@ -14012,7 +14755,8 @@ async function maybeHandleNaturalGmailInstruction(params: {
         details: {
           source: params.source,
           count: messages.length,
-          query: query ?? "",
+          query: effectiveQuery ?? "",
+          queryFallbackApplied,
           limit: intent.limit ?? null,
         },
       });
@@ -14022,7 +14766,21 @@ async function maybeHandleNaturalGmailInstruction(params: {
     if (intent.action === "send") {
       const blockReason = getPolicyCapabilityBlockReason(params.ctx.chat.id, "gmail.send");
       if (blockReason) {
-        await params.ctx.reply(blockReason);
+        await reliableReply(params.ctx, blockReason, { source: `${params.source}:gmail-intent` });
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: truncateInline(blockReason, 2600),
+          source: `${params.source}:gmail-intent`,
+        });
+        setIntentActionOutcome({
+          chatId: params.ctx.chat.id,
+          route: "gmail",
+          source: params.source,
+          success: false,
+          error: "gmail-send-policy-blocked",
+        });
         return true;
       }
       let to = intent.to?.trim() ?? "";
@@ -14037,11 +14795,24 @@ async function maybeHandleNaturalGmailInstruction(params: {
       const isDefaultSubject = subject === "Mensaje desde Houdi Agent";
       const isDefaultBody = body === "" || body === "Mensaje enviado desde Houdi Agent.";
       if (!to) {
-        await params.ctx.reply(
-          intent.recipientName?.trim()
-            ? `No encontré destinatario "${intent.recipientName}". Agrégalo con: agrega destinatario ${intent.recipientName} <email>.`
-            : "No pude inferir el destinatario. Ejemplo natural: 'envía un correo a ana@empresa.com asunto: Hola cuerpo: te contacto por...'",
-        );
+        const responseText = intent.recipientName?.trim()
+          ? `No encontré destinatario "${intent.recipientName}". Agrégalo con: agrega destinatario ${intent.recipientName} <email>.`
+          : "No pude inferir el destinatario. Ejemplo natural: 'envía un correo a ana@empresa.com asunto: Hola cuerpo: te contacto por...'";
+        await reliableReply(params.ctx, responseText, { source: `${params.source}:gmail-intent` });
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: truncateInline(responseText, 2600),
+          source: `${params.source}:gmail-intent`,
+        });
+        setIntentActionOutcome({
+          chatId: params.ctx.chat.id,
+          route: "gmail",
+          source: params.source,
+          success: false,
+          error: "gmail-send-missing-recipient",
+        });
         return true;
       }
       if (intent.autoContentKind && (isDefaultBody || intent.draftRequested)) {
@@ -14154,6 +14925,13 @@ async function maybeHandleNaturalGmailInstruction(params: {
           userId: params.userId,
         })
       ) {
+        setIntentActionOutcome({
+          chatId: params.ctx.chat.id,
+          route: "gmail",
+          source: params.source,
+          success: false,
+          error: "pending-plan-confirmation",
+        });
         return true;
       }
       await replyProgress(params.ctx, `Enviando email a ${to}...`);
@@ -14217,7 +14995,22 @@ async function maybeHandleNaturalGmailInstruction(params: {
       }
     }
     if (!messageId) {
-      await params.ctx.reply("No pude identificar qué correo quieres operar. Pide primero una lista o indica el messageId.");
+      const responseText = "No pude identificar qué correo quieres operar. Pide primero una lista o indica el messageId.";
+      await reliableReply(params.ctx, responseText, { source: `${params.source}:gmail-intent` });
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: responseText,
+        source: `${params.source}:gmail-intent`,
+      });
+      setIntentActionOutcome({
+        chatId: params.ctx.chat.id,
+        route: "gmail",
+        source: params.source,
+        success: false,
+        error: "gmail-missing-message-id",
+      });
       return true;
     }
 
@@ -14292,7 +15085,22 @@ async function maybeHandleNaturalGmailInstruction(params: {
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await params.ctx.reply(`Error Gmail: ${message}`);
+    setIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: "gmail",
+      source: params.source,
+      success: false,
+      error: message,
+    });
+    const responseText = `Error Gmail: ${message}`;
+    await reliableReply(params.ctx, responseText, { source: `${params.source}:gmail-intent` });
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(responseText, 2600),
+      source: `${params.source}:gmail-intent`,
+    });
     await safeAudit({
       type: "gmail.intent_failed",
       chatId: params.ctx.chat.id,
@@ -14642,17 +15450,23 @@ async function maybeHandleNaturalIntentPipeline(params: {
   }
 
   const hasWorkspaceImageReferences = extractWorkspaceImageReferences(params.text).length > 0;
+  const selfMaintenanceIntentPreview = detectSelfMaintenanceIntent(params.text);
+  const gmailIntentPreview = detectGmailNaturalIntent(params.text);
+  const gmailRecipientsIntentPreview = detectGmailRecipientNaturalIntent(params.text);
   const scheduleIntentPreview = detectScheduleNaturalIntent(params.text);
   const hasStrongScheduledAutomationCue =
     scheduleIntentPreview.shouldHandle &&
     scheduleIntentPreview.action === "create" &&
     Boolean(scheduleIntentPreview.dueAt) &&
     Boolean(scheduleIntentPreview.automationInstruction?.trim());
+  const hasStrongSingleDomainCue =
+    selfMaintenanceIntentPreview.shouldHandle || gmailIntentPreview.shouldHandle || gmailRecipientsIntentPreview.shouldHandle;
   const skipAiSequencedPlan =
     extractRandomWorkspaceFileNameRequest(params.text).requested ||
     conversationalNarrative ||
     hasWorkspaceImageReferences ||
-    hasStrongScheduledAutomationCue;
+    hasStrongScheduledAutomationCue ||
+    hasStrongSingleDomainCue;
   if (!skipAiSequencedPlan && !params.source.includes(":seq-step-") && !params.source.includes(":chain-")) {
     const sequencedPlan = await classifySequencedIntentPlanWithAi({
       chatId: params.ctx.chat.id,
@@ -14774,6 +15588,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
   let semanticGap: number | null = null;
   let routerAbVariant: "A" | "B" = "A";
   let routerCanaryVersion: string | null = null;
+  let shadowRouteDecision: SemanticRouteDecision | null = null;
   let routerLayerDecision: RouteLayerDecision | null = null;
   let hierarchyDecision: HierarchicalIntentDecision | null = null;
   let ensembleTop: Array<{ name: Exclude<NaturalIntentHandlerName, "none">; score: number }> = [];
@@ -14906,6 +15721,37 @@ async function maybeHandleNaturalIntentPipeline(params: {
       semanticRouteDecision.score,
     );
   }
+  if (shouldRunIntentShadowMode(params.ctx.chat.id, params.text)) {
+    const shadowRouter = new IntentSemanticRouter({
+      routes: semanticIntentRouter.listRoutes(),
+      hybridAlpha: config.intentShadowAlpha,
+      minScoreGap: config.intentShadowMinScoreGap,
+      routeAlphaOverrides: config.intentRouterRouteAlphaOverrides,
+    });
+    shadowRouteDecision = shadowRouter.route(params.text, {
+      allowed: semanticAllowedCandidates as IntentRouteName[],
+      boosts: routeScoreBoosts,
+      alphaOverrides: config.intentRouterRouteAlphaOverrides,
+      topK: 5,
+    });
+    if (shadowRouteDecision) {
+      await safeAudit({
+        type: "intent.router.shadow",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          selected: shadowRouteDecision.handler,
+          score: shadowRouteDecision.score,
+          reason: shadowRouteDecision.reason,
+          alternatives: shadowRouteDecision.alternatives,
+          alpha: config.intentShadowAlpha,
+          minGap: config.intentShadowMinScoreGap,
+          textPreview: truncateInline(params.text, 220),
+        },
+      });
+    }
+  }
 
   if (shouldRunAiJudgeForEnsemble(semanticRouteDecision)) {
     aiRouteDecision = await classifyNaturalIntentRouteWithAi({
@@ -14985,6 +15831,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
       calibratedConfidence: semanticCalibratedConfidence,
       gap: semanticGap,
       ensembleTop,
+      aiSelected: aiRouteDecision?.handler,
       text: params.text,
     })
   ) {
@@ -15239,14 +16086,77 @@ async function maybeHandleNaturalIntentPipeline(params: {
     rememberSubagentDelegation(params.ctx.chat.id, delegatedSubagent);
     const delegatedSource =
       delegatedSubagent === "coordinator" ? params.source : `${params.source}:subagent:${delegatedSubagent}`;
+    const handlerStartedAtMs = Date.now();
+    let handlerObservedReply = false;
+    const trackedCtx = withReplyTracking(params.ctx, () => {
+      handlerObservedReply = true;
+      lastObservedReplyAtByChat.set(params.ctx.chat.id, Date.now());
+    });
     const handled = await executeIntentHandlerResilient({
       route: handler.name,
       source: delegatedSource,
       executor: async () =>
         handler.fn({
           ...params,
+          ctx: trackedCtx,
           source: delegatedSource,
         }),
+    });
+    if (handled && handler.name !== "lim") {
+      const gotResponse = handlerObservedReply || hasAssistantResponseSince(params.ctx.chat.id, handlerStartedAtMs);
+      if (!gotResponse) {
+        const guardMessage = `No pude confirmar la respuesta del dominio ${handler.name}. Reintentá la instrucción en una sola frase.`;
+        await reliableReply(params.ctx, guardMessage, {
+          source: `${delegatedSource}:reply-guard`,
+        });
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: guardMessage,
+          source: `${delegatedSource}:reply-guard`,
+        });
+        setIntentActionOutcome({
+          chatId: params.ctx.chat.id,
+          route: handler.name,
+          source: delegatedSource,
+          success: false,
+          error: "missing-assistant-response",
+        });
+        await safeAudit({
+          type: "intent.reply_guard.missing_response",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            route: handler.name,
+            delegatedSource,
+            startedAtMs: handlerStartedAtMs,
+          },
+        });
+      }
+    }
+    const actionOutcome = consumeIntentActionOutcome({
+      chatId: params.ctx.chat.id,
+      route: handler.name,
+      delegatedSource,
+    });
+    const actionSuccess = actionOutcome ? actionOutcome.success : handled;
+    const actionError = actionOutcome?.error ?? null;
+    await safeAudit({
+      type: "intent.execution.result",
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        route: handler.name,
+        delegatedSource,
+        handled,
+        actionSuccess,
+        actionError,
+        semanticRouterSelected: semanticRouteDecision?.handler ?? null,
+        shadowRouterSelected: shadowRouteDecision?.handler ?? null,
+      },
     });
     if (handled) {
       clearPendingIntentClarification(params.ctx.chat.id, params.userId);
@@ -15266,6 +16176,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
           routeLayers: routerLayerDecision?.layers ?? null,
           semanticRouterSelected: semanticRouteDecision?.handler ?? null,
           semanticRouterScore: semanticRouteDecision?.score ?? null,
+          shadowRouterSelected: shadowRouteDecision?.handler ?? null,
+          shadowRouterScore: shadowRouteDecision?.score ?? null,
           semanticCalibratedConfidence,
           semanticGap,
           routerAbVariant,
@@ -15330,6 +16242,23 @@ async function maybeHandleNaturalIntentPipeline(params: {
               },
             }
           : {}),
+        actionSuccess,
+        ...(actionError ? { actionError } : {}),
+        ...(shadowRouteDecision
+          ? {
+              shadow: {
+                handler: shadowRouteDecision.handler,
+                score: shadowRouteDecision.score,
+                reason: shadowRouteDecision.reason,
+                alternatives: shadowRouteDecision.alternatives as Array<{
+                  name: Exclude<NaturalIntentHandlerName, "none">;
+                  score: number;
+                }>,
+                alpha: config.intentShadowAlpha,
+                minScoreGap: config.intentShadowMinScoreGap,
+              },
+            }
+          : {}),
         finalHandler: handler.name,
         handled: true,
       });
@@ -15356,6 +16285,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
         routerAbVariant,
         routerCanaryVersion,
         ensembleTop,
+        shadowRouterSelected: shadowRouteDecision?.handler ?? null,
+        shadowRouterScore: shadowRouteDecision?.score ?? null,
         textPreview: truncateInline(params.text, 220),
       },
     });
@@ -15400,6 +16331,21 @@ async function maybeHandleNaturalIntentPipeline(params: {
       ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
       ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
       routerEnsembleTop: ensembleTop,
+      ...(shadowRouteDecision
+        ? {
+            shadow: {
+              handler: shadowRouteDecision.handler,
+              score: shadowRouteDecision.score,
+              reason: shadowRouteDecision.reason,
+              alternatives: shadowRouteDecision.alternatives as Array<{
+                name: Exclude<NaturalIntentHandlerName, "none">;
+                score: number;
+              }>,
+              alpha: config.intentShadowAlpha,
+              minScoreGap: config.intentShadowMinScoreGap,
+            },
+          }
+        : {}),
       finalHandler: "indexed-list-reference",
       handled: true,
     });
@@ -15446,6 +16392,21 @@ async function maybeHandleNaturalIntentPipeline(params: {
     ...(routerCanaryVersion ? { routerCanaryVersion } : {}),
     ...(routerLayerDecision ? { routerLayers: routerLayerDecision.layers, routerLayerReason: routerLayerDecision.reason } : {}),
     routerEnsembleTop: ensembleTop,
+    ...(shadowRouteDecision
+      ? {
+          shadow: {
+            handler: shadowRouteDecision.handler,
+            score: shadowRouteDecision.score,
+            reason: shadowRouteDecision.reason,
+            alternatives: shadowRouteDecision.alternatives as Array<{
+              name: Exclude<NaturalIntentHandlerName, "none">;
+              score: number;
+            }>,
+            alpha: config.intentShadowAlpha,
+            minScoreGap: config.intentShadowMinScoreGap,
+          },
+        }
+      : {}),
     finalHandler: "none",
     handled: false,
   });
@@ -19369,6 +20330,19 @@ async function handleIncomingTextMessage(params: {
         },
       });
     }
+  } else if (pendingClarification && shouldDropPendingClarificationForFreshIntent(text)) {
+    clearPendingIntentClarification(params.ctx.chat.id, userId);
+    void safeAudit({
+      type: "intent.clarification.drop",
+      chatId: params.ctx.chat.id,
+      userId,
+      details: {
+        source,
+        pendingSource: pendingClarification.source,
+        reason: "fresh-intent-detected",
+        textPreview: truncateInline(text, 220),
+      },
+    });
   }
   const textForPersistence = clarificationApplied
     ? [textWithReplyReference, "[INTENT_CLARIFICATION_APPLIED]", truncateInline(textForIntent, 3000)].join("\n\n")

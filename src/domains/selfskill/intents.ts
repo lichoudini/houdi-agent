@@ -25,9 +25,11 @@ export function detectSelfMaintenanceIntent(text: string): SelfMaintenanceIntent
   const normalized = normalizeSelfSkillIntentText(original);
   const isQuestion = original.includes("?");
 
-  const listSkillsRequested =
-    /\b(que|cuales)\b.*\b(habilidades|skills|reglas)\b/.test(normalized) &&
-    /\b(tenes|tienes|agregadas|dinamicas|dynamicas|actuales)\b/.test(normalized);
+  const hasListVerb = /\b(que|cuales|lista|listar|muestra|mostrar|mostrame|muestrame|ver|estado|dime|decime)\b/.test(normalized);
+  const hasSkillLikeNoun = /\b(habilidad(?:es)?|skill(?:s)?|regla(?:s)?|capacidad(?:es)?)\b/.test(normalized);
+  const hasBotToolsCue = /\b(herramienta(?:s)?|tool(?:s)?)\b/.test(normalized) && /\b(bot|agente|houdi)\b/.test(normalized);
+  const hasListQualifier = /\b(tenes|tienes|agregadas|dinamicas|dynamicas|actuales|activas|disponibles)\b/.test(normalized);
+  const listSkillsRequested = hasListVerb && (hasSkillLikeNoun || hasBotToolsCue) && (hasListQualifier || /\b(bot|agente|houdi)\b/.test(normalized));
   if (listSkillsRequested) {
     return { shouldHandle: true, action: "list-skills" };
   }

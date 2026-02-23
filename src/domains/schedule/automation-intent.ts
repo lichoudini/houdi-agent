@@ -48,12 +48,15 @@ export function detectScheduledAutomationIntent(params: DetectScheduledAutomatio
 }
 
 function stripAutomationLead(raw: string, params: DetectScheduledAutomationIntentParams): string {
-  const strippedTemporal = params.stripScheduleTemporalPhrases(raw)
+  const strippedTemporal = params.stripScheduleTemporalPhrases(params.normalizeIntentText(raw))
     .replace(DAILY_RECURRENCE_REGEX, " ")
     .replace(
-      /\b(?:recordame|recordarme|recuerda|recuerdame|recordar|agenda|agendame|agendar|programa|programar|crea|crear|genera|generar|tarea|tareas|recordatorio|recordatorios)\b/gi,
+      /\b(record(?:a|á)(?:me|rme|r)?|recuerd(?:a|á)(?:me|r)?|agend(?:a|á)(?:me|r)?|program(?:a|á)(?:r)?|cre(?:a|á)(?:r)?|gener(?:a|á)(?:r)?|tareas?|recordatorios?)\b/gi,
       " ",
     )
+    .replace(/\b(envi(?:a|á)(?:me|rme|r)?|manda(?:me|rme|r)?)\b/gi, " ")
+    .replace(/\b(?:a\s+las?\s+)?\d{1,2}(?::\d{2})\s*(?:am|pm)?\b/gi, " ")
+    .replace(/\b(?:una?|un|para)\b/gi, " ")
     .replace(/\b(?:a\s+las?|por\s+la|de\s+la|en\s+la)\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -63,7 +66,7 @@ function stripAutomationLead(raw: string, params: DetectScheduledAutomationInten
 
 function stripTrailingAutomationNoise(raw: string): string {
   return raw
-    .replace(/^["'`\s]+|["'`\s]+$/g, "")
+    .replace(/^["'`:,;.\s-]+|["'`:,;.\s-]+$/g, "")
     .replace(/\s+(?:por\s+favor|porfa)\s*$/i, "")
     .replace(/\s+/g, " ")
     .trim();

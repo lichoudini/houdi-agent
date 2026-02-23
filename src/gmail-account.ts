@@ -134,6 +134,14 @@ function requireNonEmptyMessageId(raw: string, label = "messageId"): string {
   return id;
 }
 
+function isMetadataScopeFullFormatError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message) {
+    return false;
+  }
+  return /metadata scope/i.test(message) && /format/i.test(message) && /full/i.test(message);
+}
+
 function stripHtmlToText(html: string): string {
   return normalizeWhitespace(
     html
@@ -604,12 +612,15 @@ export class GmailAccountService {
     const gmail = await this.getGmailClient();
     const limit = this.resolveLimit(limitInput);
     const normalizedQuery = normalizeSearchQuery(query?.trim() || undefined);
-    const list = await gmail.users.messages.list({
+    const request: gmail_v1.Params$Resource$Users$Messages$List = {
       userId: "me",
-      q: normalizedQuery,
       maxResults: limit,
       includeSpamTrash: false,
-    });
+    };
+    if (normalizedQuery) {
+      request.q = normalizedQuery;
+    }
+    const list = await gmail.users.messages.list(request);
     const refs = list.data.messages ?? [];
     if (refs.length === 0) {
       return [];
@@ -640,12 +651,25 @@ export class GmailAccountService {
   async readMessage(messageId: string): Promise<GmailMessageDetail> {
     const id = requireNonEmptyMessageId(messageId);
     const gmail = await this.getGmailClient();
-    const response = await gmail.users.messages.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
-    return this.toMessageDetail(response.data);
+    try {
+      const response = await gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "full",
+      });
+      return this.toMessageDetail(response.data);
+    } catch (error) {
+      if (!isMetadataScopeFullFormatError(error)) {
+        throw error;
+      }
+      const fallback = await gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Cc", "Subject", "Date", "Reply-To", "Message-ID", "References"],
+      });
+      return this.toMessageDetail(fallback.data);
+    }
   }
 
   async sendMessage(params: {
@@ -769,12 +793,25 @@ export class GmailAccountService {
   async readDraft(draftId: string): Promise<GmailDraftDetail> {
     const id = requireNonEmptyMessageId(draftId, "draftId");
     const gmail = await this.getGmailClient();
-    const response = await gmail.users.drafts.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
-    const message = response.data.message;
+    let message: gmail_v1.Schema$Message | undefined;
+    try {
+      const response = await gmail.users.drafts.get({
+        userId: "me",
+        id,
+        format: "full",
+      });
+      message = response.data.message ?? undefined;
+    } catch (error) {
+      if (!isMetadataScopeFullFormatError(error)) {
+        throw error;
+      }
+      const fallback = await gmail.users.drafts.get({
+        userId: "me",
+        id,
+        format: "metadata",
+      });
+      message = fallback.data.message ?? undefined;
+    }
     if (!message) {
       throw new Error("Draft no encontrado");
     }
@@ -922,12 +959,27 @@ export class GmailAccountService {
     const id = requireNonEmptyMessageId(threadId, "threadId");
     const limit = this.resolveLimit(limitInput);
     const gmail = await this.getGmailClient();
-    const response = await gmail.users.threads.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
-    return (response.data.messages ?? []).slice(0, limit).map((message) => this.toMessageDetail(message));
+    let messages: gmail_v1.Schema$Message[] = [];
+    try {
+      const response = await gmail.users.threads.get({
+        userId: "me",
+        id,
+        format: "full",
+      });
+      messages = response.data.messages ?? [];
+    } catch (error) {
+      if (!isMetadataScopeFullFormatError(error)) {
+        throw error;
+      }
+      const fallback = await gmail.users.threads.get({
+        userId: "me",
+        id,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Subject", "Date"],
+      });
+      messages = fallback.data.messages ?? [];
+    }
+    return messages.slice(0, limit).map((message) => this.toMessageDetail(message));
   }
 
   async markRead(messageId: string): Promise<void> {

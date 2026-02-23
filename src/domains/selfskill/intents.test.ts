@@ -15,6 +15,20 @@ test("detecta listado de skills", () => {
   assert.equal(intent.action, "list-skills");
 });
 
+test("detecta variantes naturales de listado de skills", () => {
+  const cases = [
+    "listar habilidades activas del bot",
+    "mostrar skills dinamicas activas",
+    "que capacidades del agente estan activas",
+    "ver estado de herramientas del bot",
+  ];
+  for (const input of cases) {
+    const intent = detectSelfMaintenanceIntent(input);
+    assert.equal(intent.shouldHandle, true, input);
+    assert.equal(intent.action, "list-skills", input);
+  }
+});
+
 test("detecta eliminar última skill", () => {
   const intent = detectSelfMaintenanceIntent("elimina la ultima habilidad");
   assert.equal(intent.shouldHandle, true);

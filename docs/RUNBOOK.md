@@ -88,6 +88,9 @@ Comandos operativos:
 - `/intentcurate [n] [apply]`: promoción de utterances desde errores
 - `/intentversion [list|save|rollback]`: snapshots y rollback
 - `/intentcanary [status|set <id> <pct>|off]`: rollout canary
+- `npm run dataset:report:accuracy -- --limit=3000 --target=0.9`: accuracy por dominio (semantic/shadow + ejecución)
+- `npm run dataset:report:accuracy:non-lim -- --limit=3000`: accuracy por dominio operativo (excluye `lim`)
+- `npm run debug:intent:last20:non-lim`: revisión rápida de los últimos 20 intentos con estado `exec=OK|FAIL|NO_EXEC`
 
 Workers automáticos en segundo plano:
 
@@ -95,6 +98,12 @@ Workers automáticos en segundo plano:
 - canary guard
 
 Ambos se controlan por variables `HOUDI_INTENT_ROUTER_*` en `.env`.
+Shadow eval y guardrails extra:
+- `HOUDI_INTENT_SHADOW_MODE_ENABLED`
+- `HOUDI_INTENT_SHADOW_SAMPLE_PERCENT`
+- `HOUDI_INTENT_SHADOW_ALPHA`
+- `HOUDI_INTENT_SHADOW_MIN_SCORE_GAP`
+- `HOUDI_INTENT_CLARIFICATION_TTL_MS`
 
 ## 8. Publicación privada en GitHub
 1. Verificar workspace limpio y build:

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectGmailNaturalIntent } from "./intents.js";
+import { detectGmailNaturalIntent, detectGmailRecipientNaturalIntent } from "./intents.js";
 import { createGmailTextParsers } from "./text-parsers.js";
 
 function normalizeIntentText(text: string): string {
@@ -127,4 +127,23 @@ test("gmail send with 'sobre temas de' requests auto-generated body flow", () =>
   assert.equal(intent.cc, "patagonads@gmail.com");
   assert.equal(intent.draftRequested, true);
   assert.notEqual(intent.forceAiByMissingSubject, true);
+});
+
+test("gmail recipients add parses clean name/email from natural sentence", () => {
+  const intent = detectGmailRecipientNaturalIntent("Agregá destinatario Carla carla@empresa.com.", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "add");
+  assert.equal(intent.name, "Carla");
+  assert.equal(intent.email, "carla@empresa.com");
+});
+
+test("gmail recipients update parses clean name/email from 'con' phrasing", () => {
+  const intent = detectGmailRecipientNaturalIntent(
+    "Actualizá destinatario Carla con carla.ops@empresa.com.",
+    deps,
+  );
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "update");
+  assert.equal(intent.name, "Carla");
+  assert.equal(intent.email, "carla.ops@empresa.com");
 });

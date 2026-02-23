@@ -89,6 +89,44 @@ function inferCcBccFromEmailContext(
   };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function cleanRecipientNameCandidate(raw: string, deps: GmailIntentDeps, options?: { email?: string }): string {
+  let cleaned = raw
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[,:;.!?]+$/g, "")
+    .replace(/\b(?:destinatari[oa]|contacto|correo|mail|email|gmail)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b(?:con|para)\s*$/i, "")
+    .trim();
+
+  const localPart = (options?.email ?? "")
+    .trim()
+    .toLowerCase()
+    .split("@")[0]
+    ?.trim();
+  if (localPart) {
+    const localEscaped = escapeRegExp(localPart);
+    cleaned = cleaned
+      .replace(new RegExp(`\\b(?:con|a|para)\\s+${localEscaped}\\s*$`, "i"), "")
+      .replace(new RegExp(`\\b${localEscaped}\\s*$`, "i"), "")
+      .trim();
+  }
+
+  if (!cleaned || cleaned.includes("@")) {
+    return "";
+  }
+  const normalized = deps.normalizeIntentText(cleaned);
+  if (!normalized || /^(a|para|con|mi|yo|vos|tu|tú)$/i.test(normalized)) {
+    return "";
+  }
+  return cleaned;
+}
+
 export function detectGmailRecipientNaturalIntent(text: string, deps: GmailIntentDeps): GmailRecipientNaturalIntent {
   const original = text.trim();
   if (!original) {
@@ -100,34 +138,59 @@ export function detectGmailRecipientNaturalIntent(text: string, deps: GmailInten
     return { shouldHandle: false };
   }
 
+  const emailPattern = "[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}";
+  const addVerbPattern = "(?:agreg(?:a|á|ar)|a(?:nade|ñade|nadir|ñadir)|cre(?:a|á|ar)|guard(?:a|á|ar)|registr(?:a|á|ar))";
+  const updateVerbPattern = "(?:actualiz(?:a|á|ar)|edit(?:a|á|ar)|modific(?:a|á|ar)|cambi(?:a|á|ar))";
+  const deleteVerbPattern = "(?:elimin(?:a|á|ar)|borr(?:a|á|ar)|quit(?:a|á|ar))";
+
   const email = deps.extractEmailAddresses(original)[0] ?? "";
-  const name = deps.extractRecipientNameFromText(original);
+  const addStructuredMatch = original.match(
+    new RegExp(
+      `\\b${addVerbPattern}\\b(?:\\s+(?:destinatari[oa]|contacto))?\\s+(.+?)\\s+(${emailPattern})\\b`,
+      "i",
+    ),
+  );
+  const updateStructuredMatch = original.match(
+    new RegExp(
+      `\\b${updateVerbPattern}\\b(?:\\s+(?:destinatari[oa]|contacto))?\\s+(.+?)\\s+(?:con|a)\\s+(${emailPattern})\\b`,
+      "i",
+    ),
+  );
+  const deleteStructuredMatch = original.match(new RegExp(`\\b${deleteVerbPattern}\\b(?:\\s+(?:destinatari[oa]|contacto))?\\s+(.+)$`, "i"));
+  const structuredEmail = (updateStructuredMatch?.[2] ?? addStructuredMatch?.[2] ?? "").trim().toLowerCase();
+  const effectiveEmail = structuredEmail || email;
+  const structuredName = cleanRecipientNameCandidate(
+    updateStructuredMatch?.[1] ?? addStructuredMatch?.[1] ?? deleteStructuredMatch?.[1] ?? "",
+    deps,
+    { email: effectiveEmail },
+  );
+  const fallbackName = cleanRecipientNameCandidate(deps.extractRecipientNameFromText(original), deps, { email: effectiveEmail });
 
   if (/\b(lista|listar|mostra|mostrar|ver)\b/.test(normalized)) {
     return { shouldHandle: true, action: "list" };
   }
   if (/\b(elimina|eliminar|borra|borrar|quita|quitar)\b/.test(normalized)) {
-    return { shouldHandle: true, action: "delete", ...(name ? { name } : {}) };
+    return { shouldHandle: true, action: "delete", ...((structuredName || fallbackName) ? { name: structuredName || fallbackName } : {}) };
   }
   if (/\b(actualiza|actualizar|edita|editar|modifica|modificar|cambia|cambiar)\b/.test(normalized)) {
     return {
       shouldHandle: true,
       action: "update",
-      ...(name ? { name } : {}),
-      ...(email ? { email } : {}),
+      ...((structuredName || fallbackName) ? { name: structuredName || fallbackName } : {}),
+      ...((structuredEmail || email) ? { email: structuredEmail || email } : {}),
     };
   }
   if (/\b(agrega|agregar|anade|añade|crea|crear|guarda|guardar|registra|registrar)\b/.test(normalized)) {
     return {
       shouldHandle: true,
       action: "add",
-      ...(name ? { name } : {}),
-      ...(email ? { email } : {}),
+      ...((structuredName || fallbackName) ? { name: structuredName || fallbackName } : {}),
+      ...((structuredEmail || email) ? { email: structuredEmail || email } : {}),
     };
   }
 
-  if (email && name) {
-    return { shouldHandle: true, action: "add", name, email };
+  if ((structuredEmail || email) && (structuredName || fallbackName)) {
+    return { shouldHandle: true, action: "add", name: structuredName || fallbackName, email: structuredEmail || email };
   }
   return { shouldHandle: false };
 }

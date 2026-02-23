@@ -3,6 +3,7 @@ import path from "node:path";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
+import * as XLSX from "xlsx";
 
 export type DocumentReadResult = {
   path: string;
@@ -41,7 +42,7 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 const DOCX_EXTENSIONS = new Set([".docx"]);
-const SPREADSHEET_EXTENSIONS = new Set([".xlsx", ".ods"]);
+const SPREADSHEET_EXTENSIONS = new Set([".xlsx", ".xls", ".ods"]);
 const PRESENTATION_EXTENSIONS = new Set([".pptx", ".odp"]);
 const OPEN_DOCUMENT_TEXT_EXTENSIONS = new Set([".odt"]);
 const RTF_EXTENSIONS = new Set([".rtf"]);
@@ -211,6 +212,40 @@ function renderXlsxWorksheetRows(xml: string, sharedStrings: string[]): string[]
   return lines;
 }
 
+function renderWorkbookRows(workbook: XLSX.WorkBook): string {
+  const chunks: string[] = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) {
+      continue;
+    }
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      raw: false,
+      blankrows: false,
+      defval: "",
+    }) as unknown[];
+    const lines = rows
+      .map((row) => {
+        if (!Array.isArray(row)) {
+          return "";
+        }
+        return row
+          .map((cell) => sanitizeCellValue(cell))
+          .join("\t")
+          .trimEnd();
+      })
+      .filter(Boolean);
+    if (lines.length === 0) {
+      continue;
+    }
+    chunks.push(`## Sheet: ${sanitizeCellValue(sheetName) || "Sheet"}`);
+    chunks.push(...lines);
+    chunks.push("");
+  }
+  return chunks.join("\n");
+}
+
 function extractRtfText(raw: string): string {
   const withBreaks = raw.replace(/\\par[d]?/gi, "\n");
   const hexDecoded = withBreaks.replace(/\\'([0-9a-fA-F]{2})/g, (_, hex: string) =>
@@ -275,7 +310,7 @@ export class DocumentReader {
     } else if (SPREADSHEET_EXTENSIONS.has(ext)) {
       rawText = await this.extractSpreadsheetText(resolved.fullPath);
       format = `office:${ext.slice(1)}`;
-      extractor = "zip-xml";
+      extractor = ext === ".xls" ? "xlsx" : "zip-xml";
     } else if (PRESENTATION_EXTENSIONS.has(ext)) {
       rawText = await this.extractPresentationText(resolved.fullPath, ext);
       format = `office:${ext.slice(1)}`;
@@ -363,6 +398,16 @@ export class DocumentReader {
   private async extractSpreadsheetText(filePath: string): Promise<string> {
     const buffer = await fs.readFile(filePath);
     const extension = path.extname(filePath).toLowerCase();
+    if (extension === ".xls") {
+      const workbook = XLSX.read(buffer, {
+        type: "buffer",
+        dense: true,
+        cellText: true,
+        raw: false,
+      });
+      return renderWorkbookRows(workbook);
+    }
+
     if (extension === ".ods") {
       const zip = await JSZip.loadAsync(buffer);
       const contentXml = await extractZipEntryText(zip, "content.xml");

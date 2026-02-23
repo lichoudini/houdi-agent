@@ -22,6 +22,10 @@ Este release endurece el enrutado por contexto, mejora la operación de comandos
   - Auditoría específica para éxito/falla de listados.
 - UX de salida:
   - Formateo "touch-friendly" para IDs (`messageId/threadId/draftId`) y rutas de `workspace` en respuestas de chat.
+  - Ajuste de formato de IDs: se elimina el prefijo `id_` y se mantiene representación `#<valor>` para copy/paste en Telegram.
+- Gmail:
+  - Fallback automático de `format=full` a `format=metadata` para `read/thread/draft read` cuando la credencial OAuth no permite `FULL`.
+  - Se evita el fallo `"Metadata scope doesn't allow format FULL"` en cuentas con scopes acotados.
 
 ## Cambios de configuración
 
@@ -39,4 +43,5 @@ Este release endurece el enrutado por contexto, mejora la operación de comandos
 
 ## Validación
 
-- `npm test`: OK (99 tests passing).
+- `npm run build`: OK.
+- `npm test`: OK (33 tests passing en esta rama).

@@ -15,7 +15,7 @@ export function shouldBypassGmailRecipientsAmbiguity(text: string): boolean {
   const hasEmailAddress = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(original);
   const hasMailNoun = /\b(correo|correos|mail|mails|email|emails|gmail|bandeja|inbox)\b/.test(normalized);
   const hasMailOperationVerb =
-    /\b(envi\w*|mand\w*|escrib\w*|redact\w*|respond\w*|lee|leer|abre|abrir|mostra|mostrar|revisa|revisar|consulta|consultar|lista|listar|ver)\b/.test(
+    /\b(envi\w*|mand\w*|escrib\w*|redact\w*|respond\w*|lee|leer|abre|abrir|mostra|mostrar|revisa|revisar|consulta|consultar|lista|listar|ver|estado|status|configur\w*|perfil|cuenta)\b/.test(
       normalized,
     );
   const hasRecipientNoun = /\b(destinatari[oa]s?|contactos?|agenda\s+de\s+(?:correo|mail|email)|agenda\s+de\s+destinatarios?)\b/.test(

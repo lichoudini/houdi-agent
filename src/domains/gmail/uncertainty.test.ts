@@ -13,6 +13,10 @@ test("bypass ambiguity for mail inbox operation", () => {
   assert.equal(shouldBypassGmailRecipientsAmbiguity("leer correos no leidos"), true);
 });
 
+test("bypass ambiguity for gmail status operation", () => {
+  assert.equal(shouldBypassGmailRecipientsAmbiguity("estado de gmail"), true);
+});
+
 test("bypass ambiguity for recipients management operation", () => {
   assert.equal(
     shouldBypassGmailRecipientsAmbiguity("agrega destinatario maria maria@empresa.com"),

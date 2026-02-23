@@ -269,6 +269,11 @@ cp .env.example .env
 - `HOUDI_INTENT_ROUTER_CANARY_GUARD_MIN_SAMPLES` (default: `60`)
 - `HOUDI_INTENT_ROUTER_CANARY_GUARD_MIN_ACCURACY` (default: `0.55`)
 - `HOUDI_INTENT_ROUTER_CANARY_GUARD_BREACHES_TO_DISABLE` (default: `2`)
+- `HOUDI_INTENT_SHADOW_MODE_ENABLED` (default: `false`, evaluación en sombra del router alternativo sin ejecutar)
+- `HOUDI_INTENT_SHADOW_SAMPLE_PERCENT` (default: `0`, porcentaje de mensajes para shadow mode)
+- `HOUDI_INTENT_SHADOW_ALPHA` (default: `0.66`, peso léxico del router en sombra)
+- `HOUDI_INTENT_SHADOW_MIN_SCORE_GAP` (default: `0.02`, brecha mínima en sombra)
+- `HOUDI_INTENT_CLARIFICATION_TTL_MS` (default: `300000`, TTL de aclaraciones pendientes)
 - `HOUDI_SELFSKILL_DRAFTS_FILE` (default: `./houdi-selfskill-drafts.json`)
 - `HOUDI_INTERESTS_FILE` (default: `./houdi-interests.json`)
 - `HOUDI_SUGGESTIONS_ENABLED` (default: `true`)
@@ -442,6 +447,13 @@ node tools/experiments/intent-dataset-prepare.mjs \
 npm run dataset:eval:holdout
 ```
 
+Reporte de accuracy (interpretación + ejecución por dominio):
+
+```bash
+npm run dataset:report:accuracy -- --limit=3000 --target=0.9
+npm run dataset:report:accuracy:non-lim -- --limit=3000
+```
+
 5. Optimizar router en dry-run (sin tocar `intent-routes.json`):
 
 ```bash
@@ -457,7 +469,8 @@ npm run dataset:optimize:router -- --apply
 Atajos utiles:
 - `npm run dataset:prepare`: usa defaults (base + semilla LATAM).
 - `npm run debug:last20`: muestra resumen rapido de `runtime/telegram-last20.jsonl`.
-- `npm run debug:intent:last20`: muestra ultimas rutas `intent.route` desde `houdi-audit.log`.
+- `npm run debug:intent:last20`: muestra ultimas rutas `intent.route` con estado de ejecución (`exec=OK|FAIL|NO_EXEC`).
+- `npm run debug:intent:last20:non-lim`: igual, excluyendo ruta `lim`.
 - Salidas por default: `workspace/state/intent-dataset-train.jsonl` y `workspace/state/intent-dataset-holdout.jsonl`.
 
 Requisitos Slack (Socket Mode, inspirado en flujo OpenClaw):
@@ -740,6 +753,7 @@ Setup mínimo:
 
 1. Crear credenciales OAuth en Google Cloud (Gmail API habilitada).
 2. Obtener `refresh_token` del usuario (scope recomendado: `gmail.readonly gmail.send gmail.modify https://www.googleapis.com/auth/gmail.compose`).
+   - Si la cuenta quedó con scopes acotados de metadata, el bot hace fallback automático para lectura (`read/thread/draft read`) y evita el error de formato `FULL`.
 3. Completar en `.env`:
    - `ENABLE_GMAIL_ACCOUNT=true`
    - `GMAIL_CLIENT_ID=...`
@@ -797,6 +811,7 @@ Modo natural (sin comandos):
 Nota de seguridad:
 
 - El bot exige que el agente activo tenga `gmail-api` en `allowCommands` (incluido en `operator` y `admin`).
+- En las respuestas, los IDs se muestran como `#<valor>` (además del valor crudo en `` `...` ``), sin prefijo `id_`.
 
 ## Control LIM (natural)
 

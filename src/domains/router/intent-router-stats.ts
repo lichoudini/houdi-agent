@@ -39,6 +39,16 @@ export type IntentRouterDatasetEntry = {
     required: string[];
     summary: string;
   };
+  actionSuccess?: boolean;
+  actionError?: string;
+  shadow?: {
+    handler: string;
+    score: number;
+    reason: string;
+    alternatives: Array<{ name: string; score: number }>;
+    alpha: number;
+    minScoreGap: number;
+  };
   finalHandler: string;
   handled: boolean;
 };

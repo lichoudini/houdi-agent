@@ -25,5 +25,25 @@ export function shouldBypassAmbiguousPair<TSelfIntent>(
     }
   }
 
+  if (pair === "self-maintenance|web") {
+    const selfIntent = deps.detectSelfMaintenanceIntent(text);
+    const normalized = deps.normalizeIntentText(text);
+    const explicitWebCue = /\b(web|internet|url|link|links|enlace|enlaces|noticias|google)\b/.test(normalized);
+    if (selfIntent.shouldHandle && selfIntent.action === "list-skills" && !explicitWebCue) {
+      return true;
+    }
+  }
+
+  if (pair === "schedule|web" || pair === "memory|schedule") {
+    const normalized = deps.normalizeIntentText(text);
+    const hasScheduleCue = /\b(recordatorio|recordatorios|tarea|tareas|agenda|agendar|programad|programar|calendario|pendiente|pendientes)\b/.test(
+      normalized,
+    );
+    const hasWebCue = /\b(web|internet|url|link|links|enlace|enlaces|google|noticias|novedades)\b/.test(normalized);
+    if (hasScheduleCue && !hasWebCue) {
+      return true;
+    }
+  }
+
   return false;
 }

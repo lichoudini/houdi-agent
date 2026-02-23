@@ -1,0 +1,86 @@
+{"domain":"gmail","text":"enviar correo a carla.ops@empresa.com con novedades de marketing ahora","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"mandar mail a ventas@empresa.com cuando puedas","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"dale mostrar inbox","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"leer correos no leidos?","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"oye leer correo 1","expected_should_handle":true,"expected_action":"read","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"estado de gmail ahora","expected_should_handle":true,"expected_action":"status","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"perfil de gmail","expected_should_handle":true,"expected_action":"profile","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"enviar correo a ventas@empresa.com con novedades de dkim dmarc spf?","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"dale mandar mail a richard@vrand.biz de una","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"mostrar inbox","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"oye leer correos no leidos","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"leer correo 1?","expected_should_handle":true,"expected_action":"read","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"estado de gmail por favor","expected_should_handle":true,"expected_action":"status","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"perfil de gmail de una","expected_should_handle":true,"expected_action":"profile","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"dale enviar correo a richard@vrand.biz con novedades de openclaw","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"mandar mail a carla.ops@empresa.com?","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"oye mostrar inbox cuando puedas","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"leer correos no leidos por favor","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"estado de gmail?","expected_should_handle":true,"expected_action":"status","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"dale perfil de gmail ahora","expected_should_handle":true,"expected_action":"profile","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"enviar correo a carla.ops@empresa.com con novedades de cloudflare cuando puedas","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"oye mandar mail a ventas@empresa.com","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"leer correo 1 ahora","expected_should_handle":true,"expected_action":"read","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"dale estado de gmail","expected_should_handle":true,"expected_action":"status","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"agregar destinatario Carla carla.ops@empresa.com ahora","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"actualizar destinatario Nazareno con ventas@empresa.com cuando puedas","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"dale eliminar destinatario Sofia","expected_should_handle":true,"expected_action":"delete","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"listar destinatarios guardados?","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"oye sumar contacto Carla ventas@empresa.com","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"editar destinatario Nazareno email richard@vrand.biz ahora","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"agregar destinatario Sofia carla.ops@empresa.com","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"actualizar destinatario Gaston con ventas@empresa.com?","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"dale eliminar destinatario Carla de una","expected_should_handle":true,"expected_action":"delete","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"oye sumar contacto Sofia ventas@empresa.com","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"editar destinatario Gaston email richard@vrand.biz?","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"agregar destinatario Carla carla.ops@empresa.com por favor","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"actualizar destinatario Nazareno con ventas@empresa.com de una","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"oye sumar contacto Carla ventas@empresa.com cuando puedas","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"editar destinatario Nazareno email richard@vrand.biz por favor","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"dale eliminar destinatario Carla ahora","expected_should_handle":true,"expected_action":"delete","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"listar destinatarios guardados cuando puedas","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"agregar destinatario Carla carla.ops@empresa.com","expected_should_handle":true,"expected_action":"add","source":"domain-action-intents-v1"}
+{"domain":"gmail-recipients","text":"actualizar destinatario Nazareno con ventas@empresa.com ahora","expected_should_handle":true,"expected_action":"update","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"editar maggie-simpson.txt con otro poema ahora","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"en reporte-q1.md escribir otro poema cuando puedas","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"dale ver archivos","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"leer archivo pino.txt?","expected_should_handle":true,"expected_action":"read","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"oye eliminar maggie-simpson.txt","expected_should_handle":true,"expected_action":"delete","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"mover reporte-q1.md a archivados/reporte-q1.md ahora","expected_should_handle":true,"expected_action":"move","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"renombrar clientes.csv a backup-clientes.csv","expected_should_handle":true,"expected_action":"rename","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"enviar pino.txt por telegram?","expected_should_handle":true,"expected_action":"send","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"dale editar maggie-simpson.txt con otro poema de una","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"en reporte-q1.md escribir otro poema","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"oye ver archivos","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"eliminar maggie-simpson.txt por favor","expected_should_handle":true,"expected_action":"delete","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"mover reporte-q1.md a archivados/reporte-q1.md de una","expected_should_handle":true,"expected_action":"move","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"dale renombrar clientes.csv a backup-clientes.csv","expected_should_handle":true,"expected_action":"rename","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"oye editar maggie-simpson.txt con otro poema cuando puedas","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"en reporte-q1.md escribir otro poema por favor","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"ver archivos","expected_should_handle":true,"expected_action":"list","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"dale eliminar maggie-simpson.txt ahora","expected_should_handle":true,"expected_action":"delete","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"mover reporte-q1.md a archivados/reporte-q1.md cuando puedas","expected_should_handle":true,"expected_action":"move","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"oye renombrar clientes.csv a backup-clientes.csv","expected_should_handle":true,"expected_action":"rename","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"editar maggie-simpson.txt con otro poema","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"workspace","text":"en reporte-q1.md escribir otro poema ahora","expected_should_handle":true,"expected_action":"write","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"reinicia el agente ahora","expected_should_handle":true,"expected_action":"restart-service","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"actualiza el bot desde github cuando puedas","expected_should_handle":true,"expected_action":"update-service","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"dale que habilidades tenes activas","expected_should_handle":true,"expected_action":"list-skills","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"elimina la habilidad 2?","expected_should_handle":true,"expected_action":"delete-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"oye elimina la habilidad #sk_abc123","expected_should_handle":true,"expected_action":"delete-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"crea una skill para interpretar mejor español rioplatense ahora","expected_should_handle":true,"expected_action":"add-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"reinicia el agente","expected_should_handle":true,"expected_action":"restart-service","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"actualiza el bot desde github?","expected_should_handle":true,"expected_action":"update-service","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"dale que habilidades tenes activas de una","expected_should_handle":true,"expected_action":"list-skills","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"crea una skill para interpretar mejor español rioplatense?","expected_should_handle":true,"expected_action":"add-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"reinicia el agente por favor","expected_should_handle":true,"expected_action":"restart-service","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"actualiza el bot desde github de una","expected_should_handle":true,"expected_action":"update-service","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"oye elimina la habilidad #sk_abc123 cuando puedas","expected_should_handle":true,"expected_action":"delete-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"crea una skill para interpretar mejor español rioplatense por favor","expected_should_handle":true,"expected_action":"add-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"dale que habilidades tenes activas ahora","expected_should_handle":true,"expected_action":"list-skills","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"elimina la habilidad 2 cuando puedas","expected_should_handle":true,"expected_action":"delete-skill","source":"domain-action-intents-v1"}
+{"domain":"self-maintenance","text":"actualiza el bot desde github ahora","expected_should_handle":true,"expected_action":"update-service","source":"domain-action-intents-v1"}
+{"domain":"gmail","text":"oye agregar destinatario Carla carla.ops@empresa.com ahora","expected_should_handle":false,"expected_action":null,"source":"domain-action-intents-v1-negative"}
+{"domain":"gmail-recipients","text":"enviar correo a carla.ops@empresa.com cuando puedas","expected_should_handle":false,"expected_action":null,"source":"domain-action-intents-v1-negative"}
+{"domain":"workspace","text":"recordame mañana comprar pan","expected_should_handle":false,"expected_action":null,"source":"domain-action-intents-v1-negative"}
+{"domain":"self-maintenance","text":"abrir https://cloudflare.com?","expected_should_handle":false,"expected_action":null,"source":"domain-action-intents-v1-negative"}
