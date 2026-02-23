@@ -69,6 +69,45 @@ test("route layers apply indexed-list narrowing when list reference cue exists",
   assert.deepEqual(decision.allowed, ["workspace", "document"]);
 });
 
+test("route layers apply indexed-list narrowing with colloquial action cue", () => {
+  const decision = applyIntentRouteLayers(["gmail", "workspace", "document", "schedule"], {
+    normalizedText: "manda el 3",
+    hasMailContext: false,
+    hasMemoryRecallCue: false,
+    indexedListKind: "workspace-list",
+    hasPendingWorkspaceDelete: false,
+  });
+  assert.ok(decision);
+  assert.equal(decision.strict, true);
+  assert.deepEqual(decision.allowed, ["workspace", "document"]);
+});
+
+test("context filter prioritizes indexed list context for 'abri el 2'", () => {
+  const decision = buildIntentRouterContextFilter(
+    {
+      chatId: 1,
+      text: "abri el 2",
+      candidates: ["gmail", "workspace", "document", "web"],
+      hasMailContext: false,
+      hasMemoryRecallCue: false,
+    },
+    {
+      normalizeIntentText: (text) => text.toLowerCase().trim(),
+      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
+      getIndexedListContext: () => ({ kind: "gmail-list" }),
+      getPendingWorkspaceDelete: () => null,
+      getPendingWorkspaceDeletePath: () => null,
+      getLastGmailResultsCount: () => 0,
+      getLastListedFilesCount: () => 0,
+      getLastLimContextAt: () => 0,
+      limContextTtlMs: 60_000,
+    },
+  );
+  assert.ok(decision);
+  assert.equal(decision?.strict, true);
+  assert.deepEqual(decision?.allowed, ["gmail"]);
+});
+
 test("hierarchical router returns strict exhaustion when top domain is incompatible", () => {
   const decision = buildHierarchicalIntentDecision({
     normalizedText: "eliminar archivo de workspace",

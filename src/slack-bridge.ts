@@ -642,6 +642,18 @@ async function main(): Promise<void> {
     if (incomingAttachments.length > 0) {
       attachmentContextCache.set(contextKey, { saved: incomingAttachments, updatedAt: Date.now() });
     }
+    const hasIncomingImages = incomingAttachments.some((item) => item.kind === "image");
+    if (hasIncomingImages) {
+      await app.client.chat.postMessage({
+        channel: params.channel,
+        thread_ts: params.threadTs || params.messageTs,
+        text: "✅ La imagen fue guardada.",
+      });
+      if (cfg.enableStatusReactions) {
+        await safeReaction(app, "white_check_mark", params.channel, params.messageTs);
+      }
+      return;
+    }
     const cachedAttachments = attachmentContextCache.get(contextKey)?.saved || [];
     const savedAttachments =
       incomingAttachments.length > 0

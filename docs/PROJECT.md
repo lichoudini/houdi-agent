@@ -1,51 +1,68 @@
 # Houdi Agent - Project Overview
 
 ## Objetivo
-Houdi Agent es un bot de Telegram para operar una PC Linux de forma controlada, con ejecución de comandos restringida por agente y aprobación explícita para acciones sensibles.
+Houdi Agent es un agente operativo para Telegram/Slack orientado a automatizar tareas en una PC Linux con controles de seguridad por capas, auditoría y operación continua.
 
-## Alcance actual
-- Bot Telegram con comandos operativos (`/status`, `/exec`, `/task`, `/kill`).
-- Modo IA conversacional (`/ask`) y modo shell asistido (`/shell`, `/shellmode`).
-- Ingesta de archivos adjuntos:
-  - guarda documentos en `workspace/files/...`
-  - guarda imágenes en `workspace/images/...`
-  - análisis visual de imágenes con OpenAI (si está configurado)
-- Operaciones de archivos/carpetas en `workspace` por comando (`/workspace ...`) o lenguaje natural (listar, crear, mover, renombrar, eliminar).
-- Memoria operativa en archivos:
-  - notas diarias (`memory/YYYY-MM-DD.md`)
-  - memoria de largo plazo (`MEMORY.md`)
-  - comandos `/remember` y `/memory ...`
-- Contexto de personalidad/lineamientos por workspace (`AGENTS.md`, `SOUL.md`, `USER.md`, `HEARTBEAT.md`).
-- Skills dinámicas con lenguaje natural, incluyendo borrador multi-mensaje para crear habilidades en pasos.
-- Aprendizaje local de intereses por recurrencia de pedidos + sugerencias proactivas con cuota diaria configurable.
-- Control de riesgo por capas:
-  - allowlist por agente (`agents/*.json`)
-  - `adminmode` con aprobaciones (`/approve`, `/deny`)
-  - `panic mode` para bloqueo global
-- Reinicio remoto con confirmación (`/reboot`) cuando está habilitado.
-- Onboarding por CLI (`npm run onboard`) para setup guiado de `.env` y despliegue inicial.
-- Auditoría básica en archivo JSONL (`houdi-audit.log`).
+## Estado actual (resumen)
 
-## Stack técnico
-- Node.js + TypeScript
-- `grammy` para Telegram
-- `openai` para respuestas y planificación de shell
-- `zod` para validación de configuración
-- `systemd` para operación en producción
+- Runtime principal en Node.js + TypeScript, con transporte Telegram y bridge opcional para Slack.
+- Pipeline de intención híbrido (reglas + router semántico + fallback IA) para operar en lenguaje natural.
+- Persistencia de estado en SQLite para contexto crítico de operación.
+- Modo de seguridad por agentes (`operator`, `admin`) con allowlist y aprobaciones explícitas.
+- Integraciones productivas: Gmail, web browsing/documentos, tareas programadas, memoria y control LIM.
 
-## Estructura del repositorio
-- `src/`: lógica principal del bot
-- `agents/`: perfiles de permisos por agente
-- `scripts/`: instalación y operación (systemd, checks, backup)
-- `docs/`: documentación de arquitectura y operación
+## Capacidades funcionales
 
-## Estado de despliegue recomendado
-- Servicio `systemd` de sistema (`houdi-agent.service`)
-- Arranque automático en boot (`WantedBy=multi-user.target`)
-- Reinicio remoto vía `sudo -n /usr/bin/systemctl reboot` con política mínima en `sudoers`
+- Conversación IA y ejecución asistida:
+  - `/ask`, chat natural y análisis contextual por historial.
+  - `/shell` y `/shellmode` (siempre restringido por allowlist del agente activo).
+  - Selección dinámica de modelo por chat con `/model` y alias `/mode`.
+  - Modo ECO por chat (`/eco`) para respuestas compactas y control de costo/tokens.
+- Archivos y documentos:
+  - Operaciones en `workspace/` por comandos y lenguaje natural (`list`, `mkdir`, `write`, `mv`, `rename`, `rm`, `send`, `read`).
+  - Atajos `/files` y `/images` para listar y navegar adjuntos guardados.
+  - Lectura de PDF/Office + consultas sobre contenido con `/readfile` y `/askfile`.
+- Productividad:
+  - Tareas programadas (`/task`) y recordatorios con parsing natural de fecha/hora.
+  - Integración Gmail (listado, lectura, draft, envío, reply/forward, libreta de destinatarios).
+  - Integración LIM (`/lim`) para consulta operativa y listado de historial (`/lim list`).
+- Memoria y aprendizaje:
+  - Notas y memoria operativa (`/remember`, `/memory ...`).
+  - Aprendizaje local de intereses y sugerencias proactivas con cuota diaria.
+  - Self-skill pipeline para crear, listar y eliminar habilidades dinámicas.
+- Seguridad y gobernanza:
+  - `adminmode`, planes pendientes y aprobaciones (`/approvals`, `/approve`, `/deny`).
+  - `safe mode`, `panic mode`, auditoría estructurada (`houdi-audit.log`) y métricas de observabilidad.
+  - Protección de idempotencia/outbox para evitar efectos duplicados ante reintentos.
 
-## Próximas mejoras sugeridas
-1. Persistencia en SQLite para tareas, aprobaciones y eventos.
-2. Tests automatizados para parser, approvals y task runner.
-3. Políticas por chat/rol más finas (RBAC).
-4. Endpoints de healthcheck para monitoreo externo.
+## Persistencia y datos
+
+- Base de estado SQLite (`workspace/state/houdi-state.sqlite` por defecto):
+  - settings por chat (agente activo, shellmode, safe, eco, modelo OpenAI),
+  - outbox y dead-letter,
+  - idempotencia,
+  - contexto de listas indexadas para referencias tipo "abrí el 2",
+  - tareas programadas y estado operativo auxiliar.
+- Archivos de workspace:
+  - `workspace/files/` y `workspace/images/` para adjuntos entrantes.
+  - `workspace/state/` para rutas/versionado/calibración de router.
+
+## Arquitectura de alto nivel
+
+- Entrada:
+  - Telegram (polling) y Slack bridge (Socket Mode).
+- Núcleo:
+  - normalización y clasificación de interacción,
+  - route narrowing por capas,
+  - enrutado por dominio (gmail, workspace, document, web, lim, schedule, memory, self-maintenance),
+  - ejecución de acción con policy checks y auditoría.
+- Salida:
+  - respuestas largas segmentadas,
+  - texto "touch-friendly" para copiar IDs/rutas con menos fricción en móvil.
+
+## Operación recomendada
+
+- Usar `npm run onboard` o `./scripts/install-houdi-agent.sh` para setup inicial.
+- Ejecutar como servicio `systemd` (user o system según perfil de despliegue).
+- Mantener secretos fuera de Git (`.env`) y rotar tokens al compartir entornos.
+- Verificar salud con `/status`, `/doctor`, `/metrics` y runbook en `docs/RUNBOOK.md`.

@@ -11,7 +11,14 @@ export type RouterContextFilterDecision = {
 
 export type RouterContextFilterDeps = {
   normalizeIntentText: (text: string) => string;
-  parseIndexedListReferenceIntent: (text: string) => { shouldHandle: boolean };
+  parseIndexedListReferenceIntent: (text: string) => {
+    shouldHandle: boolean;
+    action?: "open" | "read" | "delete";
+    indexes?: number[];
+    selectAll?: boolean;
+    selectLast?: boolean;
+    selectPenultimate?: boolean;
+  };
   getIndexedListContext: (chatId: number) => { kind: RouterContextListKind } | null;
   getPendingWorkspaceDelete: (chatId: number) => { expiresAtMs: number } | null;
   getPendingWorkspaceDeletePath: (chatId: number) => { expiresAtMs: number } | null;
@@ -69,6 +76,18 @@ function narrowCandidates(
   return { allowed: base, exhausted: false };
 }
 
+function hasStrongIndexedListActionCue(normalizedText: string): boolean {
+  if (!normalizedText.trim()) {
+    return false;
+  }
+  if (/\b\d{1,2}[:.]\d{2}\b/.test(normalizedText) || /\b\d{1,2}\s*(am|pm)\b/.test(normalizedText)) {
+    return false;
+  }
+  return /\b(abri|abrime|abrilo|abre|abrir|lee|leer|leeme|leelo|mostra|mostrar|mostrame|mostralo|ver|elimina|eliminar|borra|borrar|quita|quitar|manda|mandar|mandalo|envia|enviar|enviame|envialo)\s+(?:el\s+|la\s+)?(\d{1,3}|primero|primera|segundo|segunda|tercero|tercera|ultimo|ultima|penultimo|penultima|todos|todas)\b/.test(
+    normalizedText,
+  );
+}
+
 export function buildIntentRouterContextFilter(
   params: {
     chatId: number;
@@ -123,7 +142,8 @@ export function buildIntentRouterContextFilter(
     /\b(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta|ultimo|ultima|penultimo|penultima|anterior)\b/.test(
       normalized,
     );
-  const likelyListReference = indexedListIntent.shouldHandle || ordinalReference;
+  const likelyListReference =
+    indexedListIntent.shouldHandle || hasStrongIndexedListActionCue(normalized) || (ordinalReference && normalized.length <= 120);
   if (listContext && likelyListReference) {
     if (listContext.kind === "gmail-list") {
       applyNarrow(["gmail", "gmail-recipients"], "indexed-list:gmail", { strict: true });

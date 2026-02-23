@@ -40,6 +40,13 @@ function hasIndexedListReferenceCue(normalizedText: string): boolean {
   ) {
     return true;
   }
+  if (
+    /\b(abri|abrime|abrilo|leeme|lee|leelo|mostrame|mostralo|manda|mandalo|enviame|envia|envialo)\s+(?:el\s+|la\s+)?(\d{1,3}|primero|primera|segundo|segunda|tercero|tercera|ultimo|ultima|penultimo|penultima|todos|todas)\b/.test(
+      normalizedText,
+    )
+  ) {
+    return true;
+  }
   return false;
 }
 

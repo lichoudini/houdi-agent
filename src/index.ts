@@ -433,6 +433,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "help",
   "version",
   "model",
+  "mode",
   "status",
   "doctor",
   "usage",
@@ -1129,7 +1130,7 @@ type CuratedNewsDomains = {
   en: string[];
 };
 
-type ConnectorNaturalAction = "status" | "start" | "stop" | "restart" | "query";
+type ConnectorNaturalAction = "status" | "start" | "stop" | "restart" | "query" | "list";
 
 type ConnectorNaturalIntent = {
   shouldHandle: boolean;
@@ -1309,87 +1310,42 @@ function truncateInline(text: string, maxChars: number): string {
   return `${text.slice(0, usable)}${marker}`;
 }
 
-const TOUCH_LINK_BASE = "https://copy.vrand.ai";
-
-type TouchTokenKind = "approval" | "plan" | "gmail-message" | "gmail-thread" | "gmail-draft" | "run" | "file";
-
-function buildTouchLink(kind: TouchTokenKind, value: string): string {
-  return `${TOUCH_LINK_BASE}/${kind}/${encodeURIComponent(value)}`;
-}
-
-function collectTouchTokensFromLine(line: string): Array<{ kind: TouchTokenKind; value: string }> {
-  const tokens: Array<{ kind: TouchTokenKind; value: string }> = [];
-  const seen = new Set<string>();
-  const push = (kind: TouchTokenKind, value: string) => {
-    const normalized = value.trim();
-    if (!normalized) {
-      return;
-    }
-    const key = `${kind}:${normalized}`;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    tokens.push({ kind, value: normalized });
-  };
-
-  const labeledRegex = /\b(plan[_-]?id|approval[_-]?id|messageid|threadid|draftid|run[_-]?id)\s*[:=]\s*([A-Za-z0-9._-]+)/gi;
-  let labeledMatch: RegExpExecArray | null;
-  while ((labeledMatch = labeledRegex.exec(line)) !== null) {
-    const rawLabel = labeledMatch[1]?.toLowerCase() ?? "";
-    const value = labeledMatch[2] ?? "";
-    if (!value) {
-      continue;
-    }
-    if (rawLabel.includes("approval")) {
-      push("approval", value);
-    } else if (rawLabel.includes("plan")) {
-      push("plan", value);
-    } else if (rawLabel.includes("thread")) {
-      push("gmail-thread", value);
-    } else if (rawLabel.includes("draft")) {
-      push("gmail-draft", value);
-    } else if (rawLabel.includes("message")) {
-      push("gmail-message", value);
-    } else if (rawLabel.includes("run")) {
-      push("run", value);
-    }
-  }
-
-  const approvalTextRegex = /\bAprobaci[oó]n\s+([0-9]{3,})\b/gi;
-  let approvalTextMatch: RegExpExecArray | null;
-  while ((approvalTextMatch = approvalTextRegex.exec(line)) !== null) {
-    push("approval", approvalTextMatch[1] ?? "");
-  }
-
-  const planTextRegex = /\bPlan\s+([0-9]{3,})\b/gi;
-  let planTextMatch: RegExpExecArray | null;
-  while ((planTextMatch = planTextRegex.exec(line)) !== null) {
-    push("plan", planTextMatch[1] ?? "");
-  }
-
-  const fileRegex = /(?:^|[\s(])((?:workspace|files|images)\/[A-Za-z0-9._\-\/]+)/g;
-  let fileMatch: RegExpExecArray | null;
-  while ((fileMatch = fileRegex.exec(line)) !== null) {
-    push("file", fileMatch[1] ?? "");
-  }
-
-  return tokens;
-}
-
 function makeTouchFriendlyText(text: string): string {
-  if (!text.trim() || text.includes(`${TOUCH_LINK_BASE}/`)) {
+  if (!text.trim()) {
     return text;
   }
   return text
     .split("\n")
     .map((line) => {
-      const tokens = collectTouchTokensFromLine(line);
-      if (tokens.length === 0) {
-        return line;
-      }
-      const links = tokens.map((token) => `link: ${buildTouchLink(token.kind, token.value)}`).join(" ");
-      return `${line} ${links}`;
+      const withWorkspacePaths = line.replace(
+        /(^|[\s(])((?:workspace|files|images)\/[A-Za-z0-9._\-\/]+)/g,
+        (_full, prefix: string, rawPath: string) => {
+          const normalized = normalizeWorkspaceRelativePath(rawPath);
+          if (!normalized) {
+            return `${prefix}${rawPath}`;
+          }
+          return `${prefix}/workspace/${normalized}`;
+        },
+      );
+      return withWorkspacePaths
+        .replace(
+          /\b(messageId|threadId|draftId)\s*[:=]\s*`?([A-Za-z0-9._-]{6,})`?/gi,
+          (_full, labelInput: string, value: string) => {
+            const label = labelInput.trim();
+            const lower = label.toLowerCase();
+            const anchorPrefix = lower === "messageid" ? "msg" : lower === "threadid" ? "thr" : "drf";
+            return `${label}: #${anchorPrefix}_${value} (\`${value}\`)`;
+          },
+        )
+        .replace(
+          /\b(id|thread)\s*:\s*`?([A-Za-z0-9._-]{10,})`?/gi,
+          (_full, labelInput: string, value: string) => {
+            const label = labelInput.trim();
+            const lower = label.toLowerCase();
+            const anchorPrefix = lower === "thread" ? "thr" : "id";
+            return `${label}: #${anchorPrefix}_${value} (\`${value}\`)`;
+          },
+        );
     })
     .join("\n");
 }
@@ -2620,6 +2576,65 @@ function detectDocumentIntent(text: string, allowedExts: string[]): DocumentInte
   };
 }
 
+type ImageReferenceIntent = {
+  shouldHandle: boolean;
+  references: string[];
+};
+
+function extractWorkspaceImageReferences(text: string): string[] {
+  const references: string[] = [];
+  const addReference = (raw: string) => {
+    const stripped = stripTrailingWorkspacePathPunctuation(raw);
+    const normalized = normalizeWorkspaceRelativePath(stripped);
+    if (!normalized || !normalized.startsWith("images/")) {
+      return;
+    }
+    references.push(normalized);
+  };
+
+  const imageTagPattern = /\[\s*IMAGEN\s+path\s*=\s*([^\]\s"'`]+)\s*\]/gi;
+  let tagMatch: RegExpExecArray | null;
+  while ((tagMatch = imageTagPattern.exec(text)) !== null) {
+    const candidate = tagMatch[1]?.trim();
+    if (candidate) {
+      addReference(candidate);
+    }
+  }
+
+  const workspacePathPattern = /\bworkspace\/images\/[^\s"'`)\]}>,;]+/gi;
+  let pathMatch: RegExpExecArray | null;
+  while ((pathMatch = workspacePathPattern.exec(text)) !== null) {
+    const candidate = pathMatch[0]?.trim();
+    if (candidate) {
+      addReference(candidate);
+    }
+  }
+
+  return Array.from(new Set(references));
+}
+
+function detectImageReferenceIntent(text: string): ImageReferenceIntent {
+  const references = extractWorkspaceImageReferences(text);
+  if (references.length === 0) {
+    return { shouldHandle: false, references };
+  }
+  const normalized = normalizeIntentText(text);
+  const analysisCue =
+    /\b(analiz|describe|describ|que ves|que hay|que aparece|que dice|leer|extrae|ocr|interpre|resum|detall|explic|traduce|traduc)\b/.test(
+      normalized,
+    ) || /\b(foto|imagen)\b/.test(normalized);
+  return {
+    shouldHandle: analysisCue,
+    references,
+  };
+}
+
+function buildImageInstructionFromText(text: string): string {
+  const withoutImageTag = text.replace(/\[\s*IMAGEN\s+path\s*=\s*[^\]]+\]/gi, " ");
+  const withoutSlackAttachmentBlock = withoutImageTag.replace(/\n\s*Archivos adjuntos recibidos desde Slack:[\s\S]*$/i, " ");
+  return withoutSlackAttachmentBlock.replace(/\s+/g, " ").trim();
+}
+
 function normalizeWorkspaceRelativePath(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -2736,37 +2751,37 @@ function buildAutoWorkspaceFilePath(extensionInput?: string): string {
     .replace(/[-:]/g, "")
     .replace(/\..+$/, "")
     .replace("T", "-");
-  return `generated-${stamp}${safeExt}`;
+  const character = pickRandomItem(WORKSPACE_CHARACTER_NAME_POOL);
+  return `${character.stem}-${stamp}${safeExt}`;
 }
 
-const RANDOM_WORKSPACE_NAME_ADJECTIVES = [
-  "agil",
-  "astral",
-  "bravo",
-  "claro",
-  "delta",
-  "firme",
-  "lunar",
-  "neo",
-  "noble",
-  "pleno",
-  "solar",
-  "vivo",
-] as const;
-
-const RANDOM_WORKSPACE_NAME_NOUNS = [
-  "atlas",
-  "pulso",
-  "nexo",
-  "trazo",
-  "bitacora",
-  "origen",
-  "ruta",
-  "nodo",
-  "vector",
-  "cifra",
-  "foco",
-  "ritmo",
+const WORKSPACE_CHARACTER_NAME_POOL = [
+  { stem: "homer-simpson", franchise: "simpsons" },
+  { stem: "marge-simpson", franchise: "simpsons" },
+  { stem: "bart-simpson", franchise: "simpsons" },
+  { stem: "lisa-simpson", franchise: "simpsons" },
+  { stem: "maggie-simpson", franchise: "simpsons" },
+  { stem: "mr-burns", franchise: "simpsons" },
+  { stem: "darth-vader", franchise: "star-wars" },
+  { stem: "luke-skywalker", franchise: "star-wars" },
+  { stem: "leia-organa", franchise: "star-wars" },
+  { stem: "han-solo", franchise: "star-wars" },
+  { stem: "obi-wan-kenobi", franchise: "star-wars" },
+  { stem: "yoda", franchise: "star-wars" },
+  { stem: "marty-mcfly", franchise: "back-to-the-future" },
+  { stem: "doc-brown", franchise: "back-to-the-future" },
+  { stem: "biff-tannen", franchise: "back-to-the-future" },
+  { stem: "leonardo", franchise: "tmnt" },
+  { stem: "raphael", franchise: "tmnt" },
+  { stem: "donatello", franchise: "tmnt" },
+  { stem: "michelangelo", franchise: "tmnt" },
+  { stem: "splinter", franchise: "tmnt" },
+  { stem: "achilles", franchise: "mythic-warriors" },
+  { stem: "leonidas", franchise: "mythic-warriors" },
+  { stem: "hercules", franchise: "mythic-warriors" },
+  { stem: "perseus", franchise: "mythic-warriors" },
+  { stem: "atena", franchise: "mythic-warriors" },
+  { stem: "thor", franchise: "mythic-warriors" },
 ] as const;
 
 const RANDOM_WORKSPACE_COUNT_WORDS: Record<string, number> = {
@@ -2812,10 +2827,9 @@ function buildCreativeRandomWorkspaceFilePath(extensionInput?: string): string {
   const extRaw = (extensionInput ?? ".txt").trim().toLowerCase();
   const ext = extRaw.startsWith(".") ? extRaw : `.${extRaw}`;
   const safeExt = SIMPLE_TEXT_FILE_EXTENSIONS.has(ext) ? ext : ".txt";
-  const adjective = pickRandomItem(RANDOM_WORKSPACE_NAME_ADJECTIVES);
-  const noun = pickRandomItem(RANDOM_WORKSPACE_NAME_NOUNS);
+  const character = pickRandomItem(WORKSPACE_CHARACTER_NAME_POOL);
   const suffix = Math.random().toString(36).slice(2, 7);
-  return `${adjective}-${noun}-${suffix}${safeExt}`;
+  return `${character.stem}-${suffix}${safeExt}`;
 }
 
 function extractRandomWorkspaceFileNameRequest(text: string): { requested: boolean; count: number } {
@@ -3857,6 +3871,10 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     original.match(/\b(\d{1,2})\s+mensajes?\b/i);
   const parsedCount = Number.parseInt(countMatch?.[1] ?? naturalCountMatch?.[1] ?? "", 10);
   const count = Number.isFinite(parsedCount) ? Math.max(1, Math.min(10, parsedCount)) : 3;
+  const historyCount = parseLimHistoryLimit(original, 10, 20);
+  const listRequested =
+    /\b(lista|listar|listame|historial|history|registro|registros|outputs?|salidas?)\b/.test(normalized) &&
+    /\b\/?lim\b/.test(normalized);
   const asksProspectOnly =
     /\b(prospecto|lead|contacto)\b/.test(normalized) ||
     /\b(no\s+(?:propios?|mios?|mías?|mias|nuestros?|nuestras?))\b/.test(normalized) ||
@@ -3867,6 +3885,13 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       normalized,
     );
   const hasLimParams = Boolean(firstName && lastName && sourceName);
+  if ((explicitContext || Boolean(options?.allowImplicit)) && listRequested) {
+    return {
+      shouldHandle: true,
+      action: "list",
+      count: historyCount,
+    };
+  }
   if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && hasLimParams) {
     return {
       shouldHandle: true,
@@ -4046,7 +4071,7 @@ function tryParseConnectorIntentWithAi(raw: string): ConnectorNaturalIntent | nu
   try {
     const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as Record<string, unknown>;
     const actionRaw = typeof parsed.action === "string" ? normalizeIntentText(parsed.action) : "";
-    const allowedActions = new Set<ConnectorNaturalAction>(["query", "status", "start", "stop", "restart"]);
+    const allowedActions = new Set<ConnectorNaturalAction>(["query", "status", "start", "stop", "restart", "list"]);
     if (!allowedActions.has(actionRaw as ConnectorNaturalAction)) {
       return null;
     }
@@ -4083,7 +4108,7 @@ async function classifyConnectorIntentWithAi(params: { chatId: number; text: str
     "Extrae intención LIM desde un mensaje de usuario.",
     "Responde SOLO JSON válido con estas claves:",
     "{",
-    '  "action": "query|status|start|stop|restart",',
+    '  "action": "query|status|start|stop|restart|list",',
     '  "firstName": "string|null",',
     '  "lastName": "string|null",',
     '  "sourceName": "string|null",',
@@ -4093,6 +4118,7 @@ async function classifyConnectorIntentWithAi(params: { chatId: number; text: str
     "",
     "Reglas:",
     "- Si pide mensajes/contacto, action=query.",
+    "- Si pide listar historial/output de LIM, action=list y usa count como límite (default 10).",
     "- Si action=query, intenta extraer firstName, lastName, sourceName y count (default 3).",
     "- No inventes datos; usa null si no está.",
     "- Si dice 'no propios/entrantes/prospecto', prospectOnly=true.",
@@ -7324,6 +7350,43 @@ function plannedActionRemainingSeconds(item: PendingPlannedAction): number {
   return Math.max(0, Math.round((item.expiresAtMs - Date.now()) / 1000));
 }
 
+function listPendingPlannedActions(chatId: number, userId?: number): PendingPlannedAction[] {
+  purgeExpiredPlannedActions();
+  return [...pendingPlannedActionsById.values()]
+    .filter((item) => item.chatId === chatId)
+    .filter((item) => (typeof userId === "number" ? item.userId === userId : true))
+    .sort((a, b) => a.requestedAtMs - b.requestedAtMs);
+}
+
+function consumeLatestPlannedAction(chatId: number, userId?: number): PendingPlannedAction | null {
+  const items = listPendingPlannedActions(chatId, userId);
+  const selected = items.at(-1);
+  if (!selected) {
+    return null;
+  }
+  pendingPlannedActionsById.delete(selected.id);
+  persistRuntimeStateSnapshot("planned-consume");
+  return selected;
+}
+
+function denyLatestPlannedAction(chatId: number, userId?: number): PendingPlannedAction | null {
+  const items = listPendingPlannedActions(chatId, userId);
+  const selected = items.at(-1);
+  if (!selected) {
+    return null;
+  }
+  pendingPlannedActionsById.delete(selected.id);
+  persistRuntimeStateSnapshot("planned-deny");
+  return selected;
+}
+
+function pickLatestPendingApproval(chatId: number, userId?: number): PendingApproval | null {
+  const all = adminSecurity.listApprovals(chatId);
+  const scoped = typeof userId === "number" ? all.filter((item) => item.userId === userId) : all;
+  const selected = (scoped.length > 0 ? scoped : all).at(-1);
+  return selected ?? null;
+}
+
 async function maybeRequirePlannedConfirmation(params: {
   ctx: ChatReplyContext;
   kind: PlannedActionKind;
@@ -7349,9 +7412,9 @@ async function maybeRequirePlannedConfirmation(params: {
     [
       "Plan Preview (acción sensible):",
       planned.summary,
-      `plan_id: ${planned.id}`,
       `expira en: ${plannedActionRemainingSeconds(planned)}s`,
-      "Confirma con /confirm <plan_id> o cancela con /cancelplan <plan_id>.",
+      'Responde "si" o usa /confirm para ejecutar.',
+      'Responde "no" o usa /cancelplan para cancelar.',
     ].join("\n"),
     { source: params.source },
   );
@@ -7856,6 +7919,42 @@ type LimQueryResult = {
   detail?: string;
 };
 
+type LimOutputHistoryEntry = {
+  id: string;
+  recordedAt: string;
+  traceId?: string | null;
+  source?: string | null;
+  account?: string | null;
+  workerStatus?: number;
+  query?: {
+    first_name?: string | null;
+    last_name?: string | null;
+    count?: string | null;
+    source?: string | null;
+  };
+  output?: {
+    ok?: boolean;
+    found?: boolean;
+    contact?: string;
+    returnedMessages?: number;
+    messages?: Array<{
+      direction?: string;
+      text?: string;
+      time?: string;
+      index?: number;
+    }>;
+  } | null;
+};
+
+type LimHistoryResult = {
+  ok: boolean;
+  totalStored?: number;
+  maxStored?: number;
+  outputs?: LimOutputHistoryEntry[];
+  error?: string;
+  detail?: string;
+};
+
 function normalizeLimSourceKey(value: string): string {
   return value
     .normalize("NFD")
@@ -7891,6 +7990,150 @@ function buildLimMessagesUrl(account: string, firstName: string, lastName: strin
   base.searchParams.set("last_name", lastName);
   base.searchParams.set("count", String(Math.max(1, Math.min(10, Math.floor(count)))));
   return base.toString();
+}
+
+function parseLimHistoryLimit(raw: string, fallback = 10, maxLimit = 20): number {
+  const tagged = raw.match(/\b(?:limit|limite|l[ií]mite|top)\s*[:=]?\s*(\d{1,2})\b/i);
+  const natural = raw.match(/\b(?:ultimos?|[uú]ltimos?)\s+(\d{1,2})\b/i);
+  const trailing = raw.match(/\b(?:list|lista|listar|historial|history|registro|registros|outputs?|salidas?)\s+(\d{1,2})\b/i);
+  const parsed = Number.parseInt(tagged?.[1] ?? natural?.[1] ?? trailing?.[1] ?? "", 10);
+  const limit = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.max(1, Math.min(maxLimit, Math.floor(limit)));
+}
+
+function buildLimHistoryUrl(limit: number): string {
+  const { localUrl } = getConnectorHealthUrls();
+  const base = new URL(localUrl);
+  base.pathname = "/lim/list";
+  base.search = "";
+  base.searchParams.set("limit", String(Math.max(1, Math.min(20, Math.floor(limit)))));
+  return base.toString();
+}
+
+async function queryLimOutputHistory(limitInput?: number): Promise<LimHistoryResult> {
+  const limit = Math.max(1, Math.min(20, Math.floor(limitInput ?? 10)));
+  const endpoint = buildLimHistoryUrl(limit);
+  const controller = new AbortController();
+  const timeoutMs = Math.max(30_000, config.limHealthTimeoutMs * 4);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+    const bodyText = await response.text();
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(bodyText) as Record<string, unknown>;
+    } catch {
+      parsed = null;
+    }
+
+    if (!response.ok) {
+      const detail =
+        (parsed && (typeof parsed.error === "string" ? parsed.error : typeof parsed.message === "string" ? parsed.message : "")) ||
+        `HTTP ${response.status}`;
+      return { ok: false, error: "lim_http_error", detail };
+    }
+
+    const outputsRaw = Array.isArray(parsed?.outputs) ? parsed.outputs : [];
+    const outputs = outputsRaw
+      .slice(0, limit)
+      .map((item) => (typeof item === "object" && item !== null ? (item as Record<string, unknown>) : null))
+      .filter((item): item is Record<string, unknown> => Boolean(item))
+      .map((item) => {
+        const queryRaw =
+          item.query && typeof item.query === "object" && item.query !== null
+            ? (item.query as Record<string, unknown>)
+            : {};
+        const outputRaw =
+          item.output && typeof item.output === "object" && item.output !== null
+            ? (item.output as Record<string, unknown>)
+            : null;
+        const outputMessages = Array.isArray(outputRaw?.messages)
+          ? outputRaw.messages
+              .map((entry) => (typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : null))
+              .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+              .slice(0, 3)
+              .map((entry) => ({
+                direction: typeof entry.direction === "string" ? entry.direction : undefined,
+                text: typeof entry.text === "string" ? entry.text : undefined,
+                time: typeof entry.time === "string" ? entry.time : undefined,
+                index: typeof entry.index === "number" ? entry.index : undefined,
+              }))
+          : [];
+        return {
+          id: String(item.id ?? ""),
+          recordedAt: typeof item.recordedAt === "string" ? item.recordedAt : "",
+          traceId: typeof item.traceId === "string" ? item.traceId : null,
+          source: typeof item.source === "string" ? item.source : null,
+          account: typeof item.account === "string" ? item.account : null,
+          workerStatus:
+            typeof item.workerStatus === "number"
+              ? item.workerStatus
+              : Number.parseInt(String(item.workerStatus ?? ""), 10) || 0,
+          query: {
+            first_name: typeof queryRaw.first_name === "string" ? queryRaw.first_name : null,
+            last_name: typeof queryRaw.last_name === "string" ? queryRaw.last_name : null,
+            count: queryRaw.count == null ? null : String(queryRaw.count),
+            source: typeof queryRaw.source === "string" ? queryRaw.source : null,
+          },
+          output: outputRaw
+            ? {
+                ok: typeof outputRaw.ok === "boolean" ? outputRaw.ok : undefined,
+                found: typeof outputRaw.found === "boolean" ? outputRaw.found : undefined,
+                contact: typeof outputRaw.contact === "string" ? outputRaw.contact : undefined,
+                returnedMessages:
+                  typeof outputRaw.returnedMessages === "number" ? outputRaw.returnedMessages : undefined,
+                messages: outputMessages,
+              }
+            : null,
+        } satisfies LimOutputHistoryEntry;
+      });
+
+    return {
+      ok: true,
+      totalStored: typeof parsed?.totalStored === "number" ? parsed.totalStored : outputs.length,
+      maxStored: typeof parsed?.maxStored === "number" ? parsed.maxStored : undefined,
+      outputs,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: "lim_request_failed",
+      detail: message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function formatLimHistoryText(result: LimHistoryResult, requestedLimit: number): string {
+  const outputs = result.outputs ?? [];
+  const lines: string[] = [];
+  lines.push(`LIM historial | últimos ${outputs.length} (solicitado: ${requestedLimit})`);
+  lines.push(`Buffer: ${result.totalStored ?? outputs.length}/${result.maxStored ?? "?"}`);
+  if (outputs.length === 0) {
+    lines.push("Sin outputs registrados todavía.");
+    return lines.join("\n");
+  }
+  lines.push("");
+  outputs.forEach((entry, index) => {
+    const who = [entry.query?.first_name, entry.query?.last_name].filter(Boolean).join(" ").trim() || "-";
+    const sample = (entry.output?.messages ?? [])
+      .map((msg) => truncateInline(msg.text || "(sin texto)", 90))
+      .slice(0, 2);
+    lines.push(
+      [
+        `${index + 1}. [${entry.recordedAt || "-"}] cuenta=${entry.account || "-"} status=${entry.workerStatus ?? 0} id=${entry.id || "-"}`,
+        `   contacto=${entry.output?.contact || who} | ok=${entry.output?.ok === true ? "sí" : "no"} | found=${entry.output?.found === true ? "sí" : "no"} | msgs=${entry.output?.returnedMessages ?? 0}`,
+        ...(sample.length > 0 ? [`   muestra: ${sample.join(" | ")}`] : []),
+      ].join("\n"),
+    );
+  });
+  return lines.join("\n");
 }
 
 async function queryLimMessages(params: {
@@ -8604,15 +8847,103 @@ async function queueApproval(params: {
     },
   });
 
-  await reliableReply(params.ctx, 
+  await reliableReply(params.ctx,
     [
-      `Aprobación requerida: ${approval.id}`,
+      "Aprobación requerida:",
       `Tipo: ${approval.kind}`,
       `Agente: ${approval.agentName}`,
       `Comando: ${formatApprovalCommandLabel(approval.commandLine)}`,
       `Expira en: ${approvalRemainingSeconds(approval)}s`,
-      "Usa /approve <id> para ejecutar o /deny <id> para cancelar.",
+      'Responde "si" o usa /approve para ejecutar.',
+      'Responde "no" o usa /deny para cancelar.',
     ].join("\n"), { source: "approval.request" });
+}
+
+async function executeApprovedAction(params: {
+  ctx: ChatReplyContext;
+  approval: PendingApproval;
+  source: string;
+}): Promise<void> {
+  const profile = agentRegistry.get(params.approval.agentName);
+  if (!profile) {
+    await params.ctx.reply(`El agente ${params.approval.agentName} ya no existe. Aprobación descartada.`);
+    return;
+  }
+
+  await params.ctx.reply("Aprobación aceptada. Ejecutando...");
+  await safeAudit({
+    type: "approval.approved",
+    chatId: params.ctx.chat.id,
+    userId: params.ctx.from?.id,
+    details: {
+      approvalId: params.approval.id,
+      kind: params.approval.kind,
+      agent: params.approval.agentName,
+      commandLine: params.approval.commandLine,
+      source: params.source,
+    },
+  });
+
+  if (params.approval.commandLine === SELF_UPDATE_APPROVAL_COMMAND) {
+    await executeAgentSelfUpdate({
+      ctx: params.ctx,
+      source: `${params.source}:${params.approval.kind}`,
+      note: params.approval.note,
+      userId: params.ctx.from?.id,
+      checkOnly: false,
+    });
+    return;
+  }
+
+  await runCommandForProfile({
+    ctx: params.ctx,
+    profile,
+    commandLine: params.approval.commandLine,
+    source: `${params.source}:${params.approval.kind}`,
+    note: params.approval.note,
+  });
+}
+
+async function executeConfirmedPlan(params: {
+  ctx: ChatReplyContext;
+  planned: PendingPlannedAction;
+  source: string;
+}): Promise<void> {
+  const trace = startRunTrace({
+    chatId: params.ctx.chat.id,
+    userId: params.ctx.from?.id,
+    action: `confirm:${params.planned.kind}`,
+    source: params.source,
+  });
+  await params.ctx.reply(`Confirmación recibida. Ejecutando...\nrun_id: ${trace.id}`);
+  try {
+    await executePlannedAction({ ctx: params.ctx, planned: params.planned });
+    await safeAudit({
+      type: "plan.confirmed",
+      chatId: params.ctx.chat.id,
+      userId: params.ctx.from?.id,
+      details: {
+        ...finishRunTrace({ trace, status: "ok" }),
+        planId: params.planned.id,
+        kind: params.planned.kind,
+        source: params.source,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await safeAudit({
+      type: "plan.confirmed.failed",
+      chatId: params.ctx.chat.id,
+      userId: params.ctx.from?.id,
+      details: {
+        ...finishRunTrace({ trace, status: "error", error: message }),
+        planId: params.planned.id,
+        kind: params.planned.kind,
+        source: params.source,
+      },
+    });
+    await params.ctx.reply(`Falló la ejecución del plan confirmado: ${message}`);
+  }
 }
 
 async function executePlannedAction(params: { ctx: ChatReplyContext; planned: PendingPlannedAction }): Promise<void> {
@@ -9790,6 +10121,55 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     });
   }
 
+  if (intent.action === "list") {
+    const requestedLimit = Math.max(1, Math.min(20, Math.floor(intent.count ?? 10)));
+    await replyProgress(params.ctx, `Consultando historial LIM (últimos ${requestedLimit})...`);
+    const history = await queryLimOutputHistory(requestedLimit);
+    if (!history.ok) {
+      await params.ctx.reply(
+        [
+          "No pude listar historial de LIM.",
+          `Detalle: ${truncateInline(history.detail || history.error || "error desconocido", 260)}`,
+        ].join("\n"),
+      );
+      await safeAudit({
+        type: "lim.intent_list_failed",
+        chatId,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          action: intent.action,
+          limit: requestedLimit,
+          error: history.error || "",
+          detail: history.detail || "",
+        },
+      });
+      return true;
+    }
+    const responseText = formatLimHistoryText(history, requestedLimit);
+    await replyLong(params.ctx, responseText);
+    await appendConversationTurn({
+      chatId,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(responseText, 3200),
+      source: `${params.source}:lim-intent`,
+    });
+    await safeAudit({
+      type: "lim.intent_list",
+      chatId,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        action: intent.action,
+        limit: requestedLimit,
+        totalStored: history.totalStored ?? 0,
+        returned: history.outputs?.length ?? 0,
+      },
+    });
+    return true;
+  }
+
   if (intent.action === "query") {
     const firstName = intent.firstName?.trim() ?? "";
     const lastName = intent.lastName?.trim() ?? "";
@@ -10574,6 +10954,49 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
             " - mostrar contenido de datos.csv",
           ].join("\n"),
         );
+        return true;
+      }
+
+      const resolvedTargetPath = resolveWorkspacePath(targetPath);
+      const targetPathStat = await fs.stat(resolvedTargetPath.fullPath).catch(() => null);
+      if (targetPathStat?.isDirectory()) {
+        const listed = await listWorkspaceDirectory(targetPath);
+        rememberWorkspaceListContext({
+          chatId: params.ctx.chat.id,
+          relPath: listed.relPath,
+          entries: listed.entries,
+          source: `${params.source}:workspace-intent`,
+        });
+        const responseLines =
+          listed.entries.length === 0
+            ? [`Carpeta vacia: ${listed.relPath}`]
+            : [
+                `Contenido de ${listed.relPath} (${listed.entries.length}):`,
+                ...formatWorkspaceEntries(listed.entries),
+              ];
+        if (autocompleteNotices.length > 0) {
+          responseLines.push("", "autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`));
+        }
+        const responseText = responseLines.join("\n");
+        await replyLong(params.ctx, responseText);
+        await appendConversationTurn({
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          role: "assistant",
+          text: truncateInline(responseText, 2600),
+          source: `${params.source}:workspace-intent`,
+        });
+        await safeAudit({
+          type: "workspace.intent_list",
+          chatId: params.ctx.chat.id,
+          userId: params.userId,
+          details: {
+            source: params.source,
+            path: listed.relPath,
+            count: listed.entries.length,
+            viaReadAction: true,
+          },
+        });
         return true;
       }
 
@@ -11846,6 +12269,167 @@ async function maybeHandleNaturalDocumentInstruction(params: {
   return true;
 }
 
+async function maybeHandleNaturalImageReferenceInstruction(params: {
+  ctx: ChatReplyContext;
+  text: string;
+  source: string;
+  userId?: number;
+  persistUserTurn: boolean;
+}): Promise<boolean> {
+  const intent = detectImageReferenceIntent(params.text);
+  if (!intent.shouldHandle || intent.references.length === 0) {
+    return false;
+  }
+
+  if (params.persistUserTurn) {
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      role: "user",
+      text: params.text,
+      source: params.source,
+    });
+  }
+
+  const chosenReference = intent.references[intent.references.length - 1]!;
+  let resolvedPath: { fullPath: string; relPath: string };
+  try {
+    resolvedPath = resolveWorkspacePath(chosenReference);
+  } catch {
+    await params.ctx.reply(
+      `Detecté referencia de imagen, pero no pude resolver la ruta: workspace/${chosenReference}`,
+    );
+    return true;
+  }
+
+  const relPath = toProjectRelativePath(resolvedPath.fullPath);
+  if (!normalizeWorkspaceRelativePath(relPath).startsWith("images/")) {
+    return false;
+  }
+
+  try {
+    const stat = await fs.stat(resolvedPath.fullPath);
+    if (!stat.isFile()) {
+      await params.ctx.reply(`La referencia no apunta a un archivo: ${relPath}`);
+      return true;
+    }
+
+    if (stat.size > config.imageMaxFileBytes) {
+      const limitMb = Math.round(config.imageMaxFileBytes / (1024 * 1024));
+      await params.ctx.reply(`La imagen supera el límite permitido (${limitMb}MB).`);
+      return true;
+    }
+
+    const imageBuffer = await fs.readFile(resolvedPath.fullPath);
+    const mimeType = resolveIncomingImageMimeType({
+      fileName: path.basename(relPath),
+      telegramFilePath: relPath,
+    });
+    const summaryHeader = [
+      "Imagen detectada desde referencia local.",
+      `ruta: ${relPath}`,
+      `tamano: ${formatBytes(stat.size)}`,
+      `mime: ${mimeType}`,
+    ].join("\n");
+
+    if (!openAi.isConfigured()) {
+      const responseNoAi = [
+        summaryHeader,
+        "",
+        "OpenAI no está configurado para analizar la imagen (falta OPENAI_API_KEY).",
+      ].join("\n");
+      await replyLong(params.ctx, responseNoAi);
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        role: "assistant",
+        text: responseNoAi,
+        source: `${params.source}:image-intent`,
+      });
+      return true;
+    }
+
+    await replyProgress(params.ctx, `Imagen detectada: ${relPath}. Analizando...`);
+    const ecoEnabled = isEcoModeEnabled(params.ctx.chat.id);
+    const instruction = buildImageInstructionFromText(params.text);
+    const prompt = instruction
+      ? [
+          "Analiza la imagen adjunta y responde la instrucción del usuario.",
+          `Instrucción: ${instruction}`,
+          "Si hay texto visible relevante, inclúyelo en la respuesta.",
+          ...(ecoEnabled
+            ? [
+                "MODO ECO: respuesta ultra-concisa.",
+                "Formato exacto: 1) 3 bullets máximos 2) 1 acción sugerida.",
+                "Máximo 420 caracteres.",
+              ]
+            : []),
+        ].join("\n")
+      : [
+          "Describe la imagen en español de forma clara y breve, incluyendo texto visible relevante.",
+          ...(ecoEnabled
+            ? [
+                "MODO ECO: usa 3 bullets máximos y 1 acción sugerida.",
+                "Máximo 420 caracteres.",
+              ]
+            : []),
+        ].join("\n");
+    const promptContext = await buildPromptContextForQuery(
+      instruction || `analizar imagen ${path.basename(relPath)}`,
+      {
+        chatId: params.ctx.chat.id,
+      },
+    );
+    const analysisRaw = await openAi.analyzeImage({
+      image: imageBuffer,
+      mimeType,
+      prompt,
+      context: promptContext,
+      concise: ecoEnabled,
+      maxOutputTokens: ecoEnabled ? Math.min(config.openAiEcoMaxOutputTokens, 180) : undefined,
+      model: getOpenAiModelForChat(params.ctx.chat.id),
+    });
+    const analysis = ecoEnabled ? truncateInline(analysisRaw, 700) : analysisRaw;
+
+    const response = `${summaryHeader}\n\nAnalisis:\n${analysis}`;
+    await replyLong(params.ctx, response);
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      role: "assistant",
+      text: response,
+      source: `${params.source}:image-intent`,
+    });
+    await safeAudit({
+      type: "image.intent_handled",
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        path: relPath,
+        bytes: stat.size,
+        mimeType,
+        answerChars: analysis.length,
+      },
+    });
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await params.ctx.reply(`No pude analizar la imagen de workspace: ${message}`);
+    await safeAudit({
+      type: "image.intent_failed",
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        path: relPath,
+        error: message,
+      },
+    });
+    return true;
+  }
+}
+
 async function maybeHandleNaturalWebInstruction(params: {
   ctx: ChatReplyContext;
   text: string;
@@ -13006,6 +13590,10 @@ async function maybeHandleNaturalIntentPipeline(params: {
   };
 
   const normalized = normalizeIntentText(params.text);
+  const handledImageReferenceEarly = await maybeHandleNaturalImageReferenceInstruction(params);
+  if (handledImageReferenceEarly) {
+    return true;
+  }
   const conversationalNarrative = isLikelyConversationalNarrative(params.text);
   const chained = conversationalNarrative ? [] : splitChainedInstructions(params.text);
   if (chained.length >= 2) {
@@ -13064,7 +13652,9 @@ async function maybeHandleNaturalIntentPipeline(params: {
     return true;
   }
 
-  const skipAiSequencedPlan = extractRandomWorkspaceFileNameRequest(params.text).requested || conversationalNarrative;
+  const hasWorkspaceImageReferences = extractWorkspaceImageReferences(params.text).length > 0;
+  const skipAiSequencedPlan =
+    extractRandomWorkspaceFileNameRequest(params.text).requested || conversationalNarrative || hasWorkspaceImageReferences;
   if (!skipAiSequencedPlan && !params.source.includes(":seq-step-") && !params.source.includes(":chain-")) {
     const sequencedPlan = await classifySequencedIntentPlanWithAi({
       chatId: params.ctx.chat.id,
@@ -13825,10 +14415,51 @@ bot.command("start", async (ctx) => {
 });
 
 bot.command("help", async (ctx) => {
-  const helpText = [
+  const activeAgent = getActiveAgent(ctx.chat.id).toLowerCase();
+  const isAdminView = activeAgent === "admin";
+
+  const operatorCommands = [
     "Comandos:",
     "/version - Ver versión del agente",
-    "/model [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
+    "/model|/mode [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
+    "/ask <pregunta> - Consultar IA de OpenAI",
+    "/readfile <ruta> - Extraer texto de PDF/documentos de oficina",
+    "/askfile <ruta> <pregunta> - Consultar IA sobre archivo local",
+    "/mkfile <ruta> [contenido] - Crear archivo de texto simple en workspace",
+    "/files [limit] - Listar contenido de workspace/files",
+    "/getfile <ruta|n> - Enviar archivo del workspace al chat",
+    "/images [limit] - Listar contenido de workspace/images",
+    "/docs [limit] - Listar contenido de workspace/docs",
+    "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
+    "/web <consulta> - Buscar en la web",
+    "/webopen <n|url> [pregunta] - Abrir resultado web y opcionalmente analizarlo",
+    "/webask <consulta> - Buscar + sintetizar respuesta con fuentes",
+    "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
+    "/task ... - Crear/listar/editar/eliminar tareas programadas",
+    "/gmail ... - Consultar/operar tu cuenta Gmail conectada",
+    "/remember <nota> - Guardar nota en memoria diaria",
+    "/memory - Estado de memoria",
+    "/memory search <texto> - Buscar en memoria",
+    "/memory view <path> [from] [lines] - Ver fragmento de memoria",
+    "/interests [status|add|del|clear|suggest] - Gestión de intereses de noticias",
+    "/suggest now|status - Forzar sugerencia o ver cuota/config",
+    "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
+    "/safe on|off|status - Modo determinista para interpretar órdenes precisas",
+    "/confirm - Confirmar plan preview sensible (último en este chat)",
+    "/cancelplan - Cancelar plan preview sensible (último en este chat)",
+    "",
+    "Notas:",
+    "Enviar nota de voz/audio - Se transcribe y se responde con IA.",
+    "Enviar archivo (document) - Se guarda directo en workspace/files/.",
+    "Enviar imagen/foto - Se guarda directo en workspace/images/.",
+    "Chat libre: escribe un mensaje normal (sin /) y responde OpenAI.",
+    "Si pides tareas/recordatorios con fecha y hora, se agenda automáticamente.",
+    "Si pides correo Gmail, web o archivos en lenguaje natural, lo resuelve sin comando estricto.",
+  ];
+
+  const adminOnlyCommands = [
+    "",
+    "Comandos de administración/sistema (solo admin):",
     "/status - Estado del host y tareas en ejecución",
     "/doctor - Diagnóstico operativo rápido del agente",
     "/usage [topN|reset] - Métricas de tokens/costo OpenAI desde el arranque",
@@ -13837,35 +14468,14 @@ bot.command("help", async (ctx) => {
     "/agenticcanary [status|<0-100>] - Rollout runtime de controles agénticos",
     "/agent - Ver agente activo y lista",
     "/agent set <nombre> - Cambiar agente activo para este chat",
-    "/ask <pregunta> - Consultar IA de OpenAI",
-    "/readfile <ruta> - Extraer texto de PDF/documentos de oficina",
-    "/askfile <ruta> <pregunta> - Consultar IA sobre archivo local",
-    "/mkfile <ruta> [contenido] - Crear archivo de texto simple en workspace",
-    "/files [limit] - Listar archivos guardados en workspace",
-    "/getfile <ruta|n> - Enviar archivo del workspace al chat",
-    "/images [limit] - Listar imágenes guardadas en workspace",
-    "/workspace ... - Operar archivos/carpetas en workspace (list, mkdir, mv, rename, rm, send)",
-    "/web <consulta> - Buscar en la web",
     '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
-    "/weather [ubicación] - Clima actual y próximos días (Open-Meteo)",
-    "/webopen <n|url> [pregunta] - Abrir resultado web y opcionalmente analizarlo",
-    "/webask <consulta> - Buscar + sintetizar respuesta con fuentes",
-    "/task ... - Crear/listar/editar/eliminar tareas programadas",
-    "/gmail ... - Consultar/operar tu cuenta Gmail conectada",
-    "/remember <nota> - Guardar nota en memoria diaria",
-    "/memory - Estado de memoria",
-    "/memory search <texto> - Buscar en memoria",
-    "/memory view <path> [from] [lines] - Ver fragmento de memoria",
-    "/interests [status|add|del|clear|suggest] - Gestion de intereses de noticias",
-    "/suggest now|status - Forzar sugerencia o ver cuota/config",
+    "/lim list [limit:10] - Listar historial de outputs LIM",
     "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
     "/selfskill list - Ver habilidades agregadas",
     "/selfskill del <n|last|#id> - Eliminar habilidad agregada",
     "/selfskill draft <start|add|show|apply|cancel> - Armar skill en varios mensajes",
     "/selfrestart - Reiniciar servicio del agente",
     "/selfupdate [check] - Actualizar a la última versión del repositorio",
-    "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
-    "/safe on|off|status - Modo determinista para interpretar órdenes precisas",
     "/intentstats [n] - Métricas de enrutamiento y sugerencias de threshold",
     "/intentfit [n] [iter] - Ajusta thresholds del router semántico con dataset",
     "/intentreload - Recarga configuración de rutas semánticas desde archivo",
@@ -13875,39 +14485,21 @@ bot.command("help", async (ctx) => {
     "/intentab - Estado de experimento A/B del router",
     "/intentversion [list|save [label]|rollback <id>] - Versionado/rollback de rutas",
     "/intentcanary [status|set <id> <pct>|off] - Canary rollout de versión de router",
-    "Enviar nota de voz/audio - Se transcribe y se responde con IA",
-    "Enviar archivo (document) - Se guarda directo en workspace/files/",
-    "Enviar imagen/foto - Se guarda directo en workspace/images/ y puede analizarse con IA",
     "/shell <instrucción> - IA propone y ejecuta comando shell",
     "/shellmode on|off - Habilitar shell IA en chat libre",
     "/exec <cmd> [args] - Ejecutar comando permitido por el agente",
     "/reboot - Solicitar reinicio de PC (si está habilitado)",
     "/adminmode on|off - Requerir aprobación antes de ejecutar",
     "/approvals - Ver aprobaciones pendientes",
-    "/approve <id> - Aprobar ejecución pendiente",
-    "/deny <id> - Rechazar ejecución pendiente",
-    "/confirm <plan_id> - Confirmar plan preview sensible",
-    "/cancelplan <plan_id> - Cancelar plan preview sensible",
+    "/approve - Aprobar ejecución pendiente (última en este chat)",
+    "/deny - Rechazar ejecución pendiente (última en este chat)",
     "/outbox [status|flush|recover] - Estado/reintento de respuestas pendientes",
     "/metrics [reset] - Snapshot de observabilidad (counters/timings/colas)",
     "/panic on|off|status - Bloqueo global de ejecución",
     "/kill <taskId> - Terminar tarea activa",
-    "",
-    "Chat libre: escribe un mensaje normal (sin /) y responde OpenAI.",
-    "Si mencionas un archivo (.pdf/.docx/.xlsx/etc) y pides leer/analizar, lo procesa automáticamente.",
-    "Si pides recordatorios o tareas con fecha/hora, los agenda y dispara automáticamente.",
-    "Si pides listar/leer/enviar correos o consultar estado/perfil Gmail, lo hace en lenguaje natural.",
-    "Si habilitas integración de LIM, puede operar estado/iniciar/detener/reiniciar app+tunnel en lenguaje natural.",
-    "Si pides buscar en web/internet o compartes una URL para analizar, navega sin comandos.",
-    "Si preguntas 'te acordás/recordás de ...', consulta memoria en lenguaje natural.",
-    "Si pides listar/crear/mover/copiar/pegar/renombrar/eliminar/enviar archivos o carpetas en workspace, lo opera en lenguaje natural.",
-    'También entiende selectores por nombre: "empiezan con", "contienen" o "se llaman".',
-    "Tambien puedes crear archivos simples (.txt/.csv/.json/.md/etc) con lenguaje natural.",
-    "Si pides agregar una habilidad o reiniciar el agente, también puede hacerlo en lenguaje natural.",
-    "Tambien puede armar una habilidad en varios mensajes con borrador natural y sugerir contenido proactivamente segun recurrencia (con cuota diaria).",
-    "Si shellmode=on, el chat libre puede proponer comandos para ejecutar.",
-    "Con adminmode=on, toda ejecución requiere /approve.",
-  ].join("\n");
+  ];
+
+  const helpText = [...operatorCommands, ...(isAdminView ? adminOnlyCommands : [])].join("\n");
   await replyLong(ctx, helpText);
 });
 
@@ -13915,8 +14507,8 @@ bot.command("version", async (ctx) => {
   await ctx.reply(buildAgentVersionText());
 });
 
-bot.command("model", async (ctx) => {
-  const input = String(ctx.match ?? "").trim();
+async function handleModelCommand(ctx: ChatReplyContext, inputRaw: string): Promise<void> {
+  const input = inputRaw.trim();
   const [subRaw, ...rest] = input.split(/\s+/).filter(Boolean);
   const sub = (subRaw ?? "show").toLowerCase();
   const value = rest.join(" ").trim();
@@ -13965,6 +14557,16 @@ bot.command("model", async (ctx) => {
   }
 
   await ctx.reply("Uso: /model [show|list|set <modelo>|reset]");
+}
+
+bot.command("model", async (ctx) => {
+  const input = String(ctx.match ?? "").trim();
+  await handleModelCommand(ctx, input);
+});
+
+bot.command("mode", async (ctx) => {
+  const input = String(ctx.match ?? "").trim();
+  await handleModelCommand(ctx, input);
 });
 
 bot.command("status", async (ctx) => {
@@ -15496,42 +16098,70 @@ bot.command("mkfile", async (ctx) => {
   }
 });
 
-bot.command("files", async (ctx) => {
+async function listWorkspaceShortcutFolder(
+  ctx: ChatReplyContext & { match?: string },
+  params: {
+    folder: "files" | "images" | "docs";
+    source: string;
+    title: string;
+    emptyText: string;
+  },
+): Promise<void> {
   const raw = String(ctx.match ?? "").trim();
-  let limit = 30;
+  let limit = 100;
   if (raw) {
     const parsed = Number.parseInt(raw, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      await ctx.reply("Uso: /files [limit]");
+      await ctx.reply(`Uso: /${params.folder} [limit]`);
       return;
     }
-    limit = Math.max(1, Math.min(150, Math.floor(parsed)));
+    limit = Math.max(1, Math.min(300, Math.floor(parsed)));
   }
 
-  const merged = await listRecentStoredFilesForChat(ctx.chat.id, limit);
-  lastListedFilesByChat.set(ctx.chat.id, merged);
-  rememberStoredFilesListContext({
-    chatId: ctx.chat.id,
-    title: "Archivos disponibles",
-    items: merged,
+  try {
+    const listed = await listWorkspaceDirectory(params.folder);
+    const entries = listed.entries.slice(0, limit);
+    rememberWorkspaceListContext({
+      chatId: ctx.chat.id,
+      relPath: listed.relPath,
+      entries,
+      source: params.source,
+    });
+
+    const responseText =
+      entries.length === 0
+        ? params.emptyText
+        : [
+            `${params.title} (${entries.length}${listed.entries.length > entries.length ? ` de ${listed.entries.length}` : ""}):`,
+            ...formatWorkspaceEntries(entries),
+          ].join("\n");
+    await replyLong(ctx, responseText);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/enoent|no such file or directory/i.test(message)) {
+      await ctx.reply(`No existe la carpeta workspace/${params.folder}.`);
+      return;
+    }
+    await ctx.reply(`No pude listar workspace/${params.folder}: ${message}`);
+  }
+}
+
+bot.command("files", async (ctx) => {
+  await listWorkspaceShortcutFolder(ctx, {
+    folder: "files",
     source: "telegram:/files",
+    title: "Contenido de workspace/files",
+    emptyText: "Carpeta vacía: workspace/files",
   });
+});
 
-  if (merged.length === 0) {
-    await ctx.reply("No hay archivos guardados.");
-    return;
-  }
-
-  await replyLong(
-    ctx,
-    [
-      `Archivos disponibles (${merged.length}):`,
-      ...merged.map(
-        (item, index) =>
-          `${index + 1}. ${item.relPath}\n   ${formatBytes(item.size)} | ${new Date(item.modifiedAt).toLocaleString("es-AR", { hour12: false })}`,
-      ),
-    ].join("\n\n"),
-  );
+bot.command("file", async (ctx) => {
+  await listWorkspaceShortcutFolder(ctx, {
+    folder: "files",
+    source: "telegram:/file",
+    title: "Contenido de workspace/files",
+    emptyText: "Carpeta vacía: workspace/files",
+  });
 });
 
 bot.command("getfile", async (ctx) => {
@@ -15574,39 +16204,39 @@ bot.command("getfile", async (ctx) => {
 });
 
 bot.command("images", async (ctx) => {
-  const raw = String(ctx.match ?? "").trim();
-  let limit = 20;
-  if (raw) {
-    const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      await ctx.reply("Uso: /images [limit]");
-      return;
-    }
-    limit = Math.max(1, Math.min(100, Math.floor(parsed)));
-  }
-
-  const items = await listSavedImages(ctx.chat.id, limit);
-  if (items.length === 0) {
-    await ctx.reply("No hay imágenes guardadas.");
-    return;
-  }
-  rememberStoredFilesListContext({
-    chatId: ctx.chat.id,
-    title: "Imagenes guardadas",
-    items,
+  await listWorkspaceShortcutFolder(ctx, {
+    folder: "images",
     source: "telegram:/images",
+    title: "Contenido de workspace/images",
+    emptyText: "Carpeta vacía: workspace/images",
   });
+});
 
-  await replyLong(
-    ctx,
-    [
-      `Imágenes guardadas (${items.length}):`,
-      ...items.map(
-        (item, index) =>
-          `${index + 1}. ${item.relPath}\n   ${formatBytes(item.size)} | ${new Date(item.modifiedAt).toLocaleString("es-AR", { hour12: false })}`,
-      ),
-    ].join("\n\n"),
-  );
+bot.command("img", async (ctx) => {
+  await listWorkspaceShortcutFolder(ctx, {
+    folder: "images",
+    source: "telegram:/img",
+    title: "Contenido de workspace/images",
+    emptyText: "Carpeta vacía: workspace/images",
+  });
+});
+
+bot.command("docs", async (ctx) => {
+  await listWorkspaceShortcutFolder(ctx, {
+    folder: "docs",
+    source: "telegram:/docs",
+    title: "Contenido de workspace/docs",
+    emptyText: "Carpeta vacía: workspace/docs",
+  });
+});
+
+bot.command("doc", async (ctx) => {
+  await listWorkspaceShortcutFolder(ctx, {
+    folder: "docs",
+    source: "telegram:/doc",
+    title: "Contenido de workspace/docs",
+    emptyText: "Carpeta vacía: workspace/docs",
+  });
 });
 
 bot.command("askfile", async (ctx) => {
@@ -15755,7 +16385,52 @@ bot.command("lim", async (ctx) => {
 
   const input = String(ctx.match ?? "").trim();
   if (!input) {
-    await ctx.reply('Uso: /lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3]');
+    await ctx.reply(
+      [
+        "Uso:",
+        "/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3]",
+        "/lim list [limit:10]",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const listIntent = detectConnectorNaturalIntent(`lim ${input}`, { allowImplicit: true });
+  if (listIntent.shouldHandle && listIntent.action === "list") {
+    const requestedLimit = Math.max(1, Math.min(20, Math.floor(listIntent.count ?? parseLimHistoryLimit(input, 10, 20))));
+    await replyProgress(ctx, `Consultando historial LIM (últimos ${requestedLimit})...`);
+    const history = await queryLimOutputHistory(requestedLimit);
+    if (!history.ok) {
+      await ctx.reply(
+        [
+          "No pude listar historial de LIM.",
+          `Detalle: ${truncateInline(history.detail || history.error || "error desconocido", 260)}`,
+        ].join("\n"),
+      );
+      await safeAudit({
+        type: "lim.command_list_failed",
+        chatId: ctx.chat.id,
+        userId: ctx.from?.id,
+        details: {
+          limit: requestedLimit,
+          error: history.error || "",
+          detail: history.detail || "",
+        },
+      });
+      return;
+    }
+    const responseText = formatLimHistoryText(history, requestedLimit);
+    await replyLong(ctx, responseText);
+    await safeAudit({
+      type: "lim.command_list",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        limit: requestedLimit,
+        totalStored: history.totalStored ?? 0,
+        returned: history.outputs?.length ?? 0,
+      },
+    });
     return;
   }
 
@@ -15775,7 +16450,13 @@ bot.command("lim", async (ctx) => {
   const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : 3;
 
   if (!firstName || !lastName || !sourceName) {
-    await ctx.reply('Faltan parámetros. Uso: /lim first_name:Juan last_name:Perez fuente:account_demo_c_jack [count:3]');
+    await ctx.reply(
+      [
+        "Faltan parámetros.",
+        "Uso consulta: /lim first_name:Juan last_name:Perez fuente:account_demo_c_jack [count:3]",
+        "Uso listado: /lim list [limit:10]",
+      ].join("\n"),
+    );
     return;
   }
 
@@ -16698,90 +17379,66 @@ bot.command("approvals", async (ctx) => {
 
   const lines = approvals.map(
     (approval) =>
-      `- ${approval.id} | ${approval.kind} | ${formatApprovalCommandLabel(approval.commandLine)} | expira ${approvalRemainingSeconds(approval)}s`,
+      `- ${approval.kind} | ${formatApprovalCommandLabel(approval.commandLine)} | expira ${approvalRemainingSeconds(approval)}s`,
   );
   await replyLong(ctx, ["Aprobaciones pendientes:", ...lines].join("\n"));
 });
 
 bot.command("approve", async (ctx) => {
   const id = String(ctx.match ?? "").trim();
-  if (!id) {
-    await ctx.reply("Uso: /approve <id>");
-    return;
-  }
 
   if (adminSecurity.isPanicModeEnabled()) {
     await ctx.reply("Panic mode está activo: desactívalo con /panic off para ejecutar.");
     return;
   }
 
-  const approval = adminSecurity.consumeApproval(id, ctx.chat.id);
+  const selected = id
+    ? adminSecurity.consumeApproval(id, ctx.chat.id)
+    : (() => {
+        const latest = pickLatestPendingApproval(ctx.chat.id, ctx.from?.id);
+        if (!latest) {
+          return null;
+        }
+        return adminSecurity.consumeApproval(latest.id, ctx.chat.id);
+      })();
+  const approval = selected;
   if (!approval) {
-    await ctx.reply(`No encontré aprobación pendiente con ID ${id} en este chat.`);
+    await ctx.reply("No encontré aprobación pendiente en este chat.");
     return;
   }
   persistRuntimeStateSnapshot("approval-consume");
 
-  const profile = agentRegistry.get(approval.agentName);
-  if (!profile) {
-    await ctx.reply(`El agente ${approval.agentName} ya no existe. Aprobación descartada.`);
-    return;
-  }
-
-  await ctx.reply(`Aprobación ${id} aceptada. Ejecutando...`);
-  await safeAudit({
-    type: "approval.approved",
-    chatId: ctx.chat.id,
-    userId: ctx.from?.id,
-    details: {
-      approvalId: id,
-      kind: approval.kind,
-      agent: approval.agentName,
-      commandLine: approval.commandLine,
-    },
-  });
-
-  if (approval.commandLine === SELF_UPDATE_APPROVAL_COMMAND) {
-    await executeAgentSelfUpdate({
-      ctx,
-      source: `approval:${approval.kind}`,
-      note: approval.note,
-      userId: ctx.from?.id,
-      checkOnly: false,
-    });
-    return;
-  }
-
-  await runCommandForProfile({
+  await executeApprovedAction({
     ctx,
-    profile,
-    commandLine: approval.commandLine,
-    source: `approval:${approval.kind}`,
-    note: approval.note,
+    approval,
+    source: "telegram:/approve",
   });
 });
 
 bot.command("deny", async (ctx) => {
   const id = String(ctx.match ?? "").trim();
-  if (!id) {
-    await ctx.reply("Uso: /deny <id>");
-    return;
-  }
-
-  const approval = adminSecurity.denyApproval(id, ctx.chat.id);
+  const approval = id
+    ? adminSecurity.denyApproval(id, ctx.chat.id)
+    : (() => {
+        const latest = pickLatestPendingApproval(ctx.chat.id, ctx.from?.id);
+        if (!latest) {
+          return null;
+        }
+        return adminSecurity.denyApproval(latest.id, ctx.chat.id);
+      })();
   if (!approval) {
-    await ctx.reply(`No encontré aprobación pendiente con ID ${id} en este chat.`);
+    await ctx.reply("No encontré aprobación pendiente en este chat.");
     return;
   }
   persistRuntimeStateSnapshot("approval-deny");
 
-  await ctx.reply(`Aprobación ${id} rechazada.`);
+  await ctx.reply("Aprobación rechazada.");
   await safeAudit({
     type: "approval.denied",
     chatId: ctx.chat.id,
     userId: ctx.from?.id,
     details: {
-      approvalId: id,
+      approvalId: approval.id,
       kind: approval.kind,
       commandLine: approval.commandLine,
     },
@@ -16790,62 +17447,26 @@ bot.command("deny", async (ctx) => {
 
 bot.command("confirm", async (ctx) => {
   const id = String(ctx.match ?? "").trim();
-  if (!id) {
-    await ctx.reply("Uso: /confirm <plan_id>");
-    return;
-  }
-  const planned = consumePlannedAction(id, ctx.chat.id);
+  const planned = id ? consumePlannedAction(id, ctx.chat.id) : consumeLatestPlannedAction(ctx.chat.id, ctx.from?.id);
   if (!planned) {
-    await ctx.reply(`No encontré plan pendiente con id ${id} en este chat.`);
+    await ctx.reply("No encontré plan pendiente para confirmar en este chat.");
     return;
   }
-  const trace = startRunTrace({
-    chatId: ctx.chat.id,
-    userId: ctx.from?.id,
-    action: `confirm:${planned.kind}`,
+  await executeConfirmedPlan({
+    ctx,
+    planned,
     source: "telegram:/confirm",
   });
-  await ctx.reply(`Plan ${planned.id} confirmado. Ejecutando...\nrun_id: ${trace.id}`);
-  try {
-    await executePlannedAction({ ctx, planned });
-    await safeAudit({
-      type: "plan.confirmed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        ...finishRunTrace({ trace, status: "ok" }),
-        planId: planned.id,
-        kind: planned.kind,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await safeAudit({
-      type: "plan.confirmed.failed",
-      chatId: ctx.chat.id,
-      userId: ctx.from?.id,
-      details: {
-        ...finishRunTrace({ trace, status: "error", error: message }),
-        planId: planned.id,
-        kind: planned.kind,
-      },
-    });
-    await ctx.reply(`Falló la ejecución del plan ${planned.id}: ${message}`);
-  }
 });
 
 bot.command("cancelplan", async (ctx) => {
   const id = String(ctx.match ?? "").trim();
-  if (!id) {
-    await ctx.reply("Uso: /cancelplan <plan_id>");
-    return;
-  }
-  const planned = denyPlannedAction(id, ctx.chat.id);
+  const planned = id ? denyPlannedAction(id, ctx.chat.id) : denyLatestPlannedAction(ctx.chat.id, ctx.from?.id);
   if (!planned) {
-    await ctx.reply(`No encontré plan pendiente con id ${id} en este chat.`);
+    await ctx.reply("No encontré plan pendiente para cancelar en este chat.");
     return;
   }
-  await ctx.reply(`Plan ${planned.id} cancelado.`);
+  await ctx.reply("Plan cancelado.");
   await safeAudit({
     type: "plan.canceled",
     chatId: ctx.chat.id,
@@ -17332,6 +17953,110 @@ bot.on(["message:voice", "message:audio", "message:document"], async (ctx, next)
   }
 });
 
+async function maybeHandlePendingPlanOrApprovalConfirmation(params: {
+  ctx: ChatReplyContext;
+  text: string;
+  source: string;
+  userId?: number;
+}): Promise<boolean> {
+  const decision = parseNaturalConfirmationDecision(params.text);
+  if (!decision) {
+    return false;
+  }
+
+  const latestPlanned = listPendingPlannedActions(params.ctx.chat.id, params.userId).at(-1) ?? null;
+  const latestApproval = pickLatestPendingApproval(params.ctx.chat.id, params.userId);
+  const latestKind = (() => {
+    if (latestPlanned && latestApproval) {
+      return latestPlanned.requestedAtMs >= latestApproval.createdAt ? "planned" : "approval";
+    }
+    if (latestPlanned) {
+      return "planned";
+    }
+    if (latestApproval) {
+      return "approval";
+    }
+    return null;
+  })();
+
+  if (!latestKind) {
+    return false;
+  }
+
+  if (latestKind === "planned") {
+    if (decision === "cancel") {
+      const denied = denyLatestPlannedAction(params.ctx.chat.id, params.userId);
+      if (!denied) {
+        return false;
+      }
+      await params.ctx.reply("Plan cancelado.");
+      await safeAudit({
+        type: "plan.canceled",
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        details: {
+          planId: denied.id,
+          kind: denied.kind,
+          source: `${params.source}:natural-cancel`,
+        },
+      });
+      return true;
+    }
+
+    const planned = consumeLatestPlannedAction(params.ctx.chat.id, params.userId);
+    if (!planned) {
+      return false;
+    }
+    await executeConfirmedPlan({
+      ctx: params.ctx,
+      planned,
+      source: `${params.source}:natural-confirm`,
+    });
+    return true;
+  }
+
+  if (decision === "cancel") {
+    const selected = pickLatestPendingApproval(params.ctx.chat.id, params.userId);
+    if (!selected) {
+      return false;
+    }
+    const denied = adminSecurity.denyApproval(selected.id, params.ctx.chat.id);
+    if (!denied) {
+      return false;
+    }
+    persistRuntimeStateSnapshot("approval-deny");
+    await params.ctx.reply("Aprobación rechazada.");
+    await safeAudit({
+      type: "approval.denied",
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      details: {
+        approvalId: denied.id,
+        kind: denied.kind,
+        commandLine: denied.commandLine,
+        source: `${params.source}:natural-cancel`,
+      },
+    });
+    return true;
+  }
+
+  const selected = pickLatestPendingApproval(params.ctx.chat.id, params.userId);
+  if (!selected) {
+    return false;
+  }
+  const approved = adminSecurity.consumeApproval(selected.id, params.ctx.chat.id);
+  if (!approved) {
+    return false;
+  }
+  persistRuntimeStateSnapshot("approval-consume");
+  await executeApprovedAction({
+    ctx: params.ctx,
+    approval: approved,
+    source: `${params.source}:natural-confirm`,
+  });
+  return true;
+}
+
 async function handleIncomingTextMessage(params: {
   ctx: ChatReplyContext;
   text: string;
@@ -17418,6 +18143,16 @@ async function handleIncomingTextMessage(params: {
     userId,
   });
   if (handledPendingWorkspaceDeletePath) {
+    return;
+  }
+
+  const handledPendingPlanOrApproval = await maybeHandlePendingPlanOrApprovalConfirmation({
+    ctx: params.ctx,
+    text,
+    source,
+    userId,
+  });
+  if (handledPendingPlanOrApproval) {
     return;
   }
 

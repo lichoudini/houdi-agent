@@ -11,6 +11,7 @@ Proyecto base desde cero para arrancar un asistente de operación de PC por Tele
 - `docs/AGENT_MEMORY_BASELINE.md`: baseline de memoria y personalidad
 - `docs/INTENT_ROUTER_HARDENING.md`: pipeline, tuning y operación del enrutador de intenciones
 - `docs/RELEASE_NOTES_2026-02-21.md`: cambios funcionales y operativos del release
+- `docs/RELEASE_NOTES_2026-02-23.md`: mejoras de enrutado contextual, modo ECO y UX de comandos
 
 ## Enfoque de seguridad del MVP
 
@@ -267,6 +268,8 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/doctor`
 - `/usage [topN|reset]`
 - `/model [show|list|set <modelo>|reset]`
+- `/mode [show|list|set <modelo>|reset]` (alias de `/model`)
+- `/eco on|off|status`
 - `/domains`
 - `/policy`
 - `/agenticcanary [status|<0-100>]`
@@ -337,7 +340,7 @@ Para acciones sensibles (exec, send de Gmail y borrado en workspace), puede requ
 
 Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo en runtime para un chat especifico:
 
-- `/model` o `/model show`: muestra modelo actual del chat, default global y lista sugerida por costo.
+- `/model` o `/mode` o `/model show`: muestra modelo actual del chat, default global y lista sugerida por costo.
 - `/model list`: muestra solo la lista sugerida (menor -> mayor costo).
 - `/model set <modelo>`: fija override por chat (ej. `gpt-4o-mini`).
 - `/model reset`: vuelve al default de `.env`.
@@ -345,6 +348,17 @@ Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo 
 Notas:
 - El override persiste en la base de estado (sobrevive reinicios), no modifica `.env`.
 - Aplica a consultas IA de chat, analisis de imagen y planificacion de `/shell`.
+
+## Modo ECO (ahorro de tokens)
+
+- `/eco status`: muestra estado actual de ECO para el chat y su tope de salida.
+- `/eco on`: habilita respuestas más compactas para ahorrar tokens.
+- `/eco off`: vuelve al tope normal de salida.
+
+Configuración relacionada:
+
+- `HOUDI_ECO_MODE_DEFAULT`: valor inicial por chat (`true`/`false`) si el chat todavía no tiene override runtime.
+- `OPENAI_ECO_MAX_OUTPUT_TOKENS`: tope de output tokens cuando ECO está activo.
 
 ## Operación y robustez
 
@@ -574,15 +588,18 @@ Regla de activación:
 Consulta directa de mensajes LIM (contacto + fuente):
 
 - `/lim first_name:Juan last_name:Perez fuente:account_demo_c_jack count:3`
+- `/lim list [limit:10]`
 - `consulta LIM first_name:Juan last_name:Perez fuente:account_demo_c_jack`
 - `revisar LIM de Rodrigo Toscano en linkedin marylin`
 - `trae los ultimos 3 mensajes de Rodrigo Toscano en linkedin marylin`
+- `historial lim 10`
 
 Notas de consulta LIM:
 
 - En lenguaje natural, `count` por defecto es `3` (max `10`).
 - La lectura prioriza mensajes del prospecto (entrantes/no propios).
 - El parser usa estrategia híbrida (reglas + fallback IA) para extraer `first_name`, `last_name`, `fuente` y reducir errores de interpretación en frases libres.
+- En `/lim list`, `limit` por defecto es `10` y el máximo es `20`.
 
 `fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
 

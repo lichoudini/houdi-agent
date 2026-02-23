@@ -186,6 +186,8 @@ const DEFAULT_ROUTES: SemanticRouteConfig[] = [
       "consulta lim first_name",
       "buscar mensajes en lim",
       "trae mensajes de contacto en lim",
+      "listar lim",
+      "historial lim",
     ],
   },
   {
