@@ -34,15 +34,29 @@ function normalizeWorkspaceRelativePath(raw: string): string {
   if (!value) {
     return "";
   }
-  return value.replace(/\\/g, "/").replace(/\s+/g, " ").trim();
+  const cleaned = value
+    .replace(/\\/g, "/")
+    .replace(/\s+/g, " ")
+    .replace(/[,:;!?]+$/g, "")
+    .trim();
+  return cleaned;
 }
 
 function cleanWorkspacePathPhrase(raw: string): string {
-  const cleaned = raw
+  const rawTrimmed = raw.trim();
+  const trailingDots = rawTrimmed.match(/\.{2,}$/)?.[0] ?? "";
+  const cleaned = rawTrimmed
     .trim()
     .replace(/^[\s:.,;!?¿¡-]+|[\s:.,;!?¿¡-]+$/g, "")
     .replace(/\s+(?:en|a|hacia)\s*$/i, "");
-  return normalizeWorkspaceRelativePath(cleaned);
+  const normalized = normalizeWorkspaceRelativePath(cleaned);
+  if (!normalized || !trailingDots) {
+    return normalized;
+  }
+  if (normalized.endsWith(trailingDots)) {
+    return normalized;
+  }
+  return `${normalized}${trailingDots}`;
 }
 
 function extractSimpleFilePathCandidate(text: string): string {
@@ -161,4 +175,57 @@ test("delete intent keeps direct folder delete when no contents cue is present",
   assert.equal(intent.action, "delete");
   assert.equal(intent.deleteContentsOfPath, undefined);
   assert.equal(intent.path, "images");
+});
+
+test("write intent preserves fuzzy two-dot path target for later autocomplete", () => {
+  const intent = detectWorkspaceNaturalIntent("Redactar un poema y guardarlo en el archivo mag..", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "write");
+  assert.equal(intent.path, "mag..");
+});
+
+test("write intent detects edit path with ellipsis and inline content", () => {
+  const intent = detectWorkspaceNaturalIntent("Editar leo... con otro poema", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "write");
+  assert.equal(intent.path, "leo...");
+  assert.equal(intent.content, "otro poema");
+});
+
+test("write intent detects en path escribir content", () => {
+  const intent = detectWorkspaceNaturalIntent("En leo... escribir otro poema", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "write");
+  assert.equal(intent.path, "leo...");
+  assert.equal(intent.content, "otro poema");
+});
+
+test("write intent detects en archivo path escribir content", () => {
+  const intent = detectWorkspaceNaturalIntent("En archivo leo... escribir otro poema", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "write");
+  assert.equal(intent.path, "leo...");
+  assert.equal(intent.content, "otro poema");
+});
+
+test("delete intent does not infer partial target token without ellipsis", () => {
+  const intent = detectWorkspaceNaturalIntent("Borra mag", deps);
+  assert.equal(intent.shouldHandle, false);
+});
+
+test("send intent does not infer partial target token without ellipsis", () => {
+  const intent = detectWorkspaceNaturalIntent("Enviame mag", deps);
+  assert.equal(intent.shouldHandle, false);
+});
+
+test("send intent accepts explicit ellipsis target token", () => {
+  const intent = detectWorkspaceNaturalIntent("Enviame mag...", deps);
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "send");
+  assert.equal(intent.path, "mag...");
+});
+
+test("send intent ignores generic compact non-file nouns", () => {
+  const intent = detectWorkspaceNaturalIntent("Enviame resumen", deps);
+  assert.equal(intent.shouldHandle, false);
 });

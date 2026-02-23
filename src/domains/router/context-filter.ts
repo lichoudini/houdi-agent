@@ -104,6 +104,7 @@ export function buildIntentRouterContextFilter(
   }
   const interactionMode = classifyInteractionMode(normalized);
   const conversationalOnly = interactionMode === "conversational";
+  const hasTaskRefCue = /(?:\b|_)tsk(?:[-_][a-z0-9._-]*)?\b/.test(normalized);
 
   const reasons: string[] = [];
   let allowed = uniqueCandidates(params.candidates);
@@ -186,6 +187,16 @@ export function buildIntentRouterContextFilter(
     applyNarrow(["lim"], "explicit-lim-route", { strict: true });
   }
 
+  if (
+    !conversationalOnly &&
+    hasTaskRefCue &&
+    /\b(elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|edita|editar|modifica|modificar|reprograma|reprogramar|mueve|mover|actualiza|actualizar|ver|listar|lista)\b/.test(
+      normalized,
+    )
+  ) {
+    applyNarrow(["schedule"], "explicit-schedule-taskref-route", { strict: true });
+  }
+
   if (!conversationalOnly && hasMailCue(normalized) && !/\b(workspace|archivo|carpeta|web|internet|noticias)\b/.test(normalized)) {
     if (scheduledMailCue) {
       applyNarrow(["schedule", "gmail", "gmail-recipients"], "explicit-gmail-schedule-route", { strict: true });
@@ -197,7 +208,8 @@ export function buildIntentRouterContextFilter(
   if (
     !conversationalOnly &&
     /\b(workspace|archivo|carpeta|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized) &&
-    !/\b(gmail|correo|correos|mail|mails|email|emails|lim|web|internet|noticias)\b/.test(normalized)
+    !/\b(gmail|correo|correos|mail|mails|email|emails|lim|web|internet|noticias)\b/.test(normalized) &&
+    !/(?:\b|_)tsk(?:[-_][a-z0-9._-]*)?\b/.test(normalized)
   ) {
     applyNarrow(["workspace", "document"], "explicit-workspace-route", { strict: true });
   }

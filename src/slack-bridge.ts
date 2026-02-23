@@ -5,6 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { App } from "@slack/bolt";
+import { buildSlackSessionKey, chatIdFromSessionKey } from "./session-routing.js";
 
 dotenv.config();
 
@@ -177,24 +178,13 @@ function removeSlackMentions(text: string): string {
   return text.replace(/<@[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function fnv1aHash32(input: string): number {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-function toPositiveChatId(seed: string): number {
-  const hash = fnv1aHash32(seed);
-  return (hash % 2_000_000_000) + 1;
-}
-
 function resolveChatIdForEvent(event: { channel?: string; threadTs?: string }): number {
-  const channel = event.channel?.trim() || "unknown";
-  const thread = event.threadTs?.trim() || "main";
-  return toPositiveChatId(`slack:${channel}:thread:${thread}`);
+  const sessionKey = buildSlackSessionKey(event.channel, event.threadTs) ?? "slack:unknown:thread:main";
+  return chatIdFromSessionKey(sessionKey);
+}
+
+function resolveSessionKeyForEvent(event: { channel?: string; threadTs?: string }): string {
+  return buildSlackSessionKey(event.channel, event.threadTs) ?? "slack:unknown:thread:main";
 }
 
 function resolveRequestId(prefix: string, channel?: string, ts?: string): string {
@@ -273,12 +263,45 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+function isRetryableBridgeError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes("unauthorized") ||
+    normalized.includes("forbidden") ||
+    normalized.includes("payload inválido") ||
+    normalized.includes("payload invalid")
+  ) {
+    return false;
+  }
+  return (
+    normalized.includes("timeout") ||
+    normalized.includes("timed out") ||
+    normalized.includes("network") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("econnrefused") ||
+    normalized.includes("429") ||
+    normalized.includes("502") ||
+    normalized.includes("503") ||
+    normalized.includes("saturada")
+  );
+}
+
+function computeRetryDelayMs(baseMs: number, attempt: number): number {
+  const exp = Math.max(0, attempt);
+  const scaled = Math.min(30_000, baseMs * 2 ** exp);
+  const jitter = Math.floor(Math.random() * Math.max(50, Math.floor(baseMs / 2)));
+  return scaled + jitter;
+}
+
 async function callLocalBridgeOnce(params: {
   baseUrl: string;
   headers: Record<string, string>;
   timeoutMs: number;
   text: string;
   chatId: number;
+  sessionKey?: string;
+  channel?: string;
+  threadTs?: string;
   userId: number;
   requestId: string;
   source: string;
@@ -295,6 +318,9 @@ async function callLocalBridgeOnce(params: {
       body: JSON.stringify({
         text: params.text,
         chatId: params.chatId,
+        sessionKey: params.sessionKey,
+        channel: params.channel,
+        threadTs: params.threadTs,
         userId: params.userId,
         requestId: params.requestId,
         source: params.source,
@@ -360,6 +386,9 @@ async function callLocalBridgeWithRetries(
     timeoutMs: number;
     text: string;
     chatId: number;
+    sessionKey?: string;
+    channel?: string;
+    threadTs?: string;
     userId: number;
     requestId: string;
     source: string;
@@ -375,10 +404,13 @@ async function callLocalBridgeWithRetries(
       return response;
     }
     lastError = response.error;
+    if (!isRetryableBridgeError(lastError || "")) {
+      break;
+    }
     if (attempt === retryCount) {
       break;
     }
-    await sleep(retryDelayMs * (attempt + 1));
+    await sleep(computeRetryDelayMs(retryDelayMs, attempt));
     attempt += 1;
   }
   return {
@@ -500,7 +532,7 @@ function cleanupAttachmentContextCache(cache: Map<string, ThreadAttachmentContex
   }
 }
 
-function cleanupDedupeCache(cache: Map<string, number>, now: number, ttlMs: number): void {
+function cleanupDedupeCache(cache: Map<string, number>, now: number): void {
   for (const [key, expiresAt] of cache.entries()) {
     if (expiresAt <= now) {
       cache.delete(key);
@@ -510,7 +542,7 @@ function cleanupDedupeCache(cache: Map<string, number>, now: number, ttlMs: numb
 
 function isDuplicateEvent(cache: Map<string, number>, dedupeKey: string, ttlMs: number): boolean {
   const now = Date.now();
-  cleanupDedupeCache(cache, now, ttlMs);
+  cleanupDedupeCache(cache, now);
   const expires = cache.get(dedupeKey);
   if (typeof expires === "number" && expires > now) {
     return true;
@@ -687,6 +719,9 @@ async function main(): Promise<void> {
         headers: cfg.bridgeHeaders,
         timeoutMs: cfg.bridgeTimeoutMs,
         text: effectiveText,
+        sessionKey: resolveSessionKeyForEvent({ channel: params.channel, threadTs: params.threadTs }),
+        channel: params.channel,
+        threadTs: params.threadTs,
         chatId: resolveChatIdForEvent({ channel: params.channel, threadTs: params.threadTs }),
         userId: cfg.bridgeUserId,
         requestId: params.requestId,
@@ -858,6 +893,9 @@ async function main(): Promise<void> {
         headers: cfg.bridgeHeaders,
         timeoutMs: cfg.bridgeTimeoutMs,
         text,
+        sessionKey: resolveSessionKeyForEvent({ channel, threadTs: "slash" }),
+        channel,
+        threadTs: "slash",
         chatId: resolveChatIdForEvent({ channel, threadTs: "slash" }),
         userId: cfg.bridgeUserId,
         requestId: resolveRequestId("slack:slash", channel, ts),

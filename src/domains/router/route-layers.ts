@@ -116,6 +116,7 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
   const conversationalOnly = interactionMode === "conversational";
   const listReferenceCue = hasIndexedListReferenceCue(ctx.normalizedText);
   const scheduledMailCue = hasScheduledMailCue(ctx.normalizedText);
+  const hasTaskRefCue = /(?:\b|_)tsk(?:[-_][a-z0-9._-]*)?\b/.test(ctx.normalizedText);
   const applyNarrow = (subset: string[], reason: string, layer: string, options?: { strict?: boolean }) => {
     const narrowed = narrow(allowed, subset, options);
     allowed = narrowed.allowed;
@@ -157,6 +158,16 @@ export function applyIntentRouteLayers(baseCandidates: string[], ctx: RouteLayer
 
   if (!conversationalOnly && /\b(workspace|archivo|carpeta|renombra|mueve|copia|pega|borra)\b/.test(ctx.normalizedText)) {
     applyNarrow(["workspace", "document"], "señal fuerte de workspace", "workspace-cue", { strict: true });
+  }
+
+  if (
+    !conversationalOnly &&
+    hasTaskRefCue &&
+    /\b(elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|edita|editar|modifica|modificar|reprograma|reprogramar|mueve|mover|actualiza|actualizar|ver|listar|lista)\b/.test(
+      ctx.normalizedText,
+    )
+  ) {
+    applyNarrow(["schedule"], "referencia explícita de tarea tsk", "schedule-taskref-cue", { strict: true });
   }
 
   if (!conversationalOnly && hasMailCue(ctx.normalizedText)) {

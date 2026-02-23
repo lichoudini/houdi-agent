@@ -9,6 +9,14 @@ type WorkspaceEntry = {
   size?: number;
 };
 
+type ExistingPathResolution = {
+  inputPath: string;
+  resolvedPath: string;
+  expanded: boolean;
+  ambiguous: boolean;
+  matches: string[];
+};
+
 export class WorkspaceFilesService {
   constructor(
     private readonly workspaceRoot: string,
@@ -37,7 +45,7 @@ export class WorkspaceFilesService {
     }
     return normalized
       .split("/")
-      .some((segment) => Boolean(segment) && /\.{3,}$/.test(segment));
+      .some((segment) => Boolean(segment) && /\.{2,}$/.test(segment));
   }
 
   async resolveEllipsisPathPlaceholder(
@@ -55,11 +63,12 @@ export class WorkspaceFilesService {
     const resolvedSegments: string[] = [];
     for (let index = 0; index < sourceSegments.length; index += 1) {
       const segment = sourceSegments[index] ?? "";
-      if (!segment || !segment.endsWith("...")) {
+      if (!segment || !/\.{2,}$/.test(segment)) {
         resolvedSegments.push(segment);
         continue;
       }
-      const prefix = segment.slice(0, -3);
+      const trailingDots = segment.match(/\.{2,}$/)?.[0].length ?? 0;
+      const prefix = trailingDots > 0 ? segment.slice(0, -trailingDots) : segment;
       const baseDirRel = resolvedSegments.join("/");
       const baseDirResolved = this.resolveWorkspacePath(baseDirRel);
       let baseDirEntries;
@@ -124,6 +133,27 @@ export class WorkspaceFilesService {
       resolvedPath,
       expanded: resolvedPath !== inputPath,
     };
+  }
+
+  async resolveExistingPathCandidate(relativeInput: string): Promise<ExistingPathResolution> {
+    const inputPath = this.normalizeWorkspaceRelativePath(relativeInput);
+    if (!inputPath) {
+      return { inputPath: "", resolvedPath: "", expanded: false, ambiguous: false, matches: [] };
+    }
+
+    const direct = this.resolveWorkspacePath(inputPath);
+    try {
+      await fs.access(direct.fullPath);
+      return {
+        inputPath,
+        resolvedPath: inputPath,
+        expanded: false,
+        ambiguous: false,
+        matches: [inputPath],
+      };
+    } catch {
+      return { inputPath, resolvedPath: inputPath, expanded: false, ambiguous: false, matches: [] };
+    }
   }
 
   async listWorkspaceDirectory(relativeInput?: string): Promise<{ relPath: string; entries: WorkspaceEntry[]; truncated: boolean }> {

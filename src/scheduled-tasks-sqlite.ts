@@ -35,6 +35,25 @@ function toIso(input: Date): string {
   return new Date(input.getTime()).toISOString();
 }
 
+function normalizeTaskRefToken(raw: string): string {
+  return raw.trim().replace(/[,:;!?]+$/g, "").toLowerCase();
+}
+
+function canonicalizeTaskRef(raw: string): string {
+  const normalized = normalizeTaskRefToken(raw);
+  if (!normalized) {
+    return "";
+  }
+  if (!normalized.startsWith("tsk")) {
+    return normalized;
+  }
+  if (normalized === "tsk") {
+    return normalized;
+  }
+  const withPrefix = normalized.replace(/^tsk_/, "tsk-");
+  return withPrefix.replace(/_/g, "-");
+}
+
 function mapTaskRow(row: Record<string, unknown>): ScheduledTask {
   return {
     id: String(row.id ?? ""),
@@ -50,7 +69,9 @@ function mapTaskRow(row: Record<string, unknown>): ScheduledTask {
     failureCount: Number(row.failure_count ?? 0),
     ...(typeof row.last_error === "string" ? { lastError: row.last_error } : {}),
     ...(typeof row.retry_after === "string" ? { retryAfter: row.retry_after } : {}),
-    ...(typeof row.delivery_kind === "string" ? { deliveryKind: row.delivery_kind as "reminder" | "gmail-send" } : {}),
+    ...(typeof row.delivery_kind === "string"
+      ? { deliveryKind: row.delivery_kind as "reminder" | "gmail-send" | "natural-intent" }
+      : {}),
     ...(typeof row.delivery_payload === "string" ? { deliveryPayload: row.delivery_payload } : {}),
   };
 }
@@ -180,7 +201,7 @@ export class ScheduledTaskSqliteService {
   }
 
   resolveTaskByRef(chatId: number, refInput: string): ScheduledTask | null {
-    const ref = refInput.trim().toLowerCase();
+    const ref = normalizeTaskRefToken(refInput);
     if (!ref) {
       return null;
     }
@@ -198,7 +219,26 @@ export class ScheduledTaskSqliteService {
       }
       return pending[index - 1] ?? null;
     }
-    return pending.find((task) => task.id.toLowerCase() === ref) ?? null;
+
+    const canonicalRef = canonicalizeTaskRef(ref);
+    const exact = pending.find((task) => canonicalizeTaskRef(task.id) === canonicalRef);
+    if (exact) {
+      return exact;
+    }
+
+    if (/\.{2,}$/.test(ref)) {
+      const prefixRef = canonicalizeTaskRef(ref.replace(/\.{2,}$/, ""));
+      if (!prefixRef) {
+        return null;
+      }
+      const matches = pending.filter((task) => canonicalizeTaskRef(task.id).startsWith(prefixRef));
+      if (matches.length === 1) {
+        return matches[0] ?? null;
+      }
+      return null;
+    }
+
+    return null;
   }
 
   async createTask(input: CreateScheduledTaskInput): Promise<ScheduledTask> {

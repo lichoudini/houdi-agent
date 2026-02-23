@@ -1,5 +1,5 @@
 export type ScheduledTaskStatus = "pending" | "done" | "canceled";
-export type ScheduledTaskDeliveryKind = "reminder" | "gmail-send";
+export type ScheduledTaskDeliveryKind = "reminder" | "gmail-send" | "natural-intent";
 
 export type ScheduledTask = {
   id: string;

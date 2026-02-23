@@ -32,7 +32,7 @@ import { AgentPolicyEngine, type AgentCapability } from "./agent-policy.js";
 import { finishRunTrace, startRunTrace } from "./run-trace.js";
 import { type SavedEmailRecipient, EmailRecipientsSqliteService } from "./email-recipients-sqlite.js";
 import { ScheduledTaskSqliteService } from "./scheduled-tasks-sqlite.js";
-import { GmailRecipientsManager, normalizeRecipientEmail, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
+import { GmailRecipientsManager, normalizeRecipientName } from "./domains/gmail/recipients-manager.js";
 import { DomainRegistry } from "./domains/domain-registry.js";
 import {
   detectGmailNaturalIntent as detectGmailNaturalIntentDomain,
@@ -60,6 +60,7 @@ import { buildHierarchicalIntentDecision, type HierarchicalIntentDecision } from
 import { shouldBypassAmbiguousPair } from "./domains/router/conflict-resolution.js";
 import { resolveIntentRouterAbVariant } from "./domains/router/ab-routing.js";
 import { RouterVersionStore } from "./domains/router/router-versioning.js";
+import { classifyInteractionMode } from "./domains/router/interaction-mode.js";
 import { countNewsTopicMatches, extractNewsTopicTokens } from "./domains/web/news-topic-relevance.js";
 import {
   runWebSlashAskCommand,
@@ -69,7 +70,6 @@ import {
 import { normalizeWebCommandQuery } from "./domains/web/command-parser.js";
 import {
   detectSelfMaintenanceIntent,
-  type SelfMaintenanceIntent,
 } from "./domains/selfskill/intents.js";
 import {
   extractSelfSkillInstructionFromText,
@@ -112,11 +112,18 @@ import {
   type StoredWorkspaceDeletePathRequest,
 } from "./sqlite-state-store.js";
 import {
+  chatIdFromSessionKey,
+  deriveSessionKeyFromBridgePayload,
+  normalizeSessionKey,
+} from "./session-routing.js";
+import {
   isLocalBridgeAuthorized,
   parsePositiveInteger,
   readHttpRequestBody,
   writeJsonResponse,
 } from "./local-bridge-http.js";
+import { detectScheduledAutomationIntent } from "./domains/schedule/automation-intent.js";
+import { normalizeExecCommandSequence } from "./domains/shell/command-sequence.js";
 
 const agentRegistry = new AgentRegistry(config.agentsDir, config.defaultAgent);
 await agentRegistry.load();
@@ -264,6 +271,21 @@ const aiShellModeByChat = new Map<number, boolean>();
 const ecoModeByChat = new Map<number, boolean>();
 const safeModeByChat = new Map<number, boolean>();
 const openAiModelByChat = new Map<number, string>();
+const chatIdBySessionKey = new Map<string, number>();
+const sessionKeyByChat = new Map<number, string>();
+type SpecializedSubagentName =
+  | "coordinator"
+  | "mail-ops"
+  | "workspace-ops"
+  | "web-research"
+  | "memory-archivist"
+  | "lim-ops"
+  | "self-maintainer"
+  | "schedule-ops";
+type SubagentMode = "auto" | "pinned";
+const subagentModeByChat = new Map<number, SubagentMode>();
+const subagentPinnedByChat = new Map<number, SpecializedSubagentName>();
+const subagentLastByChat = new Map<number, SpecializedSubagentName>();
 const OPENAI_MODELS_BY_COST: Array<{ model: string; tier: "bajo" | "medio" | "alto"; notes: string }> = [
   { model: "gpt-5-nano", tier: "bajo", notes: "ultra económico para tareas simples y alto volumen" },
   { model: "gpt-4.1-nano", tier: "bajo", notes: "muy económico para clasificación/automatizaciones ligeras" },
@@ -350,6 +372,19 @@ type PendingWorkspaceDeletePathRequest = {
   source: string;
   userId?: number;
 };
+type PendingIntentClarification = {
+  chatId: number;
+  userId?: number;
+  requestedAtMs: number;
+  expiresAtMs: number;
+  source: string;
+  originalText: string;
+  question: string;
+  routeHints: Array<Exclude<NaturalIntentHandlerName, "none">>;
+  preferredRoute?: Exclude<NaturalIntentHandlerName, "none">;
+  preferredAction?: string;
+  missing?: string[];
+};
 type WorkspaceClipboardState = {
   paths: string[];
   copiedAtMs: number;
@@ -369,9 +404,15 @@ type PendingPlannedAction = {
 };
 const pendingWorkspaceDeleteByChat = new Map<number, PendingWorkspaceDeleteConfirmation>();
 const pendingWorkspaceDeletePathByChat = new Map<number, PendingWorkspaceDeletePathRequest>();
+const pendingIntentClarificationByChat = new Map<number, PendingIntentClarification>();
 const workspaceClipboardByChat = new Map<number, WorkspaceClipboardState>();
 const pendingPlannedActionsById = new Map<string, PendingPlannedAction>();
 const incomingMessageQueue = new ChatMessageQueue();
+type HandlerCircuitState = {
+  failures: number;
+  openedUntilMs: number;
+};
+const handlerCircuitByName = new Map<Exclude<NaturalIntentHandlerName, "none">, HandlerCircuitState>();
 const conversationLoopDetector = new ConversationLoopDetector();
 const progressNoticeService = new ProgressNoticeService();
 const DOCUMENT_SEARCH_MAX_DEPTH = 6;
@@ -389,6 +430,7 @@ const AI_SEQUENCE_ROUTER_MAX_STEPS = 6;
 const WORKSPACE_DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const PLANNED_ACTION_TTL_MS = 5 * 60 * 1000;
 const WORKSPACE_DELETE_PATH_PROMPT_TTL_MS = 5 * 60 * 1000;
+const INTENT_CLARIFICATION_TTL_MS = 5 * 60 * 1000;
 const INDEXED_LIST_CONTEXT_TTL_MS = 2 * 60 * 60 * 1000;
 const INDEXED_LIST_ACTION_MAX_ITEMS = 5;
 const ASSISTANT_REPLY_HISTORY_LIMIT = 30;
@@ -408,6 +450,8 @@ const OUTBOX_RECOVERY_INTERVAL_MS = 15_000;
 const OUTBOX_RECOVERY_BATCH_SIZE = 30;
 const RUNTIME_STATE_PERSIST_INTERVAL_MS = 5_000;
 const RUNTIME_STATE_PERSIST_DEBOUNCE_MS = 1_200;
+const TELEGRAM_DEBUG_LAST20_FILE = path.resolve(process.cwd(), "runtime", "telegram-last20.jsonl");
+const TELEGRAM_DEBUG_LAST20_LIMIT = 20;
 const WORKSPACE_SELECTOR_MAX_DEPTH = 10;
 const WORKSPACE_SELECTOR_MAX_DIRS = 4000;
 const WORKSPACE_SELECTOR_MAX_MATCHES = 200;
@@ -435,12 +479,15 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "model",
   "mode",
   "status",
+  "health",
   "doctor",
   "usage",
   "domains",
   "policy",
   "agenticcanary",
   "agent",
+  "subagent",
+  "session",
   "tasks",
   "kill",
   "agenda",
@@ -490,6 +537,16 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "intentversion",
   "intentcanary",
 ]);
+
+class IncomingQueueOverflowError extends Error {
+  readonly kind = "incoming_queue_overflow";
+  readonly chatId: number;
+  constructor(chatId: number, message: string) {
+    super(message);
+    this.chatId = chatId;
+    this.name = "IncomingQueueOverflowError";
+  }
+}
 
 const runtimeStatePersistSignatures = {
   approvals: "",
@@ -840,6 +897,23 @@ function restoreRuntimeStateSnapshot(): void {
       });
     }
 
+    chatIdBySessionKey.clear();
+    sessionKeyByChat.clear();
+    for (const route of sqliteState.listSessionRoutes(2_000)) {
+      const normalized = normalizeSessionKey(route.sessionKey);
+      if (!normalized) {
+        continue;
+      }
+      const chatId = Math.floor(route.chatId);
+      if (!Number.isFinite(chatId) || chatId <= 0) {
+        continue;
+      }
+      chatIdBySessionKey.set(normalized, chatId);
+      if (!sessionKeyByChat.has(chatId)) {
+        sessionKeyByChat.set(chatId, normalized);
+      }
+    }
+
     observability.increment("runtime_state.restore.ok");
     persistRuntimeStateSnapshot("restore-prune");
   } catch (error) {
@@ -912,6 +986,129 @@ function setActiveAgent(chatId: number, agentName: string): void {
   persistRuntimeStateSnapshot("runtime:setActiveAgent");
 }
 
+function getSubagentMode(chatId: number): SubagentMode {
+  return subagentModeByChat.get(chatId) ?? "auto";
+}
+
+function getPinnedSubagent(chatId: number): SpecializedSubagentName | null {
+  return subagentPinnedByChat.get(chatId) ?? null;
+}
+
+function setPinnedSubagent(chatId: number, subagent: SpecializedSubagentName): void {
+  subagentModeByChat.set(chatId, "pinned");
+  subagentPinnedByChat.set(chatId, subagent);
+}
+
+function setSubagentAutoMode(chatId: number): void {
+  subagentModeByChat.set(chatId, "auto");
+  subagentPinnedByChat.delete(chatId);
+}
+
+const SUBAGENT_ALLOWED_HANDLERS: Record<SpecializedSubagentName, ReadonlySet<string>> = {
+  coordinator: new Set(["self-maintenance", "lim", "schedule", "memory", "gmail-recipients", "gmail", "workspace", "document", "web"]),
+  "mail-ops": new Set(["gmail", "gmail-recipients"]),
+  "workspace-ops": new Set(["workspace", "document"]),
+  "web-research": new Set(["web", "document"]),
+  "memory-archivist": new Set(["memory"]),
+  "lim-ops": new Set(["lim"]),
+  "self-maintainer": new Set(["self-maintenance"]),
+  "schedule-ops": new Set(["schedule"]),
+};
+
+const SUBAGENT_BY_HANDLER: Record<string, SpecializedSubagentName> = {
+  "self-maintenance": "self-maintainer",
+  lim: "lim-ops",
+  schedule: "schedule-ops",
+  memory: "memory-archivist",
+  "gmail-recipients": "mail-ops",
+  gmail: "mail-ops",
+  workspace: "workspace-ops",
+  document: "workspace-ops",
+  web: "web-research",
+};
+
+function resolveDelegatedSubagent(chatId: number, handlerName: string): SpecializedSubagentName {
+  if (getSubagentMode(chatId) === "pinned") {
+    return getPinnedSubagent(chatId) ?? "coordinator";
+  }
+  return SUBAGENT_BY_HANDLER[handlerName] ?? "coordinator";
+}
+
+function isHandlerAllowedForSubagent(subagent: SpecializedSubagentName, handlerName: string): boolean {
+  return SUBAGENT_ALLOWED_HANDLERS[subagent]?.has(handlerName) ?? false;
+}
+
+function rememberSubagentDelegation(chatId: number, subagent: SpecializedSubagentName): void {
+  subagentLastByChat.set(chatId, subagent);
+}
+
+function upsertSessionRouteMapping(params: { sessionKey: string; chatId: number; source: string }): void {
+  const sessionKey = normalizeSessionKey(params.sessionKey);
+  if (!sessionKey) {
+    return;
+  }
+  const chatId = Number.isFinite(params.chatId) ? Math.floor(params.chatId) : 0;
+  if (chatId <= 0) {
+    return;
+  }
+  const source = truncateInline(params.source.trim() || "bridge", 80);
+  chatIdBySessionKey.set(sessionKey, chatId);
+  sessionKeyByChat.set(chatId, sessionKey);
+  try {
+    sqliteState.upsertSessionRoute({
+      sessionKey,
+      chatId,
+      source,
+      updatedAtMs: Date.now(),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude persistir session route (${sessionKey}): ${message}`);
+  }
+}
+
+function resolveChatIdForBridgePayload(params: {
+  source?: string;
+  chatId?: number;
+  sessionKey?: string;
+  channel?: string;
+  threadTs?: string;
+}): { chatId: number; sessionKey: string | null } {
+  const payloadChatId = Number.isFinite(params.chatId) ? Math.floor(params.chatId ?? 0) : 0;
+  const derivedSessionKey = deriveSessionKeyFromBridgePayload({
+    source: params.source,
+    sessionKey: params.sessionKey,
+    channel: params.channel,
+    threadTs: params.threadTs,
+    chatId: payloadChatId > 0 ? payloadChatId : undefined,
+  });
+  if (!derivedSessionKey) {
+    return {
+      chatId: payloadChatId > 0 ? payloadChatId : 1,
+      sessionKey: null,
+    };
+  }
+  const inMemory = chatIdBySessionKey.get(derivedSessionKey);
+  if (typeof inMemory === "number" && inMemory > 0) {
+    return { chatId: inMemory, sessionKey: derivedSessionKey };
+  }
+  try {
+    const persisted = sqliteState.getSessionRouteByKey(derivedSessionKey);
+    if (persisted && persisted.chatId > 0) {
+      chatIdBySessionKey.set(derivedSessionKey, persisted.chatId);
+      sessionKeyByChat.set(persisted.chatId, derivedSessionKey);
+      return { chatId: persisted.chatId, sessionKey: derivedSessionKey };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude resolver session route en SQLite (${derivedSessionKey}): ${message}`);
+  }
+  if (payloadChatId > 0) {
+    return { chatId: payloadChatId, sessionKey: derivedSessionKey };
+  }
+  return { chatId: chatIdFromSessionKey(derivedSessionKey), sessionKey: derivedSessionKey };
+}
+
 function isAiShellModeEnabled(chatId: number): boolean {
   return aiShellModeByChat.get(chatId) ?? false;
 }
@@ -931,12 +1128,19 @@ function setEcoMode(chatId: number, enabled: boolean): void {
 }
 
 function isSafeModeEnabled(chatId: number): boolean {
-  return safeModeByChat.get(chatId) ?? false;
+  return safeModeByChat.get(chatId) ?? true;
 }
 
 function setSafeMode(chatId: number, enabled: boolean): void {
   safeModeByChat.set(chatId, enabled);
   persistRuntimeStateSnapshot("runtime:setSafeMode");
+}
+
+function shouldEnforceOperationalExecution(chatId: number, text: string): boolean {
+  if (!isSafeModeEnabled(chatId)) {
+    return false;
+  }
+  return classifyInteractionMode(normalizeIntentText(text)) === "operational";
 }
 
 function getOpenAiModelForChat(chatId: number): string {
@@ -1022,6 +1226,78 @@ function buildObservabilityReport(options?: { topCounters?: number; topTimings?:
         `- ${item.name}: count=${item.count} p50=${item.p50Ms}ms p95=${item.p95Ms}ms min=${item.minMs}ms max=${item.maxMs}ms`,
     ),
   ].join("\n");
+}
+
+async function buildRuntimeHealthSnapshot(): Promise<{
+  ok: boolean;
+  status: "ok" | "degraded";
+  checks: Record<string, { ok: boolean; detail: string }>;
+  queue: { totalDepth: number; activeChats: number; maxPerChat: number; maxTotal: number };
+  circuits: { openHandlers: number; entries: Array<{ route: string; openForMs: number; failures: number }> };
+}> {
+  const checks: Record<string, { ok: boolean; detail: string }> = {};
+
+  try {
+    sqliteState.listChatRuntimeSettings();
+    checks.sqlite = { ok: true, detail: "ok" };
+  } catch (error) {
+    checks.sqlite = {
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  try {
+    const stat = await fs.stat(config.workspaceDir);
+    checks.workspace = { ok: stat.isDirectory(), detail: stat.isDirectory() ? "ok" : "not_directory" };
+  } catch (error) {
+    checks.workspace = {
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const queueTop = incomingMessageQueue.snapshot(500);
+  const queueTotalDepth = queueTop.reduce((acc, item) => acc + item.depth, 0);
+  const queueOk = queueTotalDepth < config.incomingQueueMaxTotal;
+  checks.queue = {
+    ok: queueOk,
+    detail: `depth=${queueTotalDepth}/${config.incomingQueueMaxTotal}, activeChats=${queueTop.length}`,
+  };
+
+  const now = Date.now();
+  const circuits = [...handlerCircuitByName.entries()]
+    .map(([route, state]) => ({
+      route,
+      openForMs: Math.max(0, state.openedUntilMs - now),
+      failures: state.failures,
+    }))
+    .filter((item) => item.openForMs > 0 || item.failures > 0)
+    .sort((a, b) => b.openForMs - a.openForMs || b.failures - a.failures || a.route.localeCompare(b.route));
+  const openHandlers = circuits.filter((item) => item.openForMs > 0).length;
+  checks.circuits = { ok: openHandlers === 0, detail: `open=${openHandlers}` };
+
+  const outboxDue = sqliteState.listDueOutboxMessages({ limit: 500 }).length;
+  checks.outbox = { ok: outboxDue < 200, detail: `due=${outboxDue}` };
+
+  checks.openai = { ok: openAi.isConfigured(), detail: openAi.isConfigured() ? "configured" : "not_configured" };
+
+  const failedChecks = Object.values(checks).filter((item) => !item.ok).length;
+  return {
+    ok: failedChecks === 0,
+    status: failedChecks === 0 ? "ok" : "degraded",
+    checks,
+    queue: {
+      totalDepth: queueTotalDepth,
+      activeChats: queueTop.length,
+      maxPerChat: config.incomingQueueMaxPerChat,
+      maxTotal: config.incomingQueueMaxTotal,
+    },
+    circuits: {
+      openHandlers,
+      entries: circuits,
+    },
+  };
 }
 
 function isAdminApprovalRequired(chatId: number): boolean {
@@ -1154,6 +1430,8 @@ type ScheduleNaturalIntent = {
   scheduleEmail?: boolean;
   emailTo?: string;
   emailInstruction?: string;
+  automationInstruction?: string;
+  automationRecurrenceDaily?: boolean;
 };
 
 type WorkspaceNameSelectorMode = "startsWith" | "contains" | "exact";
@@ -1466,25 +1744,6 @@ function rememberWorkspaceListContext(params: {
   });
 }
 
-function rememberStoredFilesListContext(params: {
-  chatId: number;
-  title: string;
-  items: Array<{ relPath: string }>;
-  source: string;
-}): void {
-  rememberIndexedListContext({
-    chatId: params.chatId,
-    kind: "stored-files",
-    title: params.title,
-    source: params.source,
-    items: params.items.map((item) => ({
-      label: item.relPath,
-      reference: item.relPath,
-      itemType: "file",
-    })),
-  });
-}
-
 function rememberWebResultsListContext(params: {
   chatId: number;
   title: string;
@@ -1597,10 +1856,6 @@ async function summarizeMemoryRecallNatural(chatId: number, query: string, hits:
   } catch {
     return buildMemoryRecallSummaryFallback(query, hits);
   }
-}
-
-function normalizeRecipientNameKey(raw: string): string {
-  return gmailRecipients.normalizeRecipientNameKey(raw);
 }
 
 function listEmailRecipients(chatId: number): SavedEmailRecipient[] {
@@ -1821,20 +2076,6 @@ function parseQuotedArgs(input: string): string[] {
     args.push(current);
   }
   return args;
-}
-
-function parseLooseBoolean(value: string | undefined, defaultValue: boolean): boolean {
-  if (typeof value === "undefined") {
-    return defaultValue;
-  }
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on", "si", "sí"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  throw new Error(`Valor booleano inválido: ${value}`);
 }
 
 function parseKeyValueOptions(tokens: string[]): { args: string[]; options: Record<string, string> } {
@@ -2503,8 +2744,8 @@ function stripTrailingWorkspacePathPunctuation(raw: string): string {
   if (!withoutClosing) {
     return "";
   }
-  // Preserve ellipsis path placeholders (e.g. "img...") for workspace autocompletion.
-  if (/(?:^|\/)[^/\s]+\.{3,}$/.test(withoutClosing)) {
+  // Preserve fuzzy path placeholders (e.g. "img.." / "img...") for workspace autocompletion.
+  if (/(?:^|\/)[^/\s]+\.{2,}$/.test(withoutClosing)) {
     return withoutClosing;
   }
   return withoutClosing.replace(/\.+$/g, "").trim();
@@ -3028,6 +3269,28 @@ async function resolveWorkspacePathInputWithAutocomplete(
     return normalized;
   }
   const resolved = await resolveWorkspaceEllipsisPathPlaceholder(normalized);
+  if (resolved.expanded && options?.autocompleteNotices) {
+    const label = options.label?.trim() ? `${options.label.trim()}: ` : "";
+    options.autocompleteNotices.push(`${label}workspace/${resolved.inputPath} -> workspace/${resolved.resolvedPath}`);
+  }
+  return resolved.resolvedPath;
+}
+
+async function resolveWorkspaceExistingPathInputWithAutocomplete(
+  relativeInput: string | undefined,
+  options?: { autocompleteNotices?: string[]; label?: string },
+): Promise<string> {
+  const normalized = await resolveWorkspacePathInputWithAutocomplete(relativeInput, options);
+  if (!normalized) {
+    return "";
+  }
+  const resolved = await workspaceFiles.resolveExistingPathCandidate(normalized);
+  if (resolved.ambiguous) {
+    const preview = resolved.matches.slice(0, 8).map((item) => `workspace/${item}`).join(", ");
+    throw new Error(
+      `Ruta ambigua para "${resolved.inputPath}". Coincidencias: ${preview}${resolved.matches.length > 8 ? "..." : ""}`,
+    );
+  }
   if (resolved.expanded && options?.autocompleteNotices) {
     const label = options.label?.trim() ? `${options.label.trim()}: ` : "";
     options.autocompleteNotices.push(`${label}workspace/${resolved.inputPath} -> workspace/${resolved.resolvedPath}`);
@@ -4552,6 +4815,7 @@ function extractTaskTitleForEdit(text: string): string {
       /\b(edita|editar|cambia|cambiar|modifica|modificar|reprograma|reprogramar|mueve|mover|actualiza|actualizar|pospone|posponer|tarea|recordatorio|numero|nro|#)\b/gi,
       " ",
     )
+    .replace(/\btsk[-_][a-z0-9._-]*\.{0,}\b/gi, " ")
     .replace(/\b\d{1,3}\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -4564,7 +4828,16 @@ function extractScheduleTaskRef(text: string): string | null {
     return "last";
   }
 
-  const taskId = text.match(/\btsk-[a-z0-9-]+\b/i)?.[0];
+  const taskPrefixWithDots =
+    text.match(/(?:^|[\s"'`(])((?:tsk[-_][a-z0-9_-]*\.{2,}))/i)?.[1] ??
+    text.match(/(?:^|[\s"'`(])[a-z0-9]+_((?:tsk[-_][a-z0-9_-]*\.{2,}))/i)?.[1];
+  if (taskPrefixWithDots) {
+    return taskPrefixWithDots;
+  }
+
+  const taskId =
+    text.match(/\btsk[-_][a-z0-9-]+\b/i)?.[0] ??
+    text.match(/\b[a-z0-9]+_(tsk[-_][a-z0-9-]+)\b/i)?.[1];
   if (taskId) {
     return taskId;
   }
@@ -4585,8 +4858,15 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
   }
 
   const normalized = normalizeIntentText(original);
-  const scheduleNouns = /\b(recordatorio|recordatorios|tarea|tareas|agenda)\b/.test(normalized);
+  const hasTaskRefCue = /\btsk(?:[-_][a-z0-9._-]*)?\b/i.test(original);
+  const scheduleNouns = /\b(recordatorio|recordatorios|tarea|tareas|agenda)\b/.test(normalized) || hasTaskRefCue;
   const parsedSchedule = parseNaturalScheduleDateTime(original, new Date());
+  const automation = detectScheduledAutomationIntent({
+    text: original,
+    normalizeIntentText,
+    stripScheduleTemporalPhrases,
+    sanitizeTitle: sanitizeScheduleTitle,
+  });
   const hasEmailNoun = /\b(correo|mail|email|gmail)\b/.test(normalized);
   const hasSendVerb = /\b(envia|enviar|enviame|enviarme|manda|mandar|mandame|mandarme)\b/.test(normalized);
   const hasReminderVerb =
@@ -4633,6 +4913,7 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
 
   const createRequested = hasReminderVerb && (scheduleNouns || parsedSchedule.hasTemporalSignal);
   const scheduledEmailRequested = parsedSchedule.hasTemporalSignal && hasEmailNoun && (hasSendVerb || hasRecipientCue);
+  const scheduledAutomationRequested = parsedSchedule.hasTemporalSignal && Boolean(automation.instruction);
   if (scheduledEmailRequested) {
     const to = extractEmailAddresses(original)[0] ?? inferDefaultSelfEmailRecipient(original);
     const emailInstruction = extractScheduledEmailInstruction(original);
@@ -4646,6 +4927,18 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
       ...(taskTitle ? { taskTitle } : {}),
       ...(to ? { emailTo: to } : {}),
       ...(emailInstruction ? { emailInstruction } : {}),
+      ...(parsedSchedule.dueAt ? { dueAt: parsedSchedule.dueAt } : {}),
+    };
+  }
+
+  if (scheduledAutomationRequested) {
+    const taskTitle = sanitizeScheduleTitle(`Automatización: ${automation.instruction ?? "acción"}`);
+    return {
+      shouldHandle: true,
+      action: "create",
+      ...(taskTitle ? { taskTitle } : {}),
+      ...(automation.instruction ? { automationInstruction: automation.instruction } : {}),
+      ...(automation.recurrenceDaily ? { automationRecurrenceDaily: true } : {}),
       ...(parsedSchedule.dueAt ? { dueAt: parsedSchedule.dueAt } : {}),
     };
   }
@@ -4877,10 +5170,6 @@ function getRecentConversationContext(chatId: number, currentUserText: string, l
 
 function getRecentEmailRouterContext(chatId: number, currentUserText: string): string[] {
   return getRecentConversationContext(chatId, currentUserText, RECENT_EMAIL_ROUTER_CONTEXT_TURNS);
-}
-
-function uniqueRouteCandidates(candidates: Exclude<NaturalIntentHandlerName, "none">[]): Exclude<NaturalIntentHandlerName, "none">[] {
-  return Array.from(new Set(candidates));
 }
 
 function narrowRouteCandidates(
@@ -6658,7 +6947,6 @@ async function resolveDocumentReference(references: string[], preferWorkspace: b
 }
 
 async function listSavedImages(
-  chatId: number,
   limitInput?: number,
 ): Promise<Array<{ relPath: string; size: number; modifiedAt: string }>> {
   const root = path.join(config.workspaceDir, "images");
@@ -6666,7 +6954,6 @@ async function listSavedImages(
 }
 
 async function listSavedWorkspaceFiles(
-  chatId: number,
   limitInput?: number,
 ): Promise<Array<{ relPath: string; size: number; modifiedAt: string }>> {
   const root = path.join(config.workspaceDir, "files");
@@ -6674,13 +6961,13 @@ async function listSavedWorkspaceFiles(
 }
 
 async function listRecentStoredFilesForChat(
-  chatId: number,
+  _chatId: number,
   limitInput?: number,
 ): Promise<Array<{ relPath: string; size: number; modifiedAt: string }>> {
   const limit = Math.max(1, Math.min(150, Math.floor(limitInput ?? 30)));
   const [workspaceFiles, imageFiles] = await Promise.all([
-    listSavedWorkspaceFiles(chatId, limit),
-    listSavedImages(chatId, limit),
+    listSavedWorkspaceFiles(limit),
+    listSavedImages(limit),
   ]);
 
   return [...workspaceFiles, ...imageFiles]
@@ -7223,6 +7510,7 @@ function resolveCommandName(commandLine: string): string {
 type ChatReplyContext = {
   chat: { id: number };
   from?: { id?: number };
+  sessionKey?: string;
   reply: (text: string) => Promise<unknown>;
   replyWithDocument?: (document: InputFile, options?: { caption?: string }) => Promise<unknown>;
 };
@@ -7378,6 +7666,128 @@ function denyLatestPlannedAction(chatId: number, userId?: number): PendingPlanne
   pendingPlannedActionsById.delete(selected.id);
   persistRuntimeStateSnapshot("planned-deny");
   return selected;
+}
+
+function purgeExpiredPendingIntentClarifications(): void {
+  const now = Date.now();
+  for (const [chatId, item] of pendingIntentClarificationByChat.entries()) {
+    if (item.expiresAtMs <= now) {
+      pendingIntentClarificationByChat.delete(chatId);
+    }
+  }
+}
+
+function registerPendingIntentClarification(params: {
+  chatId: number;
+  userId?: number;
+  source: string;
+  originalText: string;
+  question: string;
+  routeHints?: Array<Exclude<NaturalIntentHandlerName, "none">>;
+  preferredRoute?: Exclude<NaturalIntentHandlerName, "none">;
+  preferredAction?: string;
+  missing?: string[];
+}): void {
+  purgeExpiredPendingIntentClarifications();
+  const now = Date.now();
+  pendingIntentClarificationByChat.set(params.chatId, {
+    chatId: params.chatId,
+    userId: params.userId,
+    requestedAtMs: now,
+    expiresAtMs: now + INTENT_CLARIFICATION_TTL_MS,
+    source: params.source,
+    originalText: truncateInline(params.originalText, 3000),
+    question: truncateInline(params.question, 1000),
+    routeHints: (params.routeHints ?? []).slice(0, 6),
+    ...(params.preferredRoute ? { preferredRoute: params.preferredRoute } : {}),
+    ...(params.preferredAction ? { preferredAction: params.preferredAction } : {}),
+    ...(params.missing && params.missing.length > 0 ? { missing: params.missing.slice(0, 12) } : {}),
+  });
+}
+
+function peekPendingIntentClarification(chatId: number, userId?: number): PendingIntentClarification | null {
+  purgeExpiredPendingIntentClarifications();
+  const item = pendingIntentClarificationByChat.get(chatId);
+  if (!item) {
+    return null;
+  }
+  if (typeof userId === "number" && typeof item.userId === "number" && item.userId !== userId) {
+    return null;
+  }
+  return item;
+}
+
+function consumePendingIntentClarification(chatId: number, userId?: number): PendingIntentClarification | null {
+  const item = peekPendingIntentClarification(chatId, userId);
+  if (!item) {
+    return null;
+  }
+  pendingIntentClarificationByChat.delete(chatId);
+  return item;
+}
+
+function clearPendingIntentClarification(chatId: number, userId?: number): void {
+  const item = peekPendingIntentClarification(chatId, userId);
+  if (!item) {
+    return;
+  }
+  pendingIntentClarificationByChat.delete(chatId);
+}
+
+function shouldTreatAsClarificationReply(params: {
+  text: string;
+  pending: PendingIntentClarification;
+  replyReferenceText?: string;
+}): boolean {
+  const raw = params.text.trim();
+  if (!raw) {
+    return false;
+  }
+  if (raw.startsWith("/")) {
+    return false;
+  }
+  const replyRef = params.replyReferenceText?.trim() ?? "";
+  if (replyRef) {
+    const refNormalized = normalizeIntentText(replyRef);
+    const pendingNormalized = normalizeIntentText(params.pending.question);
+    if (pendingNormalized && refNormalized.includes(pendingNormalized.slice(0, 40))) {
+      return true;
+    }
+    if (/\b(necesito precision|estoy entre dos intenciones|faltan parametros|necesito referencia de tarea|indica)\b/.test(refNormalized)) {
+      return true;
+    }
+  }
+  if (raw.length <= 200) {
+    return true;
+  }
+  if (/\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|web|lim|memoria|recordatorio|tarea)\b/i.test(raw)) {
+    return true;
+  }
+  if (params.pending.routeHints.some((route) => normalizeIntentText(raw).includes(route))) {
+    return true;
+  }
+  return false;
+}
+
+function buildClarificationFollowupText(params: {
+  pending: PendingIntentClarification;
+  replyText: string;
+}): string {
+  const hintLines: string[] = [];
+  if (params.pending.preferredRoute) {
+    hintLines.push(`dominio=${params.pending.preferredRoute}`);
+  }
+  if (params.pending.preferredAction) {
+    hintLines.push(`accion=${params.pending.preferredAction}`);
+  }
+  if (params.pending.missing && params.pending.missing.length > 0) {
+    hintLines.push(`faltantes=${params.pending.missing.join(",")}`);
+  }
+  if (hintLines.length === 0 && params.pending.routeHints.length > 0) {
+    hintLines.push(`candidatos=${params.pending.routeHints.join(",")}`);
+  }
+  const contextLine = hintLines.length > 0 ? `Contexto previo: ${hintLines.join(" | ")}.` : "Contexto previo: se pidió aclaración de intención.";
+  return [params.pending.originalText, contextLine, `Aclaración del usuario: ${params.replyText.trim()}`].join("\n");
 }
 
 function pickLatestPendingApproval(chatId: number, userId?: number): PendingApproval | null {
@@ -7633,16 +8043,173 @@ function startOutboxRecoveryWorker(): void {
   void runOutboxRecoveryTick("startup");
 }
 
+function computeIncomingQueueDepthTotal(maxChats = 500): number {
+  return incomingMessageQueue
+    .snapshot(maxChats)
+    .reduce((acc, item) => acc + item.depth, 0);
+}
+
+function getHandlerCircuitState(route: Exclude<NaturalIntentHandlerName, "none">): HandlerCircuitState {
+  const state = handlerCircuitByName.get(route) ?? { failures: 0, openedUntilMs: 0 };
+  if (!handlerCircuitByName.has(route)) {
+    handlerCircuitByName.set(route, state);
+  }
+  return state;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      onTimeout();
+      reject(new Error(`timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timeoutHandle.unref?.();
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  });
+}
+
+function isTransientErrorMessage(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("timed out") ||
+    normalized.includes("timeout") ||
+    normalized.includes("network") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("econnrefused") ||
+    normalized.includes("etimedout") ||
+    normalized.includes("429") ||
+    normalized.includes("too many requests") ||
+    normalized.includes("503") ||
+    normalized.includes("502") ||
+    normalized.includes("temporary")
+  );
+}
+
+function jitterDelayMs(baseMs: number, attempt: number): number {
+  const exp = Math.max(0, attempt - 1);
+  const scaled = Math.min(30_000, baseMs * 2 ** exp);
+  const jitter = Math.floor(Math.random() * Math.max(50, Math.floor(baseMs / 2)));
+  return scaled + jitter;
+}
+
+async function retryTransient<T>(label: string, executor: () => Promise<T>): Promise<T> {
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= config.transientRetryAttempts; attempt += 1) {
+    try {
+      if (attempt > 1) {
+        observability.increment("stability.retry.attempt", 1, { label, attempt });
+      }
+      return await executor();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastError = error instanceof Error ? error : new Error(message);
+      if (!isTransientErrorMessage(message) || attempt >= config.transientRetryAttempts) {
+        break;
+      }
+      await new Promise<void>((resolve) => {
+        const waitMs = jitterDelayMs(config.transientRetryBaseMs, attempt);
+        const timer = setTimeout(resolve, waitMs);
+        timer.unref?.();
+      });
+    }
+  }
+  throw lastError ?? new Error(`retry failed for ${label}`);
+}
+
+async function executeIntentHandlerResilient(params: {
+  route: Exclude<NaturalIntentHandlerName, "none">;
+  source: string;
+  executor: () => Promise<boolean>;
+}): Promise<boolean> {
+  const now = Date.now();
+  const state = getHandlerCircuitState(params.route);
+  if (state.openedUntilMs > now) {
+    observability.increment("intent.handler.circuit.open_block", 1, {
+      route: params.route,
+      source: params.source,
+    });
+    return false;
+  }
+  if (state.openedUntilMs > 0 && state.openedUntilMs <= now) {
+    state.openedUntilMs = 0;
+    state.failures = 0;
+  }
+
+  const startedAt = Date.now();
+  try {
+    const result = await retryTransient(`intent:${params.route}`, () =>
+      withTimeout(params.executor(), config.handlerTimeoutMs, () => {
+        observability.increment("intent.handler.timeout", 1, { route: params.route, source: params.source });
+      }),
+    );
+    if (result) {
+      state.failures = 0;
+      state.openedUntilMs = 0;
+    }
+    observability.timing("intent.handler.exec_ms", Date.now() - startedAt);
+    return result;
+  } catch (error) {
+    state.failures += 1;
+    observability.increment("intent.handler.failed", 1, {
+      route: params.route,
+      source: params.source,
+      failures: state.failures,
+    });
+    if (state.failures >= config.handlerCircuitBreakerFailures) {
+      state.openedUntilMs = Date.now() + config.handlerCircuitBreakerOpenMs;
+      observability.increment("intent.handler.circuit.opened", 1, {
+        route: params.route,
+        source: params.source,
+      });
+      logWarn(
+        `Circuit abierto para handler ${params.route} por ${config.handlerCircuitBreakerOpenMs}ms tras ${state.failures} fallas`,
+      );
+    }
+    return false;
+  }
+}
+
 async function runInIncomingQueue<T>(params: {
   chatId: number;
   source: string;
   executor: () => Promise<T>;
 }): Promise<T> {
+  const totalDepthBefore = computeIncomingQueueDepthTotal();
   const depthBefore = incomingMessageQueue.getDepth(params.chatId);
+  if (depthBefore >= config.incomingQueueMaxPerChat) {
+    observability.increment("incoming.queue.rejected.per_chat", 1, {
+      source: params.source,
+      chatId: params.chatId,
+      depth: depthBefore,
+      maxPerChat: config.incomingQueueMaxPerChat,
+    });
+    throw new IncomingQueueOverflowError(
+      params.chatId,
+      `Cola saturada para este chat (depth=${depthBefore}, max=${config.incomingQueueMaxPerChat})`,
+    );
+  }
+  if (totalDepthBefore >= config.incomingQueueMaxTotal) {
+    observability.increment("incoming.queue.rejected.global", 1, {
+      source: params.source,
+      chatId: params.chatId,
+      depth: totalDepthBefore,
+      maxTotal: config.incomingQueueMaxTotal,
+    });
+    throw new IncomingQueueOverflowError(
+      params.chatId,
+      `Cola global saturada (depth=${totalDepthBefore}, max=${config.incomingQueueMaxTotal})`,
+    );
+  }
   observability.increment("incoming.queue.enqueue", 1, {
     source: params.source,
     chatId: params.chatId,
     depth: depthBefore + 1,
+    totalDepth: totalDepthBefore + 1,
   });
   try {
     const queued = await incomingMessageQueue.enqueue(params.chatId, params.executor);
@@ -7781,8 +8348,66 @@ async function appendConversationTurn(params: {
       logWarn(`No pude actualizar aprendizaje de intereses: ${message}`);
     }
   }
+  await persistTelegramDebugLast20Turn({
+    chatId: params.chatId,
+    userId: params.userId,
+    role: params.role,
+    text,
+    source: params.source,
+  });
   observability.increment("conversation.turn.appended", 1, { role: params.role, source: params.source });
   observability.timing("conversation.turn.append.latency_ms", Date.now() - startedAt);
+}
+
+async function persistTelegramDebugLast20Turn(params: {
+  chatId: number;
+  userId?: number;
+  role: "user" | "assistant";
+  text: string;
+  source: string;
+}): Promise<void> {
+  if (!params.source.startsWith("telegram:")) {
+    return;
+  }
+  const now = Date.now();
+  const entry = {
+    at: new Date(now).toISOString(),
+    atMs: now,
+    chatId: params.chatId,
+    userId: params.userId,
+    role: params.role,
+    source: params.source,
+    text: truncateInline(params.text, 3_000),
+  };
+  try {
+    await fs.mkdir(path.dirname(TELEGRAM_DEBUG_LAST20_FILE), { recursive: true });
+    let existing: Array<typeof entry> = [];
+    try {
+      const raw = await fs.readFile(TELEGRAM_DEBUG_LAST20_FILE, "utf8");
+      existing = raw
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            return [JSON.parse(line) as typeof entry];
+          } catch {
+            return [];
+          }
+        });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        throw error;
+      }
+    }
+    const next = [...existing, entry].slice(-TELEGRAM_DEBUG_LAST20_LIMIT);
+    const payload = next.map((item) => JSON.stringify(item)).join("\n");
+    await fs.writeFile(TELEGRAM_DEBUG_LAST20_FILE, payload ? `${payload}\n` : "", "utf8");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logWarn(`No pude actualizar log temporal de debug Telegram: ${message}`);
+  }
 }
 
 async function replyLong(ctx: { reply: (text: string) => Promise<unknown> }, text: string) {
@@ -8514,6 +9139,86 @@ async function runCommandForProfile(params: {
   });
 }
 
+async function runCommandSequenceForProfile(params: {
+  ctx: ChatReplyContext;
+  profile: AgentProfile;
+  commandLines: string[];
+  source: string;
+  note?: string;
+}): Promise<void> {
+  const commands = params.commandLines.map((item) => item.trim()).filter(Boolean);
+  if (commands.length === 0) {
+    await params.ctx.reply("No hay comandos para ejecutar.");
+    return;
+  }
+  for (let index = 0; index < commands.length; index += 1) {
+    const commandLine = commands[index] ?? "";
+    await params.ctx.reply(`Secuencia ${index + 1}/${commands.length}: ${commandLine}`);
+    await runCommandForProfile({
+      ctx: params.ctx,
+      profile: params.profile,
+      commandLine,
+      source: `${params.source}:step-${index + 1}`,
+      ...(params.note ? { note: params.note } : {}),
+    });
+  }
+}
+
+async function queueExecSequenceConfirmation(params: {
+  ctx: ChatReplyContext;
+  profile: AgentProfile;
+  commandLines: string[];
+  source: string;
+  userId?: number;
+  note?: string;
+}): Promise<void> {
+  const commands = params.commandLines.map((item) => item.trim()).filter(Boolean).slice(0, 12);
+  if (commands.length === 0) {
+    throw new Error("Secuencia vacía");
+  }
+  const summary = [
+    `Secuencia de comandos (${commands.length})`,
+    `Agente: ${params.profile.name}`,
+    ...commands.map((item, idx) => `${idx + 1}. ${item}`),
+  ].join("\n");
+  const planned = createPlannedAction({
+    kind: "exec",
+    chatId: params.ctx.chat.id,
+    userId: params.userId,
+    summary,
+    payload: {
+      profileName: params.profile.name,
+      commandLines: commands,
+      ...(params.note ? { note: params.note } : {}),
+    },
+  });
+  await reliableReply(
+    params.ctx,
+    [
+      "Plan Preview (secuencia /exec|/shell):",
+      planned.summary,
+      `expira en: ${plannedActionRemainingSeconds(planned)}s`,
+      'Responde "si" o usa /confirm para ejecutar toda la secuencia.',
+      'Responde "no" o usa /cancelplan para cancelar.',
+    ].join("\n"),
+    { source: params.source },
+  );
+  await safeAudit({
+    type: "plan.preview.created",
+    chatId: params.ctx.chat.id,
+    userId: params.userId,
+    details: {
+      planId: planned.id,
+      kind: planned.kind,
+      capability: "exec",
+      summary: truncateInline(summary, 300),
+      source: params.source,
+      sequence: true,
+      count: commands.length,
+    },
+  });
+}
+
 type LocalCommandExecutionResult = {
   command: string;
   args: string[];
@@ -8949,8 +9654,13 @@ async function executeConfirmedPlan(params: {
 async function executePlannedAction(params: { ctx: ChatReplyContext; planned: PendingPlannedAction }): Promise<void> {
   if (params.planned.kind === "exec") {
     const commandLine = String(params.planned.payload.commandLine ?? "").trim();
+    const commandLines = Array.isArray(params.planned.payload.commandLines)
+      ? (params.planned.payload.commandLines as unknown[])
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter(Boolean)
+      : [];
     const profileName = String(params.planned.payload.profileName ?? "").trim();
-    if (!commandLine || !profileName) {
+    if ((!commandLine && commandLines.length === 0) || !profileName) {
       await params.ctx.reply("Plan inválido: faltan datos de ejecución.");
       return;
     }
@@ -8959,13 +9669,22 @@ async function executePlannedAction(params: { ctx: ChatReplyContext; planned: Pe
       await params.ctx.reply(`El agente ${profileName} ya no existe.`);
       return;
     }
-    if (policyEngine.isApprovalRequired("exec") || isAdminApprovalRequired(params.ctx.chat.id)) {
+    if ((policyEngine.isApprovalRequired("exec") || isAdminApprovalRequired(params.ctx.chat.id)) && commandLines.length <= 1) {
       await queueApproval({
         ctx: params.ctx,
         profile,
         commandLine,
         kind: "exec",
         note: "confirmed via /confirm",
+      });
+      return;
+    }
+    if (commandLines.length > 1) {
+      await runCommandSequenceForProfile({
+        ctx: params.ctx,
+        profile,
+        commandLines,
+        source: "planned-confirmed-sequence",
       });
       return;
     }
@@ -9330,6 +10049,30 @@ async function executeAiShellInstruction(ctx: ChatReplyContext, instruction: str
     return;
   }
 
+  if (plan.action === "exec_sequence") {
+    if (plan.reply) {
+      await ctx.reply(plan.reply);
+    }
+
+    const sequence = plan.commands
+      .map((item) => [item.command, ...(item.args ?? [])].join(" ").trim())
+      .filter(Boolean);
+    if (sequence.length < 2) {
+      await ctx.reply("La IA devolvió una secuencia inválida (mínimo 2 comandos).");
+      return;
+    }
+
+    await queueExecSequenceConfirmation({
+      ctx,
+      profile,
+      commandLines: sequence,
+      source: "ai-shell-sequence",
+      userId: ctx.from?.id,
+      note: `Instruction: ${instruction.slice(0, 300)}`,
+    });
+    return;
+  }
+
   if (plan.reply) {
     await ctx.reply(plan.reply);
   }
@@ -9404,6 +10147,50 @@ function parseScheduledEmailPayload(raw?: string): { to?: string; instruction?: 
   } catch {
     return null;
   }
+}
+
+type ScheduledNaturalIntentPayload = {
+  instruction: string;
+  recurrence?: {
+    frequency: "daily";
+  };
+};
+
+function parseScheduledNaturalIntentPayload(raw?: string): ScheduledNaturalIntentPayload | null {
+  if (!raw || !raw.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { instruction?: unknown; recurrence?: unknown };
+    const instruction = typeof parsed.instruction === "string" ? parsed.instruction.trim() : "";
+    if (!instruction) {
+      return null;
+    }
+    const recurrenceRaw = parsed.recurrence as { frequency?: unknown } | undefined;
+    const frequency = typeof recurrenceRaw?.frequency === "string" ? recurrenceRaw.frequency.trim().toLowerCase() : "";
+    return {
+      instruction,
+      ...(frequency === "daily" ? { recurrence: { frequency: "daily" as const } } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildNextDailyOccurrence(baseIso: string, nowInput?: Date): Date {
+  const base = new Date(baseIso);
+  if (!Number.isFinite(base.getTime())) {
+    const fallback = nowInput ? new Date(nowInput.getTime()) : new Date();
+    fallback.setDate(fallback.getDate() + 1);
+    return fallback;
+  }
+  const now = nowInput ? new Date(nowInput.getTime()) : new Date();
+  const next = new Date(base.getTime());
+  next.setDate(next.getDate() + 1);
+  while (next.getTime() <= now.getTime() + 10_000) {
+    next.setDate(next.getDate() + 1);
+  }
+  return next;
 }
 
 async function buildScheduledEmailBody(params: { chatId: number; instruction: string }): Promise<string> {
@@ -9488,6 +10275,40 @@ async function deliverScheduledGmailTask(task: { chatId: number; deliveryPayload
   });
 }
 
+async function deliverScheduledNaturalIntentTask(task: {
+  chatId: number;
+  userId?: number;
+  deliveryPayload?: string;
+  title: string;
+}): Promise<{ recurrenceDaily: boolean }> {
+  const payload = parseScheduledNaturalIntentPayload(task.deliveryPayload);
+  const instruction = payload?.instruction?.trim();
+  if (!instruction) {
+    throw new Error("No hay instrucción para la automatización programada.");
+  }
+
+  const automationCtx: ChatReplyContext = {
+    chat: { id: task.chatId },
+    ...(typeof task.userId === "number" ? { from: { id: task.userId } } : {}),
+    reply: async (text: string) => {
+      return await bot.api.sendMessage(task.chatId, text);
+    },
+  };
+
+  await handleIncomingTextMessage({
+    ctx: automationCtx,
+    text: instruction,
+    source: "schedule:automation",
+    ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
+    persistUserTurn: false,
+    allowSlashPrefix: true,
+  });
+
+  return {
+    recurrenceDaily: payload?.recurrence?.frequency === "daily",
+  };
+}
+
 async function processDueScheduledTasks(): Promise<void> {
   if (scheduleDeliveryLoopRunning) {
     return;
@@ -9497,6 +10318,42 @@ async function processDueScheduledTasks(): Promise<void> {
     const due = scheduledTasks.dueTasks(new Date());
     for (const task of due) {
       try {
+        if (task.deliveryKind === "natural-intent") {
+          const result = await deliverScheduledNaturalIntentTask(task);
+          if (result.recurrenceDaily) {
+            const nextDueAt = buildNextDailyOccurrence(task.dueAt, new Date());
+            const createdNext = await scheduledTasks.createTask({
+              chatId: task.chatId,
+              ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
+              title: task.title,
+              dueAt: nextDueAt,
+              deliveryKind: "natural-intent",
+              deliveryPayload: task.deliveryPayload,
+            });
+            await bot.api.sendMessage(
+              task.chatId,
+              [
+                "Automatización diaria reprogramada.",
+                `id anterior: ${task.id}`,
+                `nuevo id: ${createdNext.id}`,
+                `proxima ejecucion: ${formatScheduleDateTime(new Date(createdNext.dueAt))}`,
+              ].join("\n"),
+            );
+          }
+          await scheduledTasks.markDelivered(task.id, new Date());
+          await safeAudit({
+            type: "schedule.delivered",
+            chatId: task.chatId,
+            userId: task.userId,
+            details: {
+              taskId: task.id,
+              deliveryKind: "natural-intent",
+              recurrenceDaily: result.recurrenceDaily,
+            },
+          });
+          continue;
+        }
+
         if (task.deliveryKind === "gmail-send") {
           await deliverScheduledGmailTask(task);
           await bot.api.sendMessage(
@@ -9530,15 +10387,16 @@ async function processDueScheduledTasks(): Promise<void> {
           ].join("\n"),
         );
         await scheduledTasks.markDelivered(task.id, new Date());
-        await safeAudit({
-          type: "schedule.delivered",
-          chatId: task.chatId,
-          userId: task.userId,
-          details: {
-            taskId: task.id,
-          },
-        });
-      } catch (error) {
+          await safeAudit({
+            type: "schedule.delivered",
+            chatId: task.chatId,
+            userId: task.userId,
+            details: {
+              taskId: task.id,
+              deliveryKind: "reminder",
+            },
+          });
+        } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         try {
           await scheduledTasks.markDeliveryFailure(task.id, message, new Date());
@@ -10541,6 +11399,8 @@ async function maybeHandleNaturalScheduleInstruction(params: {
         return true;
       }
 
+      const hasAutomationInstruction = Boolean(intent.automationInstruction?.trim());
+
       if (intent.scheduleEmail) {
         const accessIssue = getGmailAccessIssue(params.ctx);
         if (accessIssue) {
@@ -10563,6 +11423,7 @@ async function maybeHandleNaturalScheduleInstruction(params: {
         title,
         dueAt,
         ...(intent.scheduleEmail ? { deliveryKind: "gmail-send" as const } : {}),
+        ...(hasAutomationInstruction ? { deliveryKind: "natural-intent" as const } : {}),
         ...(intent.scheduleEmail
           ? {
               deliveryPayload: JSON.stringify({
@@ -10570,15 +11431,24 @@ async function maybeHandleNaturalScheduleInstruction(params: {
                 instruction: intent.emailInstruction?.trim() || title,
               }),
             }
+          : hasAutomationInstruction
+            ? {
+                deliveryPayload: JSON.stringify({
+                  instruction: intent.automationInstruction?.trim() || "",
+                  ...(intent.automationRecurrenceDaily ? { recurrence: { frequency: "daily" as const } } : {}),
+                }),
+              }
           : {}),
       });
       const pending = scheduledTasks.listPending(params.ctx.chat.id);
       const index = Math.max(1, pending.findIndex((item) => item.id === created.id) + 1);
       const responseText = [
-        intent.scheduleEmail ? "Email programado." : "Tarea programada.",
+        intent.scheduleEmail ? "Email programado." : hasAutomationInstruction ? "Automatización programada." : "Tarea programada.",
         `#${index} | id: ${created.id}`,
         `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
         `detalle: ${created.title}`,
+        ...(hasAutomationInstruction ? [`accion: ${intent.automationInstruction?.trim()}`] : []),
+        ...(intent.automationRecurrenceDaily ? ["recurrencia: diaria"] : []),
       ].join("\n");
       await params.ctx.reply(responseText);
       await appendConversationTurn({
@@ -10957,10 +11827,14 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
 
-      const resolvedTargetPath = resolveWorkspacePath(targetPath);
+      const targetPathResolvedExisting = await resolveWorkspaceExistingPathInputWithAutocomplete(targetPath, {
+        autocompleteNotices,
+        label: "lectura",
+      });
+      const resolvedTargetPath = resolveWorkspacePath(targetPathResolvedExisting);
       const targetPathStat = await fs.stat(resolvedTargetPath.fullPath).catch(() => null);
       if (targetPathStat?.isDirectory()) {
-        const listed = await listWorkspaceDirectory(targetPath);
+        const listed = await listWorkspaceDirectory(targetPathResolvedExisting);
         rememberWorkspaceListContext({
           chatId: params.ctx.chat.id,
           relPath: listed.relPath,
@@ -11000,21 +11874,21 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
 
-      let readPath = targetPath;
+      let readPath = targetPathResolvedExisting;
       let readText = "";
       let readFormat = path.extname(targetPath).replace(/^\./, "").toLowerCase() || "txt";
       let readExtractor = "workspace-utf8";
       let readTruncated = false;
 
       try {
-        const read = await documentReader.readDocument(targetPath);
+        const read = await documentReader.readDocument(targetPathResolvedExisting);
         readPath = read.path;
         readText = read.text;
         readFormat = read.format;
         readExtractor = read.extractor;
         readTruncated = read.truncated;
       } catch {
-        const resolved = resolveWorkspacePath(targetPath);
+        const resolved = resolveWorkspacePath(targetPathResolvedExisting);
         readPath = resolved.relPath;
         const raw = await fs.readFile(resolved.fullPath, "utf8");
         readText = raw;
@@ -11221,6 +12095,18 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
           filePath = buildAutoWorkspaceFilePath(formatHint);
         }
       }
+      const shouldPreferExistingPath =
+        Boolean(intent.path?.trim()) &&
+        (appendMode || explicitOverwriteCue || /\b(edit\w*|modific\w*|actualiz\w*)\b/.test(normalizedWriteRequest) || !explicitCreationCue);
+      if (shouldPreferExistingPath) {
+        const resolvedExistingPath = await resolveWorkspaceExistingPathInputWithAutocomplete(filePath, {
+          autocompleteNotices,
+          label: "edicion",
+        });
+        if (resolvedExistingPath) {
+          filePath = resolvedExistingPath;
+        }
+      }
       const resolvedWritePath = resolveWorkspacePath(filePath);
       const targetFileExists = await safePathExists(resolvedWritePath.fullPath);
       const overwriteMode =
@@ -11246,6 +12132,11 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         ...(autoRandomNameGenerated ? ["nombre: aleatorio"] : autoPathGenerated ? ["nombre: autogenerado"] : []),
         `ruta: ${written.relPath}`,
         `tamano: ${formatBytes(written.size)}`,
+        `accion: ${appendMode ? "append" : written.created ? "create" : overwriteMode ? "overwrite" : "update"}`,
+        ...(typeof content === "string" ? [`contenido: ${content.length} chars`] : []),
+        ...(autocompleteNotices.length > 0
+          ? ["autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`)]
+          : []),
         ...(typeof autoNumberUsed === "number" ? [`numero: ${autoNumberUsed}`] : []),
       ].join("\n");
       await params.ctx.reply(responseText);
@@ -11364,7 +12255,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
 
-      const sourcePath = intent.sourcePath?.trim() ?? "";
+      let sourcePath = intent.sourcePath?.trim() ?? "";
       const targetPath = intent.targetPath?.trim() ?? "";
       if (!sourcePath || !targetPath) {
         const examples =
@@ -11381,11 +12272,19 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
 
+      sourcePath = await resolveWorkspaceExistingPathInputWithAutocomplete(sourcePath, {
+        autocompleteNotices,
+        label: "origen",
+      });
+
       const moved = await moveWorkspacePath(sourcePath, targetPath);
       const responseText = [
         intent.action === "rename" ? "Renombrado." : "Movido.",
         `origen: ${moved.from}`,
         `destino: ${moved.to}`,
+        ...(autocompleteNotices.length > 0
+          ? ["autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`)]
+          : []),
       ].join("\n");
       await params.ctx.reply(responseText);
       await appendConversationTurn({
@@ -11486,7 +12385,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
 
-      const sourcePath = intent.sourcePath?.trim() ?? "";
+      let sourcePath = intent.sourcePath?.trim() ?? "";
       const targetPath = intent.targetPath?.trim() ?? "";
       if (!sourcePath && !targetPath) {
         await params.ctx.reply(
@@ -11500,6 +12399,10 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
       if (sourcePath && !targetPath) {
+        sourcePath = await resolveWorkspaceExistingPathInputWithAutocomplete(sourcePath, {
+          autocompleteNotices,
+          label: "origen",
+        });
         workspaceClipboardByChat.set(params.ctx.chat.id, {
           paths: [sourcePath],
           copiedAtMs: Date.now(),
@@ -11510,6 +12413,9 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
             "Archivo copiado al portapapeles.",
             `origen: ${resolveWorkspacePath(sourcePath).relPath}`,
             'Ahora puedes decir: "pegar en <carpeta>"',
+            ...(autocompleteNotices.length > 0
+              ? ["autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`)]
+              : []),
           ].join("\n"),
         );
         return true;
@@ -11518,11 +12424,18 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         await params.ctx.reply("Indica origen y destino para copiar dentro de workspace.");
         return true;
       }
+      sourcePath = await resolveWorkspaceExistingPathInputWithAutocomplete(sourcePath, {
+        autocompleteNotices,
+        label: "origen",
+      });
       const copied = await copyWorkspacePath(sourcePath, targetPath);
       const responseText = [
         "Copiado.",
         `origen: ${copied.from}`,
         `destino: ${copied.to}`,
+        ...(autocompleteNotices.length > 0
+          ? ["autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`)]
+          : []),
       ].join("\n");
       await params.ctx.reply(responseText);
       await appendConversationTurn({
@@ -11586,7 +12499,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
     }
 
     if (intent.action === "send") {
-      const targetPath = intent.path?.trim() ?? "";
+      let targetPath = intent.path?.trim() ?? "";
       const fileIndex = intent.fileIndex;
       if (!targetPath && (!Number.isFinite(fileIndex) || (fileIndex ?? 0) <= 0)) {
         await params.ctx.reply(
@@ -11599,6 +12512,12 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         );
         return true;
       }
+      if (targetPath) {
+        targetPath = await resolveWorkspaceExistingPathInputWithAutocomplete(targetPath, {
+          autocompleteNotices,
+          label: "archivo",
+        });
+      }
 
       const responseText = await sendWorkspaceFileToChat({
         ctx: params.ctx,
@@ -11607,12 +12526,21 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         ...(targetPath ? { reference: targetPath } : {}),
         ...(Number.isFinite(fileIndex) && (fileIndex ?? 0) > 0 ? { index: Number(fileIndex) } : {}),
       });
-      await params.ctx.reply(responseText);
+      const responseWithAutocomplete =
+        autocompleteNotices.length > 0
+          ? [
+              responseText,
+              "",
+              "autocompletado:",
+              ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`),
+            ].join("\n")
+          : responseText;
+      await params.ctx.reply(responseWithAutocomplete);
       await appendConversationTurn({
         chatId: params.ctx.chat.id,
         userId: params.userId,
         role: "assistant",
-        text: responseText,
+        text: responseWithAutocomplete,
         source: `${params.source}:workspace-intent`,
       });
       return true;
@@ -11738,7 +12666,7 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         return true;
       }
 
-      const targetPath = intent.path?.trim() ?? "";
+      let targetPath = intent.path?.trim() ?? "";
       if (!targetPath) {
         const pendingPath = queueWorkspaceDeletePathRequest({
           chatId: params.ctx.chat.id,
@@ -11757,6 +12685,10 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         );
         return true;
       }
+      targetPath = await resolveWorkspaceExistingPathInputWithAutocomplete(targetPath, {
+        autocompleteNotices,
+        label: "ruta",
+      });
       pendingWorkspaceDeletePathByChat.delete(params.ctx.chat.id);
       const pending = queueWorkspaceDeleteConfirmation({
         chatId: params.ctx.chat.id,
@@ -11768,6 +12700,9 @@ async function maybeHandleNaturalWorkspaceInstruction(params: {
         "Confirmación requerida para eliminar en workspace.",
         `ruta: workspace/${pending.paths[0]}`,
         `expira en: ${pendingWorkspaceDeleteRemainingSeconds(pending)}s`,
+        ...(autocompleteNotices.length > 0
+          ? ["autocompletado:", ...autocompleteNotices.map((item, index) => `${index + 1}. ${item}`)]
+          : []),
         'Responde "si" para confirmar o "no" para cancelar.',
       ].join("\n");
       await params.ctx.reply(responseText);
@@ -13830,13 +14765,22 @@ async function maybeHandleNaturalIntentPipeline(params: {
     (hierarchyDecision?.strict && (hierarchyDecision.exhausted || hierarchyNarrowed.exhausted || hierarchyAllowedCandidates.length === 0)) ||
     (routeFilterDecision?.strict && (routeFilterDecision.exhausted || semanticAllowedCandidates.length === 0));
   if (strictNarrowingExhausted || semanticAllowedCandidates.length === 0) {
-    await params.ctx.reply(
-      buildRouteNarrowingClarificationQuestion({
-        routeFilterDecision,
-        routerLayerDecision,
-        hierarchyDecision,
-      }),
-    );
+    const clarificationQuestion = buildRouteNarrowingClarificationQuestion({
+      routeFilterDecision,
+      routerLayerDecision,
+      hierarchyDecision,
+    });
+    const clarificationHints = semanticAllowedCandidates.slice(0, 3);
+    registerPendingIntentClarification({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      source: `${params.source}:route-narrowing`,
+      originalText: params.text,
+      question: clarificationQuestion,
+      routeHints: clarificationHints,
+      ...(clarificationHints.length === 1 ? { preferredRoute: clarificationHints[0] } : {}),
+    });
+    await params.ctx.reply(clarificationQuestion);
     await appendIntentRouterDatasetEntry({
       ts: new Date().toISOString(),
       chatId: params.ctx.chat.id,
@@ -13970,7 +14914,18 @@ async function maybeHandleNaturalIntentPipeline(params: {
       text: params.text,
     })
   ) {
-    await params.ctx.reply(buildIntentClarificationQuestion(uncertainSemanticDecision.alternatives));
+    const clarificationQuestion = buildIntentClarificationQuestion(uncertainSemanticDecision.alternatives);
+    registerPendingIntentClarification({
+      chatId: params.ctx.chat.id,
+      userId: params.userId,
+      source: `${params.source}:route-uncertain`,
+      originalText: params.text,
+      question: clarificationQuestion,
+      routeHints: uncertainSemanticDecision.alternatives
+        .slice(0, 3)
+        .map((item) => item.name as Exclude<NaturalIntentHandlerName, "none">),
+    });
+    await params.ctx.reply(clarificationQuestion);
     await appendIntentRouterDatasetEntry({
       ts: new Date().toISOString(),
       chatId: params.ctx.chat.id,
@@ -14043,10 +14998,25 @@ async function maybeHandleNaturalIntentPipeline(params: {
       const executed: Array<{ handler: string; ok: boolean }> = [];
       for (let idx = 0; idx < multiHandlers.length; idx += 1) {
         const handler = multiHandlers[idx]!;
-        const ok = await handler.fn({
-          ...params,
-          source: `${params.source}:multi-topn-${idx + 1}`,
-          persistUserTurn: false,
+        const delegatedSubagent = resolveDelegatedSubagent(params.ctx.chat.id, handler.name);
+        if (!isHandlerAllowedForSubagent(delegatedSubagent, handler.name)) {
+          executed.push({ handler: handler.name, ok: false });
+          continue;
+        }
+        rememberSubagentDelegation(params.ctx.chat.id, delegatedSubagent);
+        const delegatedSource =
+          delegatedSubagent === "coordinator"
+            ? `${params.source}:multi-topn-${idx + 1}`
+            : `${params.source}:multi-topn-${idx + 1}:subagent:${delegatedSubagent}`;
+        const ok = await executeIntentHandlerResilient({
+          route: handler.name,
+          source: delegatedSource,
+          executor: async () =>
+            handler.fn({
+              ...params,
+              source: delegatedSource,
+              persistUserTurn: false,
+            }),
         });
         executed.push({ handler: handler.name, ok });
       }
@@ -14114,7 +15084,19 @@ async function maybeHandleNaturalIntentPipeline(params: {
       text: params.text,
     });
     if (typedExtraction && typedExtraction.missing.length > 0 && isSensitiveIntentRoute(handler.name)) {
-      await params.ctx.reply(buildTypedRouteClarificationQuestion(typedExtraction));
+      const clarificationQuestion = buildTypedRouteClarificationQuestion(typedExtraction);
+      registerPendingIntentClarification({
+        chatId: params.ctx.chat.id,
+        userId: params.userId,
+        source: `${params.source}:typed-missing`,
+        originalText: params.text,
+        question: clarificationQuestion,
+        routeHints: [handler.name],
+        preferredRoute: handler.name,
+        ...(typedExtraction.action ? { preferredAction: typedExtraction.action } : {}),
+        missing: typedExtraction.missing,
+      });
+      await params.ctx.reply(clarificationQuestion);
       await appendIntentRouterDatasetEntry({
         ts: new Date().toISOString(),
         chatId: params.ctx.chat.id,
@@ -14169,8 +15151,31 @@ async function maybeHandleNaturalIntentPipeline(params: {
       return true;
     }
 
-    const handled = await handler.fn(params);
+    const delegatedSubagent = resolveDelegatedSubagent(params.ctx.chat.id, handler.name);
+    const pinnedMode = getSubagentMode(params.ctx.chat.id) === "pinned";
+    if (!isHandlerAllowedForSubagent(delegatedSubagent, handler.name)) {
+      if (pinnedMode) {
+        await params.ctx.reply(
+          `El subagente fijado (${delegatedSubagent}) no puede ejecutar el dominio ${handler.name}. Usa /subagent auto o /subagent set <nombre>.`,
+        );
+        return true;
+      }
+      continue;
+    }
+    rememberSubagentDelegation(params.ctx.chat.id, delegatedSubagent);
+    const delegatedSource =
+      delegatedSubagent === "coordinator" ? params.source : `${params.source}:subagent:${delegatedSubagent}`;
+    const handled = await executeIntentHandlerResilient({
+      route: handler.name,
+      source: delegatedSource,
+      executor: async () =>
+        handler.fn({
+          ...params,
+          source: delegatedSource,
+        }),
+    });
     if (handled) {
+      clearPendingIntentClarification(params.ctx.chat.id, params.userId);
       await safeAudit({
         type: "intent.route",
         chatId: params.ctx.chat.id,
@@ -14193,6 +15198,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
           routerCanaryVersion,
           ensembleTop,
           aiRouterSelected: aiRouteDecision?.handler ?? null,
+          subagent: delegatedSubagent,
+          subagentMode: getSubagentMode(params.ctx.chat.id),
           typedRouteSummary: typedExtraction?.summary ?? null,
           textPreview: truncateInline(params.text, 220),
         },
@@ -14257,6 +15264,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
   }
   const handledByListReference = await maybeHandleNaturalIndexedListReference(params);
   if (handledByListReference) {
+    clearPendingIntentClarification(params.ctx.chat.id, params.userId);
     await safeAudit({
       type: "intent.route",
       chatId: params.ctx.chat.id,
@@ -14403,6 +15411,7 @@ bot.command("start", async (ctx) => {
       buildAgentVersionText(),
       "Houdi Agent activo.",
       `Agente actual: ${active}`,
+      `Subagente: ${getSubagentMode(chatId)}${getPinnedSubagent(chatId) ? ` (${getPinnedSubagent(chatId)})` : ""}`,
       `Shell IA: ${shellMode}`,
       `ECO mode: ${ecoMode}`,
       `SAFE mode: ${safeMode}`,
@@ -14423,6 +15432,7 @@ bot.command("help", async (ctx) => {
     "/version - Ver versión del agente",
     "/model|/mode [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
     "/ask <pregunta> - Consultar IA de OpenAI",
+    "/health - Salud runtime (cola, circuit-breakers, outbox, SQLite, workspace)",
     "/readfile <ruta> - Extraer texto de PDF/documentos de oficina",
     "/askfile <ruta> <pregunta> - Consultar IA sobre archivo local",
     "/mkfile <ruta> [contenido] - Crear archivo de texto simple en workspace",
@@ -14444,7 +15454,9 @@ bot.command("help", async (ctx) => {
     "/interests [status|add|del|clear|suggest] - Gestión de intereses de noticias",
     "/suggest now|status - Forzar sugerencia o ver cuota/config",
     "/eco on|off|status - Modo ahorro de tokens (respuestas más compactas)",
-    "/safe on|off|status - Modo determinista para interpretar órdenes precisas",
+    "/safe on|off|status - Exige ejecución real para órdenes operativas (si no, falla explícito)",
+    "/subagent [status|list|set <nombre>|auto] - Delegación a subagentes especializados por dominio",
+    "/session [status|list] - Ver ruta de sesión activa (bridge Slack/CLI/Telegram)",
     "/confirm - Confirmar plan preview sensible (último en este chat)",
     "/cancelplan - Cancelar plan preview sensible (último en este chat)",
     "",
@@ -14468,6 +15480,8 @@ bot.command("help", async (ctx) => {
     "/agenticcanary [status|<0-100>] - Rollout runtime de controles agénticos",
     "/agent - Ver agente activo y lista",
     "/agent set <nombre> - Cambiar agente activo para este chat",
+    "/subagent [status|list|set <nombre>|auto] - Fijar/soltar delegación de subagentes",
+    "/session [status|list] - Estado de session routing/mirroring para este chat",
     '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
     "/lim list [limit:10] - Listar historial de outputs LIM",
     "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
@@ -14625,6 +15639,9 @@ bot.command("status", async (ctx) => {
       `Memoria: ${usedMemMb}MB / ${totalMemMb}MB`,
       `Tareas activas: ${runningCount}`,
       `Agente actual: ${getActiveAgent(ctx.chat.id)}`,
+      `Subagente modo: ${getSubagentMode(ctx.chat.id)}${getPinnedSubagent(ctx.chat.id) ? ` (${getPinnedSubagent(ctx.chat.id)})` : ""}`,
+      `Subagente último: ${subagentLastByChat.get(ctx.chat.id) ?? "n/d"}`,
+      `Session key: ${sessionKeyByChat.get(ctx.chat.id) ?? "n/d"}`,
       `Shell IA: ${isAiShellModeEnabled(ctx.chat.id) ? "on" : "off"}`,
       `ECO mode: ${isEcoModeEnabled(ctx.chat.id) ? `on (max ${config.openAiEcoMaxOutputTokens} tok)` : "off"}`,
       `SAFE mode: ${isSafeModeEnabled(ctx.chat.id) ? "on" : "off"}`,
@@ -14635,7 +15652,8 @@ bot.command("status", async (ctx) => {
       `Reboot command: ${config.enableRebootCommand ? "habilitado" : "deshabilitado"} (${rebootAllowedInAgent ? "permitido en agente actual" : "no permitido en agente actual"})`,
       `Aprobaciones pendientes (chat): ${pendingCount}`,
       `Outbox pendiente (chat): ${pendingOutboxCount} | dead-letter recientes: ${deadLetterOutboxCount}`,
-      `Incoming queue: depth(chat)=${queueDepthChat} | chats activos=${queueActiveChats}`,
+      `Incoming queue: depth(chat)=${queueDepthChat} | chats activos=${queueActiveChats} | max/chat=${config.incomingQueueMaxPerChat} | max/global=${config.incomingQueueMaxTotal}`,
+      `Handler resilience: timeout=${config.handlerTimeoutMs}ms | circuitFail=${config.handlerCircuitBreakerFailures} | circuitOpen=${config.handlerCircuitBreakerOpenMs}ms | retries=${config.transientRetryAttempts}`,
       `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
       `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
       ...buildOpenAiUsageLines(3),
@@ -14659,6 +15677,50 @@ bot.command("status", async (ctx) => {
       memoryStatusLine,
     ].join("\n"),
   );
+});
+
+bot.command("health", async (ctx) => {
+  try {
+    const health = await buildRuntimeHealthSnapshot();
+    const checkLines = Object.entries(health.checks).map(
+      ([name, item]) => `- ${name}: ${item.ok ? "ok" : "degraded"} (${item.detail})`,
+    );
+    const circuitLines =
+      health.circuits.entries.length > 0
+        ? health.circuits.entries.slice(0, 8).map((entry) => {
+            const openInfo = entry.openForMs > 0 ? `openFor=${entry.openForMs}ms` : "closed";
+            return `- ${entry.route}: ${openInfo} failures=${entry.failures}`;
+          })
+        : ["- sin handlers degradados"];
+    await replyLong(
+      ctx,
+      [
+        `Health: ${health.status.toUpperCase()}`,
+        `queue: depth=${health.queue.totalDepth}/${health.queue.maxTotal} | activeChats=${health.queue.activeChats}`,
+        `circuits abiertos: ${health.circuits.openHandlers}`,
+        "",
+        "Checks:",
+        ...checkLines,
+        "",
+        "Circuit detail:",
+        ...circuitLines,
+      ].join("\n"),
+    );
+    await safeAudit({
+      type: "health.run",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        status: health.status,
+        queueDepth: health.queue.totalDepth,
+        queueActiveChats: health.queue.activeChats,
+        openCircuits: health.circuits.openHandlers,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`No pude ejecutar health: ${message}`);
+  }
 });
 
 bot.command("doctor", async (ctx) => {
@@ -15245,6 +16307,95 @@ bot.command("agent", async (ctx) => {
   });
 });
 
+bot.command("subagent", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim();
+  const [subRaw, ...rest] = raw.split(/\s+/).filter(Boolean);
+  const sub = (subRaw ?? "status").toLowerCase();
+  const allowed: SpecializedSubagentName[] = [
+    "coordinator",
+    "mail-ops",
+    "workspace-ops",
+    "web-research",
+    "memory-archivist",
+    "lim-ops",
+    "self-maintainer",
+    "schedule-ops",
+  ];
+
+  if (!raw || sub === "status" || sub === "show") {
+    await ctx.reply(
+      [
+        `Subagent mode: ${getSubagentMode(ctx.chat.id)}`,
+        `Pinned: ${getPinnedSubagent(ctx.chat.id) ?? "-"}`,
+        `Last delegated: ${subagentLastByChat.get(ctx.chat.id) ?? "-"}`,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (sub === "list") {
+    await replyLong(ctx, ["Subagentes disponibles:", ...allowed.map((item) => `- ${item}`)].join("\n"));
+    return;
+  }
+
+  if (sub === "auto" || sub === "reset" || sub === "clear") {
+    setSubagentAutoMode(ctx.chat.id);
+    await ctx.reply("Subagent mode = auto. Se delega por dominio detectado.");
+    return;
+  }
+
+  if (sub === "set") {
+    const target = rest.join(" ").trim().toLowerCase();
+    if (!target) {
+      await ctx.reply("Uso: /subagent set <nombre>");
+      return;
+    }
+    const matched = allowed.find((item) => item === target);
+    if (!matched) {
+      await ctx.reply(`Subagente inválido: ${target}. Usa /subagent list.`);
+      return;
+    }
+    setPinnedSubagent(ctx.chat.id, matched);
+    await ctx.reply(`Subagent fijado: ${matched}`);
+    return;
+  }
+
+  await ctx.reply("Uso: /subagent [status|list|set <nombre>|auto]");
+});
+
+bot.command("session", async (ctx) => {
+  const raw = String(ctx.match ?? "").trim().toLowerCase();
+  const sub = raw || "status";
+  const current = sessionKeyByChat.get(ctx.chat.id) ?? null;
+  const persisted = sqliteState.listSessionRoutesByChat(ctx.chat.id, 12);
+
+  if (sub === "status" || sub === "show") {
+    await ctx.reply(
+      [
+        `chatId: ${ctx.chat.id}`,
+        `session actual: ${current ?? "-"}`,
+        `session routes persistidas: ${persisted.length}`,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (sub === "list") {
+    if (persisted.length === 0) {
+      await ctx.reply("No hay session routes persistidas para este chat.");
+      return;
+    }
+    const lines = persisted.map((row, index) => {
+      const at = new Date(row.updatedAtMs).toISOString();
+      return `${index + 1}. ${row.sessionKey} | source=${row.source} | updated=${at}`;
+    });
+    await replyLong(ctx, [`Session routes (${persisted.length}):`, ...lines].join("\n"));
+    return;
+  }
+
+  await ctx.reply("Uso: /session [status|list]");
+});
+
 async function handleTaskCommand(ctx: ChatReplyContext, inputRaw: string): Promise<void> {
   const input = inputRaw.trim();
 
@@ -15294,7 +16445,7 @@ async function handleTaskCommand(ctx: ChatReplyContext, inputRaw: string): Promi
     "Uso:",
     "/task",
     "/task list",
-    "/task add <cuando> | <detalle>",
+    "/task add <cuando> | <detalle|automatizacion>",
     "/task del <n|id|last>",
     "/task edit <n|id> | <nuevo cuando> | <nuevo detalle opcional>",
     "/task running",
@@ -15306,6 +16457,13 @@ async function handleTaskCommand(ctx: ChatReplyContext, inputRaw: string): Promi
     const parsed = parseNaturalScheduleDateTime(parseTarget, new Date());
     const dueAt = parsed.dueAt;
     const detail = sanitizeScheduleTitle(detailRaw || extractTaskTitleForCreate(restRaw));
+    const automation = detectScheduledAutomationIntent({
+      text: restRaw,
+      normalizeIntentText,
+      stripScheduleTemporalPhrases,
+      sanitizeTitle: sanitizeScheduleTitle,
+    });
+    const hasAutomationInstruction = Boolean(automation.instruction?.trim());
 
     if (!dueAt) {
       await ctx.reply(`No pude inferir fecha/hora.\n\n${usage}`);
@@ -15315,7 +16473,7 @@ async function handleTaskCommand(ctx: ChatReplyContext, inputRaw: string): Promi
       await ctx.reply("La fecha/hora debe ser futura.");
       return;
     }
-    if (!detail) {
+    if (!detail && !hasAutomationInstruction) {
       await ctx.reply("Falta detalle de la tarea. Ejemplo: /task add mañana 10:30 | llamar a Juan");
       return;
     }
@@ -15323,15 +16481,26 @@ async function handleTaskCommand(ctx: ChatReplyContext, inputRaw: string): Promi
     const created = await scheduledTasks.createTask({
       chatId: ctx.chat.id,
       userId: ctx.from?.id,
-      title: detail,
+      title: hasAutomationInstruction ? sanitizeScheduleTitle(`Automatización: ${automation.instruction}`) : detail,
       dueAt,
+      ...(hasAutomationInstruction ? { deliveryKind: "natural-intent" as const } : {}),
+      ...(hasAutomationInstruction
+        ? {
+            deliveryPayload: JSON.stringify({
+              instruction: automation.instruction,
+              ...(automation.recurrenceDaily ? { recurrence: { frequency: "daily" as const } } : {}),
+            }),
+          }
+        : {}),
     });
     await ctx.reply(
       [
-        "Tarea programada.",
+        hasAutomationInstruction ? "Automatización programada." : "Tarea programada.",
         `id: ${created.id}`,
         `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
         `detalle: ${created.title}`,
+        ...(hasAutomationInstruction ? [`accion: ${automation.instruction}`] : []),
+        ...(automation.recurrenceDaily ? ["recurrencia: diaria"] : []),
       ].join("\n"),
     );
     return;
@@ -15469,6 +16638,20 @@ bot.command("exec", async (ctx) => {
   }
 
   const profile = agentRegistry.require(getActiveAgent(ctx.chat.id));
+  const sequence = normalizeExecCommandSequence(input);
+  const isSequence = sequence.length > 1;
+
+  if (isSequence) {
+    await queueExecSequenceConfirmation({
+      ctx,
+      profile,
+      commandLines: sequence,
+      source: "telegram:/exec-sequence",
+      userId: ctx.from?.id,
+      note: "requested via /exec sequence",
+    });
+    return;
+  }
 
   if (
     await maybeRequirePlannedConfirmation({
@@ -17266,7 +18449,7 @@ bot.command("safe", async (ctx) => {
   setSafeMode(ctx.chat.id, enabled);
   await ctx.reply(
     enabled
-      ? "SAFE mode activado: interpretaré tus mensajes como órdenes precisas y deterministas."
+      ? "SAFE mode activado: órdenes operativas se ejecutan o fallan explícitamente (sin fallback conversacional)."
       : "SAFE mode desactivado.",
   );
   await safeAudit({
@@ -17893,6 +19076,11 @@ bot.on(["message:voice", "message:audio", "message:document"], async (ctx, next)
   await replyProgress(ctx, `Audio recibido (${incoming.kind}). Transcribiendo...`);
 
   try {
+    upsertSessionRouteMapping({
+      sessionKey: `telegram:chat:${ctx.chat.id}`,
+      chatId: ctx.chat.id,
+      source: "telegram:audio",
+    });
     const audioBuffer = await downloadTelegramFileBuffer(incoming.fileId);
     if (audioBuffer.length > config.openAiAudioMaxFileBytes) {
       const limitMb = Math.round(config.openAiAudioMaxFileBytes / (1024 * 1024));
@@ -18077,6 +19265,13 @@ async function handleIncomingTextMessage(params: {
 
   const userId = params.userId ?? params.ctx.from?.id;
   const source = params.source;
+  if (params.ctx.sessionKey) {
+    upsertSessionRouteMapping({
+      sessionKey: params.ctx.sessionKey,
+      chatId: params.ctx.chat.id,
+      source,
+    });
+  }
   const persistUserTurn = params.persistUserTurn ?? true;
   const allowSlashPrefix = params.allowSlashPrefix ?? false;
   const replyReferenceText = params.replyReference?.text?.trim() ?? "";
@@ -18091,6 +19286,42 @@ async function handleIncomingTextMessage(params: {
         `text=${truncateInline(replyReferenceText, 3000)}`,
       ].join("\n")
     : text;
+  let textForIntent = text;
+  let clarificationApplied = false;
+  const pendingClarification = peekPendingIntentClarification(params.ctx.chat.id, userId);
+  if (
+    pendingClarification &&
+    shouldTreatAsClarificationReply({
+      text,
+      pending: pendingClarification,
+      ...(replyReferenceText ? { replyReferenceText } : {}),
+    })
+  ) {
+    const consumed = consumePendingIntentClarification(params.ctx.chat.id, userId);
+    if (consumed) {
+      textForIntent = buildClarificationFollowupText({
+        pending: consumed,
+        replyText: text,
+      });
+      clarificationApplied = true;
+      void safeAudit({
+        type: "intent.clarification.consume",
+        chatId: params.ctx.chat.id,
+        userId,
+        details: {
+          source,
+          pendingSource: consumed.source,
+          preferredRoute: consumed.preferredRoute ?? null,
+          preferredAction: consumed.preferredAction ?? null,
+          missing: consumed.missing ?? null,
+          textPreview: truncateInline(text, 220),
+        },
+      });
+    }
+  }
+  const textForPersistence = clarificationApplied
+    ? [textWithReplyReference, "[INTENT_CLARIFICATION_APPLIED]", truncateInline(textForIntent, 3000)].join("\n\n")
+    : textWithReplyReference;
 
   // Never intercept Telegram slash commands from the free-text pipeline.
   if (!allowSlashPrefix && text.startsWith("/")) {
@@ -18163,7 +19394,7 @@ async function handleIncomingTextMessage(params: {
         chatId: params.ctx.chat.id,
         userId,
         role: "user",
-        text: textWithReplyReference,
+        text: textForPersistence,
         source,
       });
     }
@@ -18180,7 +19411,7 @@ async function handleIncomingTextMessage(params: {
 
   const handledAsNaturalIntent = await maybeHandleNaturalIntentPipeline({
     ctx: params.ctx,
-    text,
+    text: textForIntent,
     source,
     userId,
     persistUserTurn,
@@ -18189,12 +19420,45 @@ async function handleIncomingTextMessage(params: {
     return;
   }
 
+  if (shouldEnforceOperationalExecution(params.ctx.chat.id, textForIntent)) {
+    if (persistUserTurn) {
+      await appendConversationTurn({
+        chatId: params.ctx.chat.id,
+        userId,
+        role: "user",
+        text: textForPersistence,
+        source,
+      });
+    }
+    const responseText =
+      "SAFE mode: detecté una orden operativa, pero no hubo ejecución confirmada. Reformulá con acción+parámetros o usa comando explícito (/workspace, /gmail, /schedule, /lim, /shell).";
+    await params.ctx.reply(responseText);
+    await appendConversationTurn({
+      chatId: params.ctx.chat.id,
+      userId,
+      role: "assistant",
+      text: responseText,
+      source: `${source}:safe-operational-block`,
+    });
+    await safeAudit({
+      type: "intent.execution_required_not_executed",
+      chatId: params.ctx.chat.id,
+      userId,
+      details: {
+        source,
+        safeMode: true,
+        textPreview: truncateInline(textForIntent, 220),
+      },
+    });
+    return;
+  }
+
   if (persistUserTurn) {
     await appendConversationTurn({
       chatId: params.ctx.chat.id,
       userId,
       role: "user",
-      text: textWithReplyReference,
+      text: textForPersistence,
       source,
     });
   }
@@ -18254,8 +19518,10 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
 
   if (method === "GET" && pathname === LOCAL_BRIDGE_HEALTH_PATH) {
     const metrics = observability.snapshot();
+    const health = await buildRuntimeHealthSnapshot();
     writeJsonResponse(res, 200, {
       ok: true,
+      health,
       service: "houdi-local-bridge",
       version: config.agentVersion,
       messagePath: LOCAL_BRIDGE_MESSAGE_PATH,
@@ -18327,7 +19593,19 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
     return;
   }
 
-  const chatId = parsePositiveInteger(record.chatId) ?? 1;
+  const bridgeChatId = parsePositiveInteger(record.chatId);
+  const bridgeSessionKeyRaw = typeof record.sessionKey === "string" ? record.sessionKey : undefined;
+  const bridgeChannel = typeof record.channel === "string" ? record.channel : undefined;
+  const bridgeThreadTs = typeof record.threadTs === "string" ? record.threadTs : undefined;
+  const resolvedBridgeRoute = resolveChatIdForBridgePayload({
+    source: typeof record.source === "string" ? record.source : undefined,
+    chatId: bridgeChatId,
+    sessionKey: bridgeSessionKeyRaw,
+    channel: bridgeChannel,
+    threadTs: bridgeThreadTs,
+  });
+  const chatId = resolvedBridgeRoute.chatId;
+  const sessionKey = resolvedBridgeRoute.sessionKey;
   const requestId = idempotency.normalizeRequestId(record.requestId);
   if (requestId) {
     const cached = idempotency.read(chatId, requestId);
@@ -18356,6 +19634,9 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
   const userId = parsePositiveInteger(record.userId) ?? defaultAllowedUserId;
 
   if (typeof userId !== "number" || !config.allowedUserIds.has(userId)) {
+    if (requestId) {
+      idempotency.release(chatId, requestId);
+    }
     writeJsonResponse(res, 403, {
       ok: false,
       error: "userId is not authorized",
@@ -18365,10 +19646,14 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
 
   const sourceCandidate = typeof record.source === "string" ? record.source.trim() : "";
   const source = sourceCandidate ? truncateInline(sourceCandidate, 80) : "cli:bridge";
+  if (sessionKey) {
+    upsertSessionRouteMapping({ sessionKey, chatId, source });
+  }
   const replies: string[] = [];
   const ctx: ChatReplyContext = {
     chat: { id: chatId },
     from: { id: userId },
+    ...(sessionKey ? { sessionKey } : {}),
     reply: async (textReply: string) => {
       replies.push(textReply);
       return undefined;
@@ -18401,6 +19686,7 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
     writeJsonResponse(res, 200, {
       ok: true,
       chatId,
+      ...(sessionKey ? { sessionKey } : {}),
       userId,
       replies,
       ...(requestId ? { requestId } : {}),
@@ -18412,6 +19698,7 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
         body: {
           ok: true,
           chatId,
+          ...(sessionKey ? { sessionKey } : {}),
           userId,
           replies,
           requestId,
@@ -18421,16 +19708,19 @@ async function handleLocalBridgeHttpRequest(req: IncomingMessage, res: ServerRes
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logWarn(`Local bridge error: ${message}`);
+    const isQueueOverflow = error instanceof IncomingQueueOverflowError;
     const payloadError = {
       ok: false,
       error: message,
       ...(requestId ? { requestId } : {}),
     };
-    writeJsonResponse(res, 500, payloadError);
-    observability.increment("bridge.http.message.error");
+    writeJsonResponse(res, isQueueOverflow ? 429 : 500, payloadError);
+    observability.increment("bridge.http.message.error", 1, {
+      kind: isQueueOverflow ? "queue_overflow" : "generic",
+    });
     if (requestId) {
       idempotency.save(chatId, requestId, {
-        statusCode: 500,
+        statusCode: isQueueOverflow ? 429 : 500,
         body: payloadError,
       });
     }
@@ -18477,6 +19767,11 @@ bot.on("message:text", async (ctx) => {
   if (ctx.message.text.trim().startsWith("/")) {
     return;
   }
+  upsertSessionRouteMapping({
+    sessionKey: `telegram:chat:${ctx.chat.id}`,
+    chatId: ctx.chat.id,
+    source: "telegram:message",
+  });
   const replied = (ctx.message as { reply_to_message?: Record<string, unknown> }).reply_to_message;
   const repliedTextRaw =
     replied && typeof replied === "object"
@@ -18500,28 +19795,36 @@ bot.on("message:text", async (ctx) => {
     return typeof firstName === "string" ? firstName : "";
   })();
 
-  await runInIncomingQueue({
-    chatId: ctx.chat.id,
-    source: "telegram:message",
-    executor: async () =>
-      handleIncomingTextMessage({
-        ctx,
-        text: ctx.message.text,
-        source: "telegram:message",
-        userId: ctx.from?.id,
-        persistUserTurn: true,
-        allowSlashPrefix: false,
-        ...(repliedTextRaw.trim()
-          ? {
-              replyReference: {
-                ...(typeof repliedMessageId === "number" ? { messageId: repliedMessageId } : {}),
-                ...(repliedFromName.trim() ? { fromName: repliedFromName.trim() } : {}),
-                text: repliedTextRaw.trim(),
-              },
-            }
-          : {}),
-      }),
-  });
+  try {
+    await runInIncomingQueue({
+      chatId: ctx.chat.id,
+      source: "telegram:message",
+      executor: async () =>
+        handleIncomingTextMessage({
+          ctx,
+          text: ctx.message.text,
+          source: "telegram:message",
+          userId: ctx.from?.id,
+          persistUserTurn: true,
+          allowSlashPrefix: false,
+          ...(repliedTextRaw.trim()
+            ? {
+                replyReference: {
+                  ...(typeof repliedMessageId === "number" ? { messageId: repliedMessageId } : {}),
+                  ...(repliedFromName.trim() ? { fromName: repliedFromName.trim() } : {}),
+                  text: repliedTextRaw.trim(),
+                },
+              }
+            : {}),
+        }),
+    });
+  } catch (error) {
+    if (error instanceof IncomingQueueOverflowError) {
+      await ctx.reply(`Sistema ocupado: ${error.message}. Reintentá en unos segundos.`);
+      return;
+    }
+    throw error;
+  }
 });
 
 bot.catch((error) => {

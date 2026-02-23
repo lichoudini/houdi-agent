@@ -50,15 +50,24 @@ function stripJsonCodeFence(raw: string): string {
 }
 
 const ShellPlanSchema = z.object({
-  action: z.enum(["reply", "exec"]),
+  action: z.enum(["reply", "exec", "exec_sequence"]),
   reply: z.string().optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
+  commands: z
+    .array(
+      z.object({
+        command: z.string(),
+        args: z.array(z.string()).optional(),
+      }),
+    )
+    .optional(),
 });
 
 export type ShellPlan =
   | { action: "reply"; reply: string }
-  | { action: "exec"; command: string; args: string[]; reply?: string };
+  | { action: "exec"; command: string; args: string[]; reply?: string }
+  | { action: "exec_sequence"; commands: Array<{ command: string; args: string[] }>; reply?: string };
 
 const PROMPT_ESCAPE_MAP: Record<string, string> = {
   "&": "&amp;",
@@ -172,9 +181,10 @@ function buildShellSystemPrompt(context?: PromptContextSnapshot): string {
     "",
     "## Modo Shell",
     "Devuelve SOLO JSON válido, sin texto extra.",
-    'Schema exacto: {"action":"reply"|"exec","reply?":"string","command?":"string","args?":["string"]}.',
+    'Schema exacto: {"action":"reply"|"exec"|"exec_sequence","reply?":"string","command?":"string","args?":["string"],"commands?":[{"command":"string","args?":["string"]}]}.',
     'Usa action="reply" cuando no sea necesario ejecutar comandos.',
     'Usa action="exec" solo con un comando de la allowlist.',
+    'Usa action="exec_sequence" solo cuando se necesiten entre 2 y 5 comandos simples en secuencia.',
     "Nunca uses pipes, redirecciones, subshell, ni operadores de shell.",
     "Si la instrucción es ambigua o insegura, devuelve action=reply y pide precisión.",
   ].join("\n");
@@ -425,6 +435,45 @@ export class OpenAiService {
       return {
         action: "reply",
         reply: parsed.reply?.trim() || "No hace falta ejecutar comandos para responder eso.",
+      };
+    }
+
+    if (parsed.action === "exec_sequence") {
+      const commands = (parsed.commands ?? [])
+        .map((item) => ({
+          command: item.command.trim().toLowerCase(),
+          args: (item.args ?? [])
+            .map((arg) => arg.trim())
+            .filter((arg) => arg.length > 0)
+            .filter((arg) => !arg.includes("\n"))
+            .slice(0, 20),
+        }))
+        .filter((item) => item.command.length > 0)
+        .slice(0, 5);
+
+      if (commands.length < 2) {
+        return {
+          action: "reply",
+          reply: parsed.reply?.trim() || "La secuencia propuesta no es válida (mínimo 2 comandos).",
+        };
+      }
+
+      for (const item of commands) {
+        if (!/^[a-z0-9._-]+$/.test(item.command)) {
+          return { action: "reply", reply: `Comando inválido propuesto por IA: ${item.command}` };
+        }
+        if (!allowed.includes(item.command)) {
+          return {
+            action: "reply",
+            reply: `Comando no permitido por el agente: ${item.command}. Permitidos: ${allowedDisplay}`,
+          };
+        }
+      }
+
+      return {
+        action: "exec_sequence",
+        commands,
+        ...(parsed.reply?.trim() ? { reply: parsed.reply.trim() } : {}),
       };
     }
 

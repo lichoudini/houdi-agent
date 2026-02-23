@@ -1,0 +1,20 @@
+{"text":"Todos los dias 9am ejecutar lista lim","expected_detected":true,"expected_domain":"lim","expected_daily":true}
+{"text":"Cada dia a las 08:30 buscar en web noticias de inteligencia artificial","expected_detected":true,"expected_domain":"web","expected_daily":true}
+{"text":"Mañana a las 10 consultar archivo workspace/reportes/ventas.txt","expected_detected":true,"expected_domain":"workspace","expected_daily":false}
+{"text":"En 2 horas enviar correo a nazareno.tomaselli@vrand.biz con resumen de noticias","expected_detected":true,"expected_domain":"gmail","expected_daily":false}
+{"text":"Programa para hoy 18 ejecutar /status","expected_detected":true,"expected_domain":"command","expected_daily":false}
+{"text":"Agenda todos los días a las 9 revisar carpeta workspace/images","expected_detected":true,"expected_domain":"workspace","expected_daily":true}
+{"text":"Recordame mañana 11 comprar panchos","expected_detected":false,"expected_domain":null,"expected_daily":false}
+{"text":"En 30 minutos buscar noticias de cripto en web","expected_detected":true,"expected_domain":"web","expected_daily":false}
+{"text":"Todos los días 07:00 enviar mail con pendientes","expected_detected":true,"expected_domain":"gmail","expected_daily":true}
+{"text":"Mañana 9 ejecutar comando lista lim","expected_detected":true,"expected_domain":"lim","expected_daily":false}
+{"text":"Recordatorio para el lunes 10 llamar al proveedor","expected_detected":false,"expected_domain":null,"expected_daily":false}
+{"text":"Cada día a las 17 consultar workspace/files/clientes.txt","expected_detected":true,"expected_domain":"workspace","expected_daily":true}
+{"text":"Pasado mañana 14 buscar en internet novedades de cloudflare","expected_detected":true,"expected_domain":"web","expected_daily":false}
+{"text":"Programar todos los dias 9am que consulte LIM de Juan Perez en account_demo_b_marylin","expected_detected":true,"expected_domain":"lim","expected_daily":true}
+{"text":"En 1 hora ejecutar shell uptime","expected_detected":true,"expected_domain":"command","expected_daily":false}
+{"text":"Mañana a las 8 ver archivo leo...","expected_detected":true,"expected_domain":"workspace","expected_daily":false}
+{"text":"Recordame todos los dias a las 9 tomar agua","expected_detected":false,"expected_domain":null,"expected_daily":true}
+{"text":"Todos los días 10 enviar correo con noticias de IA","expected_detected":true,"expected_domain":"gmail","expected_daily":true}
+{"text":"En 45 minutos lista lim","expected_detected":true,"expected_domain":"lim","expected_daily":false}
+{"text":"Esta tarde revisar internet por novedades de openai","expected_detected":true,"expected_domain":"web","expected_daily":false}

@@ -1,0 +1,100 @@
+{"text":"recordame manana 9am pagar expensas","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"agendame para hoy 18:30 llamar a juan","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"programa un recordatorio en 20 minutos para revisar mails","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"crear tarea para el lunes: enviar presupuesto","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"eliminar tsk-mlz4df9a","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"borrar id_tsk-mlz4df9a","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"editar tsk_mlz... cambiar hora a 10am","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"listar tareas pendientes","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"mostrame la agenda de hoy","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"pasar tsk-abc123 para manana a las 8","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"reprograma tsk_mlz... para el viernes","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"crear tarea diaria: lista lim a las 9am","finalHandler":"schedule","source":"intent-debug-100"}
+{"text":"crear archivo pino.txt con un poema","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"editar leo... con otro poema","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"en archivo leo... escribir otro poema","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"abrir /img... y listar archivos","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"eliminar mag... del workspace","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"mover clientes.csv a archivados/clientes.csv","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"renombrar cabeza.txt a cabeza-v2.txt","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"leer infogr... del directorio actual","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"enviame mag... por telegram","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"crear carpeta /images/nuevo","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"borrar contenido de /tmp... sin borrar carpeta","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"escribir en pino.txt una linea nueva","finalHandler":"workspace","source":"intent-debug-100"}
+{"text":"enviar correo a ops@houdiagent.com con asunto estado diario","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"mandar mail a naza con resumen comercial","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"responder el ultimo correo de carla","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"leer inbox de gmail","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"busca ultimo mail de factura y resumilo","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"enviar email a juan@empresa.com con el reporte","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"redacta correo para clientes con promo de marzo","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"reenviar el ultimo correo a finanzas@empresa.com","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"mandar un correo con las ultimas noticias crypto a naza","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"che enviar mail a soporte@houdiagent.com","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"listar mis correos no leidos","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"escribi un email para ventas@empresa.com con seguimiento","finalHandler":"gmail","source":"intent-debug-100"}
+{"text":"agrega destinatario carla ops@houdiagent.com","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"guardar contacto naza nazareno.tomaselli@vrand.biz para gmail","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"listar destinatarios de correo","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"elimina destinatario sofia","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"actualizar destinatario carla con mail nuevo","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"crear destinatario finanzas finanzas@empresa.com","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"agenda de contactos de gmail","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"busca contacto naza en destinatarios","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"borra contacto de gmail llamado compras","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"agrega contacto para gmail: legal legal@empresa.com","finalHandler":"gmail-recipients","source":"intent-debug-100"}
+{"text":"buscar en web ultimas noticias de bitcoin","finalHandler":"web","source":"intent-debug-100"}
+{"text":"revisa reddit sobre n8n y resumilo","finalHandler":"web","source":"intent-debug-100"}
+{"text":"abrir https://cloudflare.com y contar novedades","finalHandler":"web","source":"intent-debug-100"}
+{"text":"ultimas noticias de boca juniors hoy","finalHandler":"web","source":"intent-debug-100"}
+{"text":"investiga precios actuales de dominio .ai","finalHandler":"web","source":"intent-debug-100"}
+{"text":"buscar informacion sobre SPF DMARC DKIM","finalHandler":"web","source":"intent-debug-100"}
+{"text":"navega y compara 3 proveedores de email transaccional","finalHandler":"web","source":"intent-debug-100"}
+{"text":"que paso hoy con openai en las noticias","finalHandler":"web","source":"intent-debug-100"}
+{"text":"buscame tutorial oficial de cloudflared tunnel","finalHandler":"web","source":"intent-debug-100"}
+{"text":"consulta clima actual en buenos aires","finalHandler":"web","source":"intent-debug-100"}
+{"text":"inicia lim","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"detener lim ahora","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"reinicia el conector lim","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"estado del conector lim","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"arranca el tunnel de lim","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"detener cloudflared de lim","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"consulta lim first_name juan","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"buscar mensajes en lim del ultimo dia","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"trae mensajes de contacto en lim","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"lim: sincronizar mensajes pendientes","finalHandler":"lim","source":"intent-debug-100"}
+{"text":"reinicia el agente","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"actualiza el repositorio de houdi-agent","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"estado del servicio houdi-agent","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"crear skill para parsing de tareas","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"sumar habilidad para intents de argentina","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"eliminar skill vieja de pruebas","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"hacer pull y rebuild del bot","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"mostrame version actual del agente","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"reinstalar servicio del bot","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"diagnosticar logs del agente y corregir","finalHandler":"self-maintenance","source":"intent-debug-100"}
+{"text":"leer documento contrato.pdf y resumir","finalHandler":"document","source":"intent-debug-100"}
+{"text":"analiza este archivo docx de propuesta","finalHandler":"document","source":"intent-debug-100"}
+{"text":"que dice el pdf adjunto","finalHandler":"document","source":"intent-debug-100"}
+{"text":"extrae texto de informe.docx","finalHandler":"document","source":"intent-debug-100"}
+{"text":"resumi el contrato en 5 puntos","finalHandler":"document","source":"intent-debug-100"}
+{"text":"abrir documento balance-2025.pdf","finalHandler":"document","source":"intent-debug-100"}
+{"text":"analizar archivo /workspace/docs/plan.pdf","finalHandler":"document","source":"intent-debug-100"}
+{"text":"leer el contenido del documento enviado","finalHandler":"document","source":"intent-debug-100"}
+{"text":"interpretar el pdf y listar riesgos","finalHandler":"document","source":"intent-debug-100"}
+{"text":"hacer resumen ejecutivo del doc adjunto","finalHandler":"document","source":"intent-debug-100"}
+{"text":"abrir el doc y detectar fechas clave","finalHandler":"document","source":"intent-debug-100"}
+{"text":"analizar esta imagen adjunta del ticket","finalHandler":"document","source":"intent-debug-100"}
+{"text":"te acordas de lo que hablamos ayer de cloudflare","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"recordas mi preferencia de usar html puro","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"busca en memoria que dijimos sobre tsk","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"que recuerdas sobre vrandserver","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"acordate de que uso espanol rioplatense","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"guardate que tsk siempre refiere a tareas","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"mostrame memoria reciente del chat","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"recupera contexto de la ultima sesion","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"memoria: que intenciones falle ayer","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"consulta memoria de instrucciones del usuario","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"recordame que no uso wordpress","finalHandler":"memory","source":"intent-debug-100"}
+{"text":"te acuerdas del token del tunnel","finalHandler":"memory","source":"intent-debug-100"}

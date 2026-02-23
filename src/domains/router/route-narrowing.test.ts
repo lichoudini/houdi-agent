@@ -222,3 +222,42 @@ test("route layers priorizan self-maintenance para crear habilidad", () => {
   assert.equal(decision.exhausted, false);
   assert.deepEqual(decision.allowed, ["self-maintenance"]);
 });
+
+test("route layers priorizan schedule cuando hay referencia tsk en delete", () => {
+  const decision = applyIntentRouteLayers(["schedule", "workspace", "document"], {
+    normalizedText: "eliminar tsk-mlz7y5a9-t7qltx",
+    hasMailContext: false,
+    hasMemoryRecallCue: false,
+    indexedListKind: null,
+    hasPendingWorkspaceDelete: false,
+  });
+  assert.ok(decision);
+  assert.equal(decision.strict, true);
+  assert.deepEqual(decision.allowed, ["schedule"]);
+});
+
+test("context filter prioriza schedule para eliminar tsk parcial", () => {
+  const decision = buildIntentRouterContextFilter(
+    {
+      chatId: 1,
+      text: "Eliminar tsk-ml...",
+      candidates: ["schedule", "workspace", "document"],
+      hasMailContext: false,
+      hasMemoryRecallCue: false,
+    },
+    {
+      normalizeIntentText: (text) => text.toLowerCase().trim(),
+      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
+      getIndexedListContext: () => null,
+      getPendingWorkspaceDelete: () => null,
+      getPendingWorkspaceDeletePath: () => null,
+      getLastGmailResultsCount: () => 0,
+      getLastListedFilesCount: () => 0,
+      getLastLimContextAt: () => 0,
+      limContextTtlMs: 60_000,
+    },
+  );
+  assert.ok(decision);
+  assert.equal(decision?.strict, true);
+  assert.deepEqual(decision?.allowed, ["schedule"]);
+});

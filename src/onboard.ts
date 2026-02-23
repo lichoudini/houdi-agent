@@ -44,7 +44,7 @@ const ANSI_GREEN = "\x1b[32m";
 const ANSI_YELLOW = "\x1b[33m";
 const ANSI_RED = "\x1b[31m";
 const ANSI_BOLD = "\x1b[1m";
-const VRAND_GRADIENT = [
+const HOUDI_GRADIENT = [
   "\x1b[38;5;17m",
   "\x1b[38;5;18m",
   "\x1b[38;5;19m",
@@ -54,73 +54,73 @@ const VRAND_GRADIENT = [
   "\x1b[38;5;33m",
   "\x1b[38;5;39m",
 ];
-const VRAND_QUOTE =
-  "The currents before us are ever changing. We must adapt and press forward if we are to see our journey's end.";
+const HOUDI_QUOTE =
+  "Las corrientes frente a nosotros cambian constantemente. Debemos adaptarnos, avanzar, para llegar al destino.";
 
-function buildVrandAsciiLines(): string[] {
+function buildHoudiAsciiLines(): string[] {
   // 8-line ASCII banner (height fixed at 8), thicker body.
-  const v = [
-    "VVVVVV        VVVVVV",
-    " VVVVVV      VVVVVV ",
-    "  VVVVVV    VVVVVV  ",
-    "   VVVVVV  VVVVVV   ",
-    "    VVVVVVVVVVVV    ",
-    "     VVVVVVVVVV     ",
-    "      VVVVVVVV      ",
-    "       VVVVVV       ",
+  const h = [
+    "HHHH      HHHH",
+    "HHHH      HHHH",
+    "HHHH      HHHH",
+    "HHHHHHHHHHHHHH",
+    "HHHHHHHHHHHHHH",
+    "HHHH      HHHH",
+    "HHHH      HHHH",
+    "HHHH      HHHH",
   ];
-  const r = [
-    "RRRRRRRRRRRR ",
-    "RRRRRRRRRRRRR",
-    "RRRR      RRR",
-    "RRRR      RRR",
-    "RRRRRRRRRRRRR",
-    "RRRRRRRRRRRR ",
-    "RRRR   RRRRR ",
-    "RRRR    RRRRR",
+  const o = [
+    "  OOOOOOOOOO  ",
+    " OOOO    OOOO ",
+    "OOOO      OOOO",
+    "OOOO      OOOO",
+    "OOOO      OOOO",
+    "OOOO      OOOO",
+    " OOOO    OOOO ",
+    "  OOOOOOOOOO  ",
   ];
-  const a = [
-    "    AAAAAAAA    ",
-    "   AAAA  AAAA   ",
-    "  AAAA    AAAA  ",
-    " AAAAAAAAAAAAAA ",
-    " AAAAAAAAAAAAAA ",
-    " AAAA      AAAA ",
-    " AAAA      AAAA ",
-    " AAAA      AAAA ",
-  ];
-  const n = [
-    "NNNN      NNNN",
-    "NNNNN     NNNN",
-    "NNNNNN    NNNN",
-    "NNNN NNN  NNNN",
-    "NNNN  NNN NNNN",
-    "NNNN   NNNNNNN",
-    "NNNN    NNNNNN",
-    "NNNN      NNNN",
+  const u = [
+    "UUUU      UUUU",
+    "UUUU      UUUU",
+    "UUUU      UUUU",
+    "UUUU      UUUU",
+    "UUUU      UUUU",
+    "UUUU      UUUU",
+    " UUUU    UUUU ",
+    "  UUUUUUUUUU  ",
   ];
   const d = [
-    "DDDDDDDDDDD  ",
-    "DDDDDDDDDDDD ",
-    "DDDD     DDDD",
-    "DDDD      DDD",
-    "DDDD      DDD",
-    "DDDD      DDD",
-    "DDDD     DDDD",
-    "DDDDDDDDDDDD ",
+    "DDDDDDDDDDDD  ",
+    "DDDDDDDDDDDDD ",
+    "DDDD      DDDD",
+    "DDDD       DDD",
+    "DDDD       DDD",
+    "DDDD      DDDD",
+    "DDDDDDDDDDDDD ",
+    "DDDDDDDDDDDD  ",
+  ];
+  const iLetter = [
+    "IIIIIIIIIIII",
+    "    IIII    ",
+    "    IIII    ",
+    "    IIII    ",
+    "    IIII    ",
+    "    IIII    ",
+    "    IIII    ",
+    "IIIIIIIIIIII",
   ];
   const lines: string[] = [];
-  for (let i = 0; i < 8; i += 1) {
-    lines.push(`${v[i]}  ${r[i]}  ${a[i]}  ${n[i]}  ${d[i]}`);
+  for (let idx = 0; idx < 8; idx += 1) {
+    lines.push(`${h[idx]}  ${o[idx]}  ${u[idx]}  ${d[idx]}  ${iLetter[idx]}`);
   }
   return lines;
 }
 
-function printVrandWelcomeBanner(): void {
-  const lines = buildVrandAsciiLines();
-  const output = lines.map((line, index) => `${VRAND_GRADIENT[index] ?? ANSI_LIGHT_BLUE}${line}${ANSI_RESET}`).join("\n");
+function printHoudiWelcomeBanner(): void {
+  const lines = buildHoudiAsciiLines();
+  const output = lines.map((line, index) => `${HOUDI_GRADIENT[index] ?? ANSI_LIGHT_BLUE}${line}${ANSI_RESET}`).join("\n");
   process.stdout.write(`${output}\n`);
-  process.stdout.write(`${ANSI_LIGHT_BLUE}${VRAND_QUOTE}${ANSI_RESET}\n\n`);
+  process.stdout.write(`${ANSI_LIGHT_BLUE}${HOUDI_QUOTE}${ANSI_RESET}\n\n`);
 }
 
 function printHeading(title: string): void {
@@ -617,7 +617,7 @@ async function main(): Promise<void> {
     terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
   });
 
-  printVrandWelcomeBanner();
+  printHoudiWelcomeBanner();
   printHeading("Houdi Onboarding Wizard");
   process.stdout.write("Instalador guiado para dejar tu instancia lista y operativa.\n");
   process.stdout.write("Este agente puede operar con permisos altos según agente/entorno.\n\n");

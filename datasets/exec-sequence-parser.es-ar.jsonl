@@ -1,0 +1,7 @@
+{"text":"git fetch && git pull","expected_count":2,"expected_sequence":["git fetch","git pull"]}
+{"text":"systemctl --user restart lim-app.service; systemctl --user restart lim-tunnel.service","expected_count":2,"expected_sequence":["systemctl --user restart lim-app.service","systemctl --user restart lim-tunnel.service"]}
+{"text":"npm run build","expected_count":1,"expected_sequence":["npm run build"]}
+{"text":"echo 'a;b' && echo \"x&&y\"","expected_count":2,"expected_sequence":["echo 'a;b'","echo \"x&&y\""]}
+{"text":"pwd\nls -la\nwhoami","expected_count":3,"expected_sequence":["pwd","ls -la","whoami"]}
+{"text":"git status ; ; npm test","expected_count":2,"expected_sequence":["git status","npm test"]}
+{"text":"","expected_count":0,"expected_sequence":[]}

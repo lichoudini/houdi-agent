@@ -106,6 +106,13 @@ export type StoredGlobalRuntimeSettings = {
   updatedAtMs: number;
 };
 
+export type StoredSessionRoute = {
+  sessionKey: string;
+  chatId: number;
+  source: string;
+  updatedAtMs: number;
+};
+
 export class SqliteStateStore {
   private readonly dbPath: string;
   private db: DatabaseSync | null = null;
@@ -240,6 +247,15 @@ export class SqliteStateStore {
         panic_mode INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS session_routes (
+        session_key TEXT PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_routes_chat ON session_routes(chat_id, updated_at_ms DESC);
+      CREATE INDEX IF NOT EXISTS idx_session_routes_updated ON session_routes(updated_at_ms DESC);
     `);
     this.ensureOutboxSchema();
   }
@@ -905,5 +921,82 @@ export class SqliteStateStore {
       panicMode: Number(row.panic_mode ?? 0) === 1,
       updatedAtMs: Number(row.updated_at_ms ?? 0),
     };
+  }
+
+  upsertSessionRoute(route: StoredSessionRoute): void {
+    const db = this.ensureDb();
+    db.prepare(
+      `
+      INSERT INTO session_routes (session_key, chat_id, source, updated_at_ms)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET
+        chat_id = excluded.chat_id,
+        source = excluded.source,
+        updated_at_ms = excluded.updated_at_ms
+    `,
+    ).run(route.sessionKey, route.chatId, route.source, route.updatedAtMs);
+  }
+
+  getSessionRouteByKey(sessionKey: string): StoredSessionRoute | null {
+    const db = this.ensureDb();
+    const row = db
+      .prepare(
+        `
+      SELECT session_key, chat_id, source, updated_at_ms
+      FROM session_routes
+      WHERE session_key = ?
+    `,
+      )
+      .get(sessionKey) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      sessionKey: String(row.session_key ?? ""),
+      chatId: Number(row.chat_id ?? 0),
+      source: String(row.source ?? ""),
+      updatedAtMs: Number(row.updated_at_ms ?? 0),
+    };
+  }
+
+  listSessionRoutesByChat(chatId: number, limit = 20): StoredSessionRoute[] {
+    const db = this.ensureDb();
+    const rows = db
+      .prepare(
+        `
+      SELECT session_key, chat_id, source, updated_at_ms
+      FROM session_routes
+      WHERE chat_id = ?
+      ORDER BY updated_at_ms DESC
+      LIMIT ?
+    `,
+      )
+      .all(chatId, Math.max(1, Math.min(200, Math.floor(limit)))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      sessionKey: String(row.session_key ?? ""),
+      chatId: Number(row.chat_id ?? 0),
+      source: String(row.source ?? ""),
+      updatedAtMs: Number(row.updated_at_ms ?? 0),
+    }));
+  }
+
+  listSessionRoutes(limit = 500): StoredSessionRoute[] {
+    const db = this.ensureDb();
+    const rows = db
+      .prepare(
+        `
+      SELECT session_key, chat_id, source, updated_at_ms
+      FROM session_routes
+      ORDER BY updated_at_ms DESC
+      LIMIT ?
+    `,
+      )
+      .all(Math.max(1, Math.min(10_000, Math.floor(limit)))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      sessionKey: String(row.session_key ?? ""),
+      chatId: Number(row.chat_id ?? 0),
+      source: String(row.source ?? ""),
+      updatedAtMs: Number(row.updated_at_ms ?? 0),
+    }));
   }
 }

@@ -96,6 +96,30 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   const hasSendNoun = /\b(archivo|archivos|documento|documentos|file|files|pdf|imagen|imagenes|foto|fotos)\b/.test(
     normalized,
   );
+  const extractExplicitPathHint = (rawSegment: string): string => {
+    const cleaned = deps.cleanWorkspacePathPhrase(rawSegment);
+    if (!cleaned) {
+      return "";
+    }
+    const singleToken = cleaned.split(/\s+/).filter(Boolean);
+    if (singleToken.length !== 1) {
+      return "";
+    }
+    const token = singleToken[0] ?? "";
+    if (/@/.test(token)) {
+      return "";
+    }
+    if (token.includes("/")) {
+      return token;
+    }
+    if (/\.{2,}/.test(token)) {
+      return token;
+    }
+    if (/\.[a-z0-9]{1,12}$/i.test(token)) {
+      return token;
+    }
+    return "";
+  };
   const hasFileLikeToken = /\b[\w./\\-]+\.[a-z0-9]{2,8}\b/i.test(original);
   const defaultSelectorScope = deps.pickFirstNonEmpty(explicitWorkspacePath, fromFolderPhrase);
   const hasWorkspaceFileContext =
@@ -122,32 +146,65 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   );
   const deletePhrase = deletePhraseMatch?.[1] ?? "";
   const deletePathCandidate = deps.extractWorkspaceDeletePathCandidate(deletePhrase);
+  const explicitDeletePathHint = extractExplicitPathHint(deletePhrase);
   const deleteExtensions = deps.extractWorkspaceDeleteExtensions(deletePhrase || original);
   const deleteContentsOfPath = deps.extractWorkspaceDeleteContentsPath(deletePhrase || original);
   const hasExplicitContentMarker =
     /\b(?:con(?:tenido)?|contenido|texto|body|data|datos)\s*(?::|=)\s*/i.test(original) ||
     rawQuotedSegments.length >= 2 ||
     /\n/.test(original);
+  const editPathMatch = original.match(/\b(?:editar|modific\w*|actualiz\w*|complet\w*|agreg\w*|anex\w*)\s+([^\s"'`]+)/i);
+  const inPathWriteMatch = original.match(
+    /\b(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?(?:archivo|documento)?\s*([^\s"'`]+)\s+(?:escrib\w*|redact\w*|guard\w*|agreg\w*|anex\w*)\b/i,
+  );
+  const explicitWritePathHint = deps.pickFirstNonEmpty(
+    extractExplicitPathHint(editPathMatch?.[1] ?? ""),
+    extractExplicitPathHint(inPathWriteMatch?.[1] ?? ""),
+  );
+  const writeInlineContentHint = deps.pickFirstNonEmpty(
+    original.match(/\b(?:editar|modific\w*|actualiz\w*|complet\w*|agreg\w*|anex\w*)\s+[^\s"'`]+\s+con\s+(.+)$/i)?.[1],
+    original.match(
+      /\b(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?(?:archivo|documento)?\s*[^\s"'`]+\s+(?:escrib\w*|redact\w*|guard\w*|agreg\w*|anex\w*)\s+(.+)$/i,
+    )?.[1],
+  );
   const writeTargetHint = deps.pickFirstNonEmpty(
     quoted[0],
     explicitWorkspacePath,
+    explicitWritePathHint,
     explicitNamedPath,
     fileLikePath,
     fromFilePhrase,
   );
+  const resolveWriteTargetPath = (rawTargetPath: string, extensionHint?: string): string => {
+    const hinted = deps.resolveWorkspaceWritePathWithHint(rawTargetPath, extensionHint);
+    if (hinted) {
+      return hinted;
+    }
+    const normalizedTarget = deps.normalizeWorkspaceRelativePath(rawTargetPath);
+    if (!normalizedTarget) {
+      return "";
+    }
+    // Keep fuzzy placeholders (eg: "mag..") so runtime autocompletion can resolve
+    // to an existing workspace file instead of forcing an auto-generated filename.
+    if (/\.{2,}$/.test(normalizedTarget) || deps.looksLikeWorkspacePathCandidate(normalizedTarget)) {
+      return normalizedTarget;
+    }
+    return "";
+  };
   const shouldPrioritizeWrite =
     Boolean(writeTargetHint) &&
     (hasWriteVerb || hasEditVerb || hasDrawVerb || /\b(?:en|dentro(?:\s+de)?)\s+(?:el\s+)?archivo\b/.test(normalized)) &&
-    hasExplicitContentMarker;
+    (hasExplicitContentMarker || Boolean(writeInlineContentHint));
 
   if (shouldPrioritizeWrite) {
     const formatHint = deps.detectSimpleTextExtensionHint(original);
-    const targetPath = deps.resolveWorkspaceWritePathWithHint(writeTargetHint, formatHint);
+    const targetPath = resolveWriteTargetPath(writeTargetHint, formatHint);
     const content = deps.extractNaturalWorkspaceWriteContent({
       text: original,
       rawQuotedSegments,
       selectedPath: targetPath,
     });
+    const resolvedContent = deps.pickFirstNonEmpty(content, writeInlineContentHint);
     const append =
       /\b(al\s+final|append|anex\w*|agreg\w*)\b/.test(normalized) &&
       !/\b(reemplaz\w*|sobrescrib\w*)\b/.test(normalized);
@@ -155,7 +212,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       shouldHandle: true,
       action: "write",
       ...(targetPath ? { path: targetPath } : {}),
-      ...(typeof content === "string" ? { content } : {}),
+      ...(typeof resolvedContent === "string" ? { content: resolvedContent } : {}),
       ...(append ? { append: true } : {}),
       ...(formatHint ? { formatHint } : {}),
     };
@@ -170,7 +227,8 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       Boolean(explicitWorkspacePath) ||
       quoted.length > 0 ||
       /\bl[oa]s?\b/.test(normalized) ||
-      Boolean(deletePathCandidate))
+      Boolean(deletePathCandidate) ||
+      Boolean(explicitDeletePathHint))
   ) {
     if (deleteContentsOfPath) {
       return {
@@ -194,7 +252,8 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       defaultScopePath: defaultSelectorScope,
       rawQuotedSegments,
     });
-    const targetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, deletePathCandidate);
+    const strictDeleteCandidate = extractExplicitPathHint(deletePathCandidate);
+    const targetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, explicitDeletePathHint, strictDeleteCandidate);
     return {
       shouldHandle: true,
       action: "delete",
@@ -256,12 +315,13 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   if (writeIntent) {
     const formatHint = deps.detectSimpleTextExtensionHint(original);
     const rawTargetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, explicitNamedPath, fileLikePath, fromFilePhrase);
-    const targetPath = deps.resolveWorkspaceWritePathWithHint(rawTargetPath, formatHint);
+    const targetPath = resolveWriteTargetPath(rawTargetPath, formatHint);
     const content = deps.extractNaturalWorkspaceWriteContent({
       text: original,
       rawQuotedSegments,
       selectedPath: targetPath,
     });
+    const resolvedContent = deps.pickFirstNonEmpty(content, writeInlineContentHint);
     const append =
       /\b(al\s+final|append|anex\w*|agreg\w*)\b/.test(normalized) &&
       !/\b(reemplaz\w*|sobrescrib\w*)\b/.test(normalized);
@@ -269,7 +329,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       shouldHandle: true,
       action: "write",
       ...(targetPath ? { path: targetPath } : {}),
-      ...(typeof content === "string" ? { content } : {}),
+      ...(typeof resolvedContent === "string" ? { content: resolvedContent } : {}),
       ...(append ? { append: true } : {}),
       ...(formatHint ? { formatHint } : {}),
     };
@@ -346,13 +406,25 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
   if (
     hasSendVerb &&
     !hasMailContext &&
-    (hasSendNoun || hasFileLikeToken || hasWorkspaceWord || quoted.length > 0 || Boolean(explicitWorkspacePath))
+    (hasSendNoun ||
+      hasFileLikeToken ||
+      hasWorkspaceWord ||
+      quoted.length > 0 ||
+      Boolean(explicitWorkspacePath) ||
+      Boolean(extractExplicitPathHint(original.match(
+        /\b(?:enviar|envia|enviame|enviame|mandar|manda|mandame|pasar|pasa|compartir|comparte|adjuntar|adjunta|subir|sube)\s+(.+)$/iu,
+      )?.[1] ?? "")))
   ) {
     const phraseMatch = original.match(
       /\b(?:enviar|envia|enviame|enviame|mandar|manda|mandame|pasar|pasa|compartir|comparte|adjuntar|adjunta|subir|sube)\s+(.+)$/iu,
     );
     const fileIndex = deps.parseWorkspaceFileIndexReference(original) ?? undefined;
-    const targetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, deps.cleanWorkspacePathPhrase(phraseMatch?.[1] ?? ""));
+    const explicitSendPathHint = extractExplicitPathHint(phraseMatch?.[1] ?? "");
+    const targetPath = deps.pickFirstNonEmpty(
+      quoted[0],
+      explicitWorkspacePath,
+      explicitSendPathHint,
+    );
     return {
       shouldHandle: true,
       action: "send",

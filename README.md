@@ -67,12 +67,24 @@ Instalador recomendado (entrypoint único):
 ./scripts/install-houdi-agent.sh
 ```
 
+Ayuda rápida del instalador:
+
+```bash
+./scripts/install-houdi-agent.sh --help
+```
+
 Modo automatizado (sin preguntas, ideal para provisionado):
 
 ```bash
 TELEGRAM_BOT_TOKEN="<token>" TELEGRAM_ALLOWED_USER_IDS="123456789" \
 ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user --install-deps --build
 ```
+
+Notas de operación del instalador:
+
+- En `--yes`, valida antes de arrancar que existan `TELEGRAM_BOT_TOKEN` y `TELEGRAM_ALLOWED_USER_IDS` (por env o `.env`).
+- Si falla onboarding, el instalador muestra pasos de recuperación accionables.
+- Requiere `Node.js >= 22`.
 
 Alias:
 
@@ -194,6 +206,13 @@ cp .env.example .env
 - `HOUDI_LOCAL_API_HOST` (default: `127.0.0.1`)
 - `HOUDI_LOCAL_API_PORT` (default: `3210`)
 - `HOUDI_LOCAL_API_TOKEN` (opcional, exige `Authorization: Bearer`)
+- `HOUDI_INCOMING_QUEUE_MAX_PER_CHAT` (default: `30`, backpressure por chat)
+- `HOUDI_INCOMING_QUEUE_MAX_TOTAL` (default: `400`, backpressure global)
+- `HOUDI_HANDLER_TIMEOUT_MS` (default: `45000`, timeout por handler natural)
+- `HOUDI_HANDLER_CIRCUIT_BREAKER_FAILURES` (default: `3`, fallas para abrir circuito)
+- `HOUDI_HANDLER_CIRCUIT_BREAKER_OPEN_MS` (default: `60000`, tiempo de circuito abierto)
+- `HOUDI_TRANSIENT_RETRY_ATTEMPTS` (default: `3`, reintentos para errores transitorios)
+- `HOUDI_TRANSIENT_RETRY_BASE_MS` (default: `400`, base para backoff+jitter)
 - `SLACK_BOT_TOKEN` (opcional, bridge Slack Socket Mode)
 - `SLACK_APP_TOKEN` (opcional, `xapp-...`, requerido para Socket Mode)
 - `SLACK_BRIDGE_USER_ID` (opcional, userId autorizado de Houdi; si falta usa el primer `TELEGRAM_ALLOWED_USER_IDS`)
@@ -242,6 +261,59 @@ Persistir bridge Slack con systemd --user:
 ./scripts/install-systemd-user-slack-bridge.sh
 ```
 
+## Dataset LATAM rapido (intent router)
+
+Flujo recomendado para ampliar cobertura regional (AR/CL/MX) y validar sin tocar produccion:
+
+1. Generar semilla LATAM:
+
+```bash
+npm run dataset:seed:latam
+```
+
+2. Extraer dataset debil desde ultimos mensajes Telegram (log temporal):
+
+```bash
+npm run dataset:from:last20
+```
+
+Opcional (recomendado): extraer intents reales desde `houdi-audit.log`:
+
+```bash
+npm run dataset:from:audit
+```
+
+3. Preparar merge + dedupe + split train/holdout:
+
+```bash
+node tools/experiments/intent-dataset-prepare.mjs \
+  --inputs=houdi-intent-router-dataset.jsonl,datasets/intent-latam.seed.jsonl,datasets/intent-from-last20.jsonl,datasets/intent-from-audit.jsonl
+```
+
+4. Evaluar holdout:
+
+```bash
+npm run dataset:eval:holdout
+```
+
+5. Optimizar router en dry-run (sin tocar `intent-routes.json`):
+
+```bash
+npm run dataset:optimize:router
+```
+
+Para aplicar cambios de thresholds/negativos al router:
+
+```bash
+npm run dataset:optimize:router -- --apply
+```
+
+Atajos utiles:
+- `npm run dataset:prepare`: usa defaults (base + semilla LATAM).
+- `npm run debug:last20`: muestra resumen rapido de `runtime/telegram-last20.jsonl`.
+- `npm run debug:intent:last20`: muestra ultimas rutas `intent.route` desde `houdi-audit.log`.
+- Salidas por default: `workspace/state/intent-dataset-train.jsonl` y `workspace/state/intent-dataset-holdout.jsonl`.
+
 Requisitos Slack (Socket Mode, inspirado en flujo OpenClaw):
 1. Crear Slack App.
 2. Activar **Socket Mode**.
@@ -265,6 +337,7 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 ## Comandos Telegram
 
 - `/status`
+- `/health`
 - `/doctor`
 - `/usage [topN|reset]`
 - `/model [show|list|set <modelo>|reset]`
@@ -362,6 +435,7 @@ Configuración relacionada:
 
 ## Operación y robustez
 
+- `/health`: salud runtime (cola, circuit-breakers, outbox, SQLite, workspace).
 - `/doctor`: ejecuta chequeos rápidos de runtime, permisos, credenciales y seguridad base.
 - `/usage`: muestra tokens/costo estimado OpenAI acumulado desde que inició el proceso.
 - `/usage reset`: reinicia contadores locales de uso OpenAI.

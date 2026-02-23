@@ -110,3 +110,73 @@ test("workspace files service reports ambiguity for ellipsis placeholder", async
 
   await fs.rm(tempDir, { recursive: true, force: true });
 });
+
+test("workspace files service resolves two-dot placeholder when match is unique", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-twodot-test-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+
+  await service.createWorkspaceDirectory("images");
+  await service.createWorkspaceDirectory("images/events");
+  await service.writeWorkspaceTextFile({
+    relativePath: "images/events/reporte.txt",
+    content: "hola",
+  });
+
+  const resolvedNested = await service.resolveEllipsisPathPlaceholder("imag../eve../repo..");
+  assert.equal(resolvedNested.resolvedPath, "images/events/reporte.txt");
+  assert.equal(resolvedNested.expanded, true);
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+test("workspace files service resolves existing exact candidate", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-exact-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+  await service.createWorkspaceDirectory("docs");
+  await service.writeWorkspaceTextFile({ relativePath: "docs/maggie-simpson.txt", content: "hola" });
+
+  const resolved = await service.resolveExistingPathCandidate("docs/maggie-simpson.txt");
+  assert.equal(resolved.ambiguous, false);
+  assert.equal(resolved.expanded, false);
+  assert.equal(resolved.resolvedPath, "docs/maggie-simpson.txt");
+  assert.deepEqual(resolved.matches, ["docs/maggie-simpson.txt"]);
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+test("workspace files service keeps unresolved for non-exact candidate", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-nonexact-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+  await service.createWorkspaceDirectory("docs");
+  await service.writeWorkspaceTextFile({ relativePath: "docs/maggie.txt", content: "a" });
+  await service.writeWorkspaceTextFile({ relativePath: "docs/magento.txt", content: "b" });
+
+  const resolved = await service.resolveExistingPathCandidate("docs/mag");
+  assert.equal(resolved.ambiguous, false);
+  assert.equal(resolved.expanded, false);
+  assert.equal(resolved.resolvedPath, "docs/mag");
+  assert.deepEqual(resolved.matches, []);
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});

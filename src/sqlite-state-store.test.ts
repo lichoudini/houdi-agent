@@ -96,3 +96,41 @@ test("sqlite state store persists runtime chat/global settings", async () => {
 
   await fs.rm(tempDir, { recursive: true, force: true });
 });
+
+test("sqlite state store upserts and reads session routes", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-sqlite-state-session-"));
+  const dbPath = path.join(tempDir, "state.sqlite");
+  const state = new SqliteStateStore(dbPath);
+  await state.init();
+
+  const now = Date.now();
+  state.upsertSessionRoute({
+    sessionKey: "slack:c123:thread:main",
+    chatId: 51,
+    source: "slack:message",
+    updatedAtMs: now,
+  });
+
+  const byKey = state.getSessionRouteByKey("slack:c123:thread:main");
+  assert.ok(byKey);
+  assert.equal(byKey?.chatId, 51);
+  assert.equal(byKey?.source, "slack:message");
+
+  state.upsertSessionRoute({
+    sessionKey: "slack:c123:thread:main",
+    chatId: 72,
+    source: "slack:app_mention",
+    updatedAtMs: now + 1_000,
+  });
+
+  const updated = state.getSessionRouteByKey("slack:c123:thread:main");
+  assert.ok(updated);
+  assert.equal(updated?.chatId, 72);
+  assert.equal(updated?.source, "slack:app_mention");
+
+  const byChat = state.listSessionRoutesByChat(72, 10);
+  assert.equal(byChat.length, 1);
+  assert.equal(byChat[0]?.sessionKey, "slack:c123:thread:main");
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
