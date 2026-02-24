@@ -9,6 +9,8 @@
     "build": "tsc -p tsconfig.json",
     "check": "npm run test",
     "test": "npm run build && node --test dist/**/*.test.js",
+    "guard:repo": "node scripts/repo-guard.mjs",
+    "hooks:install": "bash scripts/install-git-hooks.sh",
     "start": "node dist/index.js",
     "cli": "tsx src/cli.ts",
     "onboard": "tsx src/onboard.ts",

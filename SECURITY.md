@@ -6,6 +6,8 @@ Si encuentras una vulnerabilidad en Houdi Agent, repórtala en privado al manten
 
 - No expongas el bot a usuarios no autorizados.
 - No publiques `.env`, tokens de Telegram, API keys ni credenciales OAuth.
+- Antes de push al repositorio, ejecuta `npm run guard:repo`.
+- Para enforcement local automático, instala hooks con `npm run hooks:install`.
 - Ejecuta el agente en un host dedicado cuando uses perfil `full-control`.
 - Mantén `HOUDI_LOCAL_API_HOST=127.0.0.1` salvo que tengas una necesidad explícita de red y controles de firewall.
 

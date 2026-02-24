@@ -6,6 +6,8 @@ dist/
 
 # Runtime files
 *.log
+*.sqlite
+*.db
 *.pid
 *.lock
 runtime/
@@ -17,6 +19,8 @@ houdi-interests.json
 houdi-selfskill-drafts.json
 houdi-intent-router-dataset.jsonl
 houdi-recipients.local-*.json
+datasets/
+tools/experiments/
 
 # Local environment and secrets
 .env

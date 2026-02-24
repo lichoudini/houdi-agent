@@ -220,11 +220,14 @@ Si usas servicio de usuario, reemplazar `systemctl` por `systemctl --user`.
 - No commitear tokens/API keys/refresh tokens.
 - Mantener `.env.example` con placeholders.
 - Revisar siempre `git status` antes de push.
+- Ejecutar `npm run guard:repo` antes de cada push.
+- Instalar hook local con `npm run hooks:install`.
 
 ## 10. Checklist antes de compartir
 
 1. `npm run build` sin errores.
-2. Servicio activo y estable.
-3. README actualizado.
-4. `docs/RUNBOOK.md` actualizado.
-5. Sin secretos en archivos versionados.
+2. `npm run guard:repo` sin hallazgos.
+3. Servicio activo y estable.
+4. README actualizado.
+5. `docs/RUNBOOK.md` actualizado.
+6. Sin secretos en archivos versionados.

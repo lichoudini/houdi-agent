@@ -47,6 +47,7 @@ Buenas prácticas mínimas:
 - `docs/INTENT_ROUTER_HARDENING.md`: pipeline, tuning y operación del enrutador de intenciones
 - `docs/RELEASE_NOTES_2026-02-21.md`: cambios funcionales y operativos del release
 - `docs/RELEASE_NOTES_2026-02-23.md`: mejoras de enrutado contextual, modo ECO y UX de comandos
+- `docs/REPO_PUBLISH_GUARD.md`: política y guard automático para push seguro
 
 ## Enfoque de seguridad del MVP
 
@@ -63,6 +64,22 @@ Este proyecto puede operar con privilegios altos si así lo configuras.
 - El operador de la instancia es responsable de dónde se instala, qué usuario lo ejecuta y qué permisos del host concede.
 - Para uso público, no compartas tu `.env`, tokens ni credenciales OAuth.
 - Recomendado: usar un host dedicado para el agente y una cuenta de Telegram exclusiva para operación.
+
+## Publicación segura del repositorio
+
+Antes de cada push:
+
+```bash
+npm run guard:repo
+```
+
+Para bloquear pushes inseguros automáticamente:
+
+```bash
+npm run hooks:install
+```
+
+Esto instala un `pre-push` que ejecuta el guard y rechaza pushes que incumplen política.
 
 ## Perfiles de Despliegue
 

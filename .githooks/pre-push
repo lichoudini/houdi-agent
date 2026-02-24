@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-push] repo guard"
+npm run guard:repo
+
+echo "[pre-push] ok"
