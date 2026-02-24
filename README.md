@@ -7,7 +7,7 @@ Repositorio oficial:
 - https://github.com/lichoudini/houdi-agent
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Houdi Contributors**
+Autores del repositorio: **Nazareno Tomaselli & Vrand**
 
 ## Posicionamiento y comunicación del proyecto
 

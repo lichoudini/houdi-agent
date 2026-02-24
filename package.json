@@ -1,7 +1,7 @@
 {
   "name": "houdi-agent",
   "version": "0.63b",
-  "author": "Houdi Contributors",
+  "author": "Nazareno Tomaselli & Vrand",
   "private": true,
   "type": "module",
   "scripts": {
