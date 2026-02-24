@@ -1,9 +1,11 @@
 # Houdi Agent - Instalación en Otra PC
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Nazareno Tomaselli & Vrand**
+Autor del repositorio: **licHoudini**  
+Contacto: **lichoudini@houdiagent.com**
 
 Esta guía deja una instalación reproducible para que cualquier persona pueda correr su propia instancia.
+Houdi Agent es un proyecto en desarrollo continuo: se recomienda actualizar con frecuencia para incorporar mejoras de estabilidad y seguridad.
 
 ## 1. Requisitos
 
@@ -13,6 +15,22 @@ Esta guía deja una instalación reproducible para que cualquier persona pueda c
 - User ID de Telegram autorizado.
 - (Opcional) clave de proveedor IA (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` o `GEMINI_API_KEY`).
 - (Opcional) credenciales OAuth de Gmail.
+
+Compatibilidad de entorno:
+
+- Linux/Ubuntu: recomendado para operación diaria.
+- macOS: compatible.
+- Windows: compatible mediante WSL.
+- Recomendación operativa: ejecutar en Docker para reducir diferencias por entorno.
+
+### Recursos oficiales (usuarios inexpertos)
+
+- nvm (Node Version Manager): https://github.com/nvm-sh/nvm
+- Node.js + npm: https://nodejs.org/en/download
+- Guía oficial npm: https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- Git (descarga oficial): https://git-scm.com/downloads
+- Docker Engine (instalación oficial): https://docs.docker.com/engine/install/
+- Cómo clonar un repositorio: https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository
 
 ## 2. Clonar proyecto
 
@@ -127,6 +145,11 @@ Validar desde Telegram:
 6. `/web noticias ia hoy`
 
 Detener con `Ctrl+C` cuando la prueba esté OK.
+
+Nota de canales:
+
+- La referencia de comandos usa sintaxis Telegram (`/comando`).
+- Las mismas capacidades operan en Slack, WhatsApp y CLI con lenguaje natural o sintaxis equivalente según bridge/canal.
 
 ## 6. Instalar servicio persistente
 

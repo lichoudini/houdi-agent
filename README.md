@@ -1,6 +1,6 @@
-# Houdi Agent | El primer Agente IA de LATAM | Whatsapp | Telgram | Slack
+# Houdi Agent | Agente IA para ejecución de tareas en español
 
-Proyecto base desde cero para arrancar un asistente de operación de PC por Whastapp/Telegram/Slack, con una arquitectura simple que puedas escalar.
+Proyecto open source para arrancar un asistente de operación real por WhatsApp/Telegram/Slack, con arquitectura agéntica y enrutadores semánticos que puedes escalar.
 
 Repositorio oficial:
 
@@ -8,7 +8,8 @@ Repositorio oficial:
 - https://houdiagent.com
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Nazareno Tomaselli & Vrand**
+Autor del repositorio: **licHoudini**  
+Contacto: **lichoudini@houdiagent.com**
 
 ## Posicionamiento y comunicación del proyecto
 
@@ -17,6 +18,7 @@ Autores del repositorio: **Nazareno Tomaselli & Vrand**
 - Diferencial operativo: instalación y levantada en un único comando (bot + bridges opcionales).
 - Inspiración de arquitectura: **OpenClaw** + **Aurelio's Semantic Router**.
 - Diferencial: optimización desde el core para interpretar **español operativo** (AR/CL/MX) y casos ambiguos de lenguaje natural.
+- Estado del producto: **proyecto en desarrollo continuo** con mejoras iterativas de interpretación y ejecución.
 - Trabajo recomendado en iteración asistida con **Chat GPT 5.3** para diseño de prompts, pruebas de intención y depuración semántica.
 
 ## Compatibilidad de entorno
@@ -107,6 +109,15 @@ Perfil `moderated` (entorno compartido o más estricto):
 - Tu user ID de Telegram
 - (Opcional) API key de OpenAI, Claude o Gemini para `/ask` y chat libre
 - Para transcripción de audio se requiere OpenAI (`OPENAI_API_KEY`)
+
+### Recursos oficiales para instalación (usuarios nuevos)
+
+- nvm (Node Version Manager): https://github.com/nvm-sh/nvm
+- Node.js + npm: https://nodejs.org/en/download
+- Guía oficial npm: https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- Git (descarga oficial): https://git-scm.com/downloads
+- Docker Engine (instalación oficial): https://docs.docker.com/engine/install/
+- Cómo clonar un repositorio: https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository
 
 ### Soporte IA multi-proveedor
 
@@ -496,7 +507,10 @@ Requisitos WhatsApp Cloud API:
 Importante: ejecuta solo **una instancia** del bot a la vez.
 Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de Telegram polling.
 
-## Comandos Telegram
+## Comandos (referencia con sintaxis Telegram)
+
+Esta lista usa formato `/comando` porque Telegram es el canal principal de referencia.
+Las mismas capacidades se pueden ejecutar también por Slack, WhatsApp y CLI mediante lenguaje natural o sintaxis equivalente según integración.
 
 - `/status`
 - `/health`

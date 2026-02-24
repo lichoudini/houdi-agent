@@ -1,10 +1,11 @@
 # Houdi Agent - Project Overview
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Nazareno Tomaselli & Vrand**
+Autor del repositorio: **licHoudini**
 
 ## Objetivo
-Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a automatizar tareas en una PC Linux con controles de seguridad por capas, auditoría y operación continua.
+Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a automatizar tareas con controles de seguridad por capas, auditoría y operación continua.
+Es un proyecto open source en desarrollo continuo, con foco en ejecución real y lenguaje natural en español.
 
 ## Estado actual (resumen)
 
@@ -70,3 +71,8 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 - Ejecutar como servicio `systemd` (user o system según perfil de despliegue).
 - Mantener secretos fuera de Git (`.env`) y rotar tokens al compartir entornos.
 - Verificar salud con `/status`, `/doctor`, `/metrics` y runbook en `docs/RUNBOOK.md`.
+
+## Nota de canales
+
+- La documentación suele mostrar comandos en formato Telegram (`/comando`) por ser el canal de referencia.
+- La misma capa de capacidades está disponible en Slack, WhatsApp y CLI según integración activa.
