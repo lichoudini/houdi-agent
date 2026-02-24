@@ -131,9 +131,28 @@ function normalizeSkillReference(rawPath) {
   return rawPath.trim().replace(/^["'`]/, "").replace(/["'`]$/, "");
 }
 
+function isSkillReferenceExample(rawPath) {
+  const normalized = rawPath.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+
+  return (
+    normalized.includes("mi-skill") ||
+    normalized.includes("my-skill") ||
+    normalized.includes("<skill") ||
+    normalized.includes("{skill") ||
+    normalized.includes("...") ||
+    normalized.includes("*")
+  );
+}
+
 function validateSkillReference(params) {
   const refRaw = normalizeSkillReference(params.ref);
   if (!refRaw) {
+    return null;
+  }
+  if (isSkillReferenceExample(refRaw)) {
     return null;
   }
 
