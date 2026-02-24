@@ -2,6 +2,7 @@
 
 Versión actual: **0.63b**  
 Autor del repositorio: **licHoudini**
+Licencia: **MIT** (ver `LICENSE`)
 
 ## Objetivo
 Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a automatizar tareas con controles de seguridad por capas, auditoría y operación continua.
@@ -76,3 +77,9 @@ Es un proyecto open source en desarrollo continuo, con foco en ejecución real y
 
 - La documentación suele mostrar comandos en formato Telegram (`/comando`) por ser el canal de referencia.
 - La misma capa de capacidades está disponible en Slack, WhatsApp y CLI según integración activa.
+
+## Agradecimientos explícitos
+
+- OpenClaw.ai
+- Aurelio.ai
+- OpenAI

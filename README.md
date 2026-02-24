@@ -9,6 +9,7 @@ Repositorio oficial:
 
 Versión actual: **0.63b**  
 Autor del repositorio: **licHoudini**  
+Licencia: **MIT** (ver `LICENSE`)
 
 ## Posicionamiento y comunicación del proyecto
 
@@ -51,6 +52,15 @@ Buenas prácticas mínimas:
 - `docs/RELEASE_NOTES_2026-02-23.md`: mejoras de enrutado contextual, modo ECO y UX de comandos
 - `docs/RELEASE_NOTES_2026-02-24.md`: soporte multi-proveedor IA (OpenAI/Claude/Gemini) y mejoras de onboarding
 - `docs/REPO_PUBLISH_GUARD.md`: política y guard automático para push seguro
+- `LICENSE`: licencia open source del proyecto (MIT)
+- `NOTICE.md`: agradecimientos y avisos de marca/afiliación
+- `THIRD_PARTY_NOTICES.md`: avisos de licencias de dependencias de terceros
+
+## Agradecimientos explícitos
+
+- Gracias a **OpenClaw.ai** por inspiración de arquitectura agéntica operativa.
+- Gracias a **Aurelio.ai** por inspiración en patrones de semantic routing.
+- Gracias a **OpenAI** por capacidades fundacionales de API utilizadas en el proyecto.
 
 ## Enfoque de seguridad del MVP
 

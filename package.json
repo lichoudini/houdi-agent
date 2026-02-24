@@ -1,7 +1,8 @@
 {
   "name": "houdi-agent",
   "version": "0.63b",
-  "author": "Nazareno Tomaselli & Vrand",
+  "author": "licHoudini",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
