@@ -1,0 +1,4 @@
+interface:
+  display_name: "Houdi Agent"
+  short_description: "Instala y opera Houdi Agent en Linux/macOS/WSL"
+  default_prompt: "Configura Houdi Agent paso a paso y verifica salud operacional."
