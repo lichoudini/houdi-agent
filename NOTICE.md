@@ -11,4 +11,5 @@ Houdi Agent is an independent open source project.
 ## Trademark and Affiliation Notice
 
 - This project is not officially affiliated with, endorsed by, or sponsored by OpenClaw.ai, Aurelio.ai, or OpenAI.
+- This project is not officially affiliated with, endorsed by, or sponsored by GitHub, Inc.
 - All product and company names may be trademarks of their respective owners.
