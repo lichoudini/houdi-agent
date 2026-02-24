@@ -30,6 +30,8 @@ jobs:
         run: |
           set -o pipefail
           node --test dist/**/*.test.js > ci-test.log 2>&1 || {
+            echo "---- failing markers (not ok / ERR / Error) ----"
+            grep -nE "not ok|ERR_|Error \\[|failureType|exitCode" ci-test.log | tail -n 80 || true
             echo "---- tail(ci-test.log) ----"
             tail -n 200 ci-test.log || true
             details=$(tail -n 60 ci-test.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g')
