@@ -35,6 +35,13 @@ Instalador recomendado:
 ./scripts/install-houdi-agent.sh
 ```
 
+Por default abre wizard **modo simple** (recomendado para primera instalación).
+Si necesitas ver todos los parámetros técnicos:
+
+```bash
+./scripts/install-houdi-agent.sh --wizard-mode advanced
+```
+
 Automatizado (sin preguntas):
 
 ```bash
@@ -71,6 +78,9 @@ Alias:
 
 Esto genera/actualiza `.env` con todas las variables necesarias.
 El wizard ahora incluye preflight (Node/npm/systemd/proyecto), resumen de riesgos y checklist final con próximos pasos.
+Incluye dos niveles:
+- `simple` (default): menos decisiones, defaults recomendados, foco en quedar operativo rápido.
+- `advanced`: muestra todos los parámetros para ajuste fino.
 También incluye configuración opcional de bridge WhatsApp (`WHATSAPP_*`) y opción de instalar su servicio `systemd --user`.
 También soporta flags `--with-whatsapp-bridge` y `--with-slack-bridge` para dejar servicios bridge instalados al finalizar.
 Para usuarios no experimentados, este flujo guiado evita editar `.env` de forma manual.

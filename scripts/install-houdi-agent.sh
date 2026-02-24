@@ -50,12 +50,14 @@ Uso:
 
 Qué hace:
   - Ejecuta el wizard de onboarding.
+  - Por default usa wizard en modo simple (ideal primera vez).
   - Ayuda a configurar .env, dependencias, build y servicio (opcional).
   - Incluye opciones de bridge Slack/WhatsApp durante el onboarding.
   - Permite instalar bridges automáticamente con flags (one-command install).
 
 Tips:
-  - Interactivo recomendado para primera instalación.
+  - Interactivo + modo simple recomendado para primera instalación.
+  - Si querés control total, usa: --wizard-mode advanced
   - En modo --yes, valida variables mínimas antes de ejecutar.
 
 Ayuda avanzada del wizard:
@@ -64,6 +66,7 @@ Ayuda avanzada del wizard:
 Flags extra del instalador:
   --with-whatsapp-bridge  Instala houdi-whatsapp-bridge.service al terminar
   --with-slack-bridge     Instala houdi-slack-bridge.service al terminar
+  --wizard-mode advanced  Muestra todos los parámetros del wizard
 EOF
 }
 
@@ -130,6 +133,10 @@ fi
 
 echo "Flujo recomendado (interactivo):"
 echo "  ./scripts/install-houdi-agent.sh"
+echo "  (wizard simple, apto primera instalación)"
+echo
+echo "Flujo interactivo avanzado (control total):"
+echo "  ./scripts/install-houdi-agent.sh --wizard-mode advanced"
 echo
 echo "Flujo automatizado (sin preguntas):"
 echo "  TELEGRAM_BOT_TOKEN=... TELEGRAM_ALLOWED_USER_IDS=123456 \\"
@@ -141,7 +148,7 @@ echo "  ./scripts/install-houdi-agent.sh --yes --accept-risk --service-mode user
 echo
 
 log "Lanzando wizard de onboarding..."
-log "Tip: puedes usar -- --accept-risk para omitir confirmación de riesgo."
+log "Tip: para ver todos los parámetros técnicos usa --wizard-mode advanced."
 if ! "${NPM_BIN}" run onboard -- "$@"; then
   echo
   echo "[install][hint] El onboarding falló. Pasos recomendados:"

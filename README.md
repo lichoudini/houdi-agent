@@ -119,6 +119,13 @@ Instalador recomendado (entrypoint único):
 ./scripts/install-houdi-agent.sh
 ```
 
+El instalador interactivo usa **wizard en modo simple** por default (primera instalación).
+Si necesitas control total de parámetros:
+
+```bash
+./scripts/install-houdi-agent.sh --wizard-mode advanced
+```
+
 Ayuda rápida del instalador:
 
 ```bash
@@ -155,6 +162,8 @@ Notas de operación del instalador:
 - El onboarding ahora incluye configuración opcional de WhatsApp Cloud API (`WHATSAPP_*`).
 - En `service-mode user`, puedes instalar opcionalmente `houdi-slack-bridge.service` y `houdi-whatsapp-bridge.service`.
 - Usuarios no experimentados pueden usar el wizard interactivo para configurar todo sin abrir `.env` directamente.
+- `--wizard-mode simple` (default): asistente con menos decisiones y defaults recomendados.
+- `--wizard-mode advanced`: expone todos los parámetros técnicos.
 - Flags de instalación directa:
   - `--with-whatsapp-bridge`: instala `houdi-whatsapp-bridge.service` al terminar onboarding.
   - `--with-slack-bridge`: instala `houdi-slack-bridge.service` al terminar onboarding.

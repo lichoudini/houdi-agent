@@ -23,6 +23,7 @@ type OnboardRuntimeOptions = {
   autoInstallDeps?: boolean;
   autoBuild?: boolean;
   serviceMode?: "none" | "user" | "system";
+  wizardMode?: "simple" | "advanced";
   forceSystemInstall: boolean;
 };
 
@@ -455,6 +456,17 @@ function parseOnboardRuntimeOptions(argv: string[]): OnboardRuntimeOptions {
     }
   }
 
+  const wizardModeRaw = readFlagValue(argv, "wizard-mode");
+  let wizardMode: "simple" | "advanced" | undefined;
+  if (wizardModeRaw) {
+    const normalized = wizardModeRaw.trim().toLowerCase();
+    if (normalized === "simple" || normalized === "advanced") {
+      wizardMode = normalized;
+    } else {
+      throw new Error("Valor inválido para --wizard-mode. Usa simple|advanced.");
+    }
+  }
+
   return {
     nonInteractive,
     skipPreflight,
@@ -463,6 +475,7 @@ function parseOnboardRuntimeOptions(argv: string[]): OnboardRuntimeOptions {
     ...(autoInstallDeps === undefined ? {} : { autoInstallDeps }),
     ...(autoBuild === undefined ? {} : { autoBuild }),
     ...(serviceMode ? { serviceMode } : {}),
+    ...(wizardMode ? { wizardMode } : {}),
     forceSystemInstall,
   };
 }
@@ -585,9 +598,12 @@ async function main(): Promise<void> {
         "  npm run onboard -- --accept-risk",
         "  npm run onboard -- --skip-preflight",
         "  npm run onboard -- --yes --accept-risk --service-mode user --install-deps --build",
+        "  npm run onboard -- --wizard-mode advanced",
         "",
         "Qué hace:",
         "- Configura .env paso a paso (Telegram, OpenAI, Gmail, workspace, bridge local y WhatsApp bridge).",
+        "- Modo simple (default): menos decisiones, defaults seguros y explicación para primera instalación.",
+        "- Modo advanced: control total de parámetros.",
         "- Configura integración externa opcional (CONNECTOR).",
         "- Opcionalmente ejecuta npm install, npm run build e instala servicio systemd.",
         "",
@@ -599,6 +615,7 @@ async function main(): Promise<void> {
         "- --install-deps|--skip-install-deps: fuerza instalación u omisión de npm install.",
         "- --build|--skip-build: fuerza ejecución u omisión de npm run build.",
         "- --service-mode <none|user|system>: modo de instalación de servicio.",
+        "- --wizard-mode <simple|advanced>: profundidad del asistente.",
         "- --force-system-install: evita confirmación extra al instalar servicio system.",
         "",
         "Modo no interactivo (variables mínimas recomendadas):",
@@ -620,6 +637,7 @@ async function main(): Promise<void> {
   printHoudiWelcomeBanner();
   printHeading("Houdi Onboarding Wizard");
   process.stdout.write("Instalador guiado para dejar tu instancia lista y operativa.\n");
+  process.stdout.write("Tip: si no sabes qué poner, en casi todos los pasos puedes presionar Enter para usar recomendado.\n");
   process.stdout.write("Este agente puede operar con permisos altos según agente/entorno.\n\n");
   if (runtimeOptions.nonInteractive) {
     process.stdout.write(`${ANSI_YELLOW}Modo no interactivo activo (--yes).${ANSI_RESET}\n`);
@@ -722,6 +740,30 @@ async function main(): Promise<void> {
       }
     }
 
+    const wizardMode: "simple" | "advanced" = runtimeOptions.nonInteractive
+      ? runtimeOptions.wizardMode ?? "advanced"
+      : runtimeOptions.wizardMode ??
+        (await resolveChoice(
+          "Nivel del wizard",
+          ["simple", "advanced"],
+          "simple",
+        ) as "simple" | "advanced");
+
+    if (wizardMode === "simple") {
+      process.stdout.write(
+        [
+          "",
+          "Modo simple activo:",
+          "- Menos decisiones técnicas.",
+          "- Defaults seguros para primera instalación.",
+          "- Puedes volver a correr el wizard en modo advanced cuando quieras.",
+          "",
+        ].join("\n"),
+      );
+    } else {
+      process.stdout.write("\nModo advanced activo: se mostrarán todos los parámetros.\n\n");
+    }
+
     let envExampleContent = "";
     try {
       envExampleContent = await fs.readFile(ENV_EXAMPLE_PATH, "utf8");
@@ -779,7 +821,15 @@ async function main(): Promise<void> {
       "CONNECTOR_PUBLIC_HEALTH_URL",
     ]);
 
-    printHeading("Paso 1/7 - Configuración base");
+    const totalSteps = wizardMode === "simple" ? 7 : 8;
+    let stepIndex = 1;
+    const printStep = (title: string): void => {
+      const prefix = stepIndex === 1 ? "" : "\n";
+      printHeading(`${prefix}Paso ${stepIndex}/${totalSteps} - ${title}`);
+      stepIndex += 1;
+    };
+
+    printStep("Configuración base");
     process.stdout.write(
       [
         "La carpeta workspace es el directorio de trabajo del agente.",
@@ -797,13 +847,18 @@ async function main(): Promise<void> {
     );
     envMap.set("HOUDI_WORKSPACE_DIR", workspaceDir);
 
-    const defaultAgent = await resolveLine("Agente por defecto", {
-      defaultValue: envMap.get("DEFAULT_AGENT") || envExampleMap.get("DEFAULT_AGENT") || "operator",
-      required: true,
-    }, "DEFAULT_AGENT");
-    envMap.set("DEFAULT_AGENT", defaultAgent);
+    if (wizardMode === "advanced") {
+      const defaultAgent = await resolveLine("Agente por defecto", {
+        defaultValue: envMap.get("DEFAULT_AGENT") || envExampleMap.get("DEFAULT_AGENT") || "operator",
+        required: true,
+      }, "DEFAULT_AGENT");
+      envMap.set("DEFAULT_AGENT", defaultAgent);
+    } else {
+      envMap.set("DEFAULT_AGENT", "operator");
+      process.stdout.write("Agente por defecto: operator (recomendado para operación segura).\n");
+    }
 
-    printHeading("\nPaso 2/7 - Telegram");
+    printStep("Telegram");
     process.stdout.write(
       [
         "Esta sección define quién puede operar el agente.",
@@ -826,7 +881,7 @@ async function main(): Promise<void> {
     }, "TELEGRAM_ALLOWED_USER_IDS");
     envMap.set("TELEGRAM_ALLOWED_USER_IDS", allowedUserIds);
 
-    printHeading("\nPaso 3/7 - OpenAI");
+    printStep("OpenAI");
     process.stdout.write("Si no defines OPENAI_API_KEY, Houdi funcionará pero sin capacidades IA avanzadas.\n\n");
     const openAiApiKey = await resolveLine("OPENAI_API_KEY (opcional)", {
       defaultValue: envMap.get("OPENAI_API_KEY") || "",
@@ -834,11 +889,16 @@ async function main(): Promise<void> {
     }, "OPENAI_API_KEY");
     envMap.set("OPENAI_API_KEY", openAiApiKey);
 
-    const openAiModel = await resolveLine("OPENAI_MODEL", {
-      defaultValue: envMap.get("OPENAI_MODEL") || envExampleMap.get("OPENAI_MODEL") || "gpt-4o-mini",
-      required: true,
-    }, "OPENAI_MODEL");
+    const openAiModel = wizardMode === "advanced"
+      ? await resolveLine("OPENAI_MODEL", {
+          defaultValue: envMap.get("OPENAI_MODEL") || envExampleMap.get("OPENAI_MODEL") || "gpt-4o-mini",
+          required: true,
+        }, "OPENAI_MODEL")
+      : envMap.get("OPENAI_MODEL") || envExampleMap.get("OPENAI_MODEL") || "gpt-4o-mini";
     envMap.set("OPENAI_MODEL", openAiModel);
+    if (wizardMode === "simple") {
+      process.stdout.write(`Modelo IA: ${openAiModel} (default recomendado).\n`);
+    }
 
     const enableWebBrowse = await resolveYesNo(
       "Habilitar navegación web",
@@ -846,7 +906,7 @@ async function main(): Promise<void> {
     );
     envMap.set("ENABLE_WEB_BROWSE", normalizeBoolean(enableWebBrowse));
 
-    printHeading("\nPaso 4/7 - Gmail");
+    printStep("Gmail");
     process.stdout.write("Actívalo solo si realmente necesitas lectura/envío de correos desde el agente.\n\n");
     const enableGmail = await resolveYesNo(
       "Habilitar integración Gmail",
@@ -882,7 +942,7 @@ async function main(): Promise<void> {
       envMap.set("GMAIL_REFRESH_TOKEN", "");
     }
 
-    printHeading("\nPaso 5/7 - Bridge local CLI");
+    printStep("Bridge local CLI");
     process.stdout.write("Permite que CLI local y Telegram compartan el mismo runtime/estado.\n\n");
     const enableLocalApi = await resolveYesNo(
       "Habilitar API local para paridad CLI/Telegram",
@@ -891,25 +951,29 @@ async function main(): Promise<void> {
     envMap.set("HOUDI_LOCAL_API_ENABLED", normalizeBoolean(enableLocalApi));
     if (enableLocalApi) {
       const localApiHostDefault = normalizeLocalApiHostCandidate(envMap.get("HOUDI_LOCAL_API_HOST"));
-      const localApiHost = await resolveLine("HOUDI_LOCAL_API_HOST", {
-        defaultValue: localApiHostDefault,
-        required: true,
-        validate: validateLocalApiHost,
-      }, "HOUDI_LOCAL_API_HOST");
-      const localApiPort = await resolveLine("HOUDI_LOCAL_API_PORT", {
-        defaultValue: envMap.get("HOUDI_LOCAL_API_PORT") || "3210",
-        required: true,
-        validate: (value) => {
-          if (!/^\d+$/.test(value)) {
-            return "Debe ser número entero.";
-          }
-          const parsed = Number.parseInt(value, 10);
-          if (parsed < 1 || parsed > 65535) {
-            return "Puerto fuera de rango (1-65535).";
-          }
-          return null;
-        },
-      }, "HOUDI_LOCAL_API_PORT");
+      const localApiHost = wizardMode === "advanced"
+        ? await resolveLine("HOUDI_LOCAL_API_HOST", {
+            defaultValue: localApiHostDefault,
+            required: true,
+            validate: validateLocalApiHost,
+          }, "HOUDI_LOCAL_API_HOST")
+        : localApiHostDefault;
+      const localApiPort = wizardMode === "advanced"
+        ? await resolveLine("HOUDI_LOCAL_API_PORT", {
+            defaultValue: envMap.get("HOUDI_LOCAL_API_PORT") || "3210",
+            required: true,
+            validate: (value) => {
+              if (!/^\d+$/.test(value)) {
+                return "Debe ser número entero.";
+              }
+              const parsed = Number.parseInt(value, 10);
+              if (parsed < 1 || parsed > 65535) {
+                return "Puerto fuera de rango (1-65535).";
+              }
+              return null;
+            },
+          }, "HOUDI_LOCAL_API_PORT")
+        : envMap.get("HOUDI_LOCAL_API_PORT") || "3210";
       let localApiToken = await resolveLine("HOUDI_LOCAL_API_TOKEN (vacío = sin token)", {
         defaultValue: envMap.get("HOUDI_LOCAL_API_TOKEN") || "",
         displayDefault: false,
@@ -923,13 +987,25 @@ async function main(): Promise<void> {
       envMap.set("HOUDI_LOCAL_API_HOST", localApiHost);
       envMap.set("HOUDI_LOCAL_API_PORT", localApiPort);
       envMap.set("HOUDI_LOCAL_API_TOKEN", localApiToken);
+      if (wizardMode === "simple") {
+        process.stdout.write(`Bridge local configurado en ${localApiHost}:${localApiPort}.\n`);
+      }
     }
 
-    printHeading("\nPaso 6/8 - Bridge WhatsApp (opcional)");
+    printStep("Bridge WhatsApp (opcional)");
     process.stdout.write("Permite recibir mensajes por webhook de WhatsApp Cloud API y responder vía bridge local.\n\n");
     const hasWhatsAppConfigured = Boolean((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim());
     const configureWhatsApp = await resolveYesNo("Configurar bridge WhatsApp", hasWhatsAppConfigured);
     if (configureWhatsApp) {
+      if (envMap.get("HOUDI_LOCAL_API_ENABLED") !== "true") {
+        process.stdout.write("WhatsApp requiere bridge local activo. Lo habilito automáticamente con defaults seguros.\n");
+        envMap.set("HOUDI_LOCAL_API_ENABLED", "true");
+        envMap.set("HOUDI_LOCAL_API_HOST", normalizeLocalApiHostCandidate(envMap.get("HOUDI_LOCAL_API_HOST")));
+        envMap.set("HOUDI_LOCAL_API_PORT", envMap.get("HOUDI_LOCAL_API_PORT") || "3210");
+        if (!(envMap.get("HOUDI_LOCAL_API_TOKEN") || "").trim()) {
+          envMap.set("HOUDI_LOCAL_API_TOKEN", randomBytes(24).toString("hex"));
+        }
+      }
       const whatsappVerifyToken = await resolveLine("WHATSAPP_VERIFY_TOKEN", {
         defaultValue: envMap.get("WHATSAPP_VERIFY_TOKEN") || "",
         required: true,
@@ -944,38 +1020,50 @@ async function main(): Promise<void> {
         defaultValue: envMap.get("WHATSAPP_APP_SECRET") || "",
         displayDefault: false,
       }, "WHATSAPP_APP_SECRET");
-      const whatsappBridgeHost = await resolveLine("WHATSAPP_BRIDGE_HOST", {
-        defaultValue: envMap.get("WHATSAPP_BRIDGE_HOST") || "0.0.0.0",
-        required: true,
-      }, "WHATSAPP_BRIDGE_HOST");
-      const whatsappBridgePort = await resolveLine("WHATSAPP_BRIDGE_PORT", {
-        defaultValue: envMap.get("WHATSAPP_BRIDGE_PORT") || "3390",
-        required: true,
-        validate: (value) => {
-          if (!/^\d+$/.test(value)) {
-            return "Debe ser número entero.";
-          }
-          const parsed = Number.parseInt(value, 10);
-          if (parsed < 1 || parsed > 65535) {
-            return "Puerto fuera de rango (1-65535).";
-          }
-          return null;
-        },
-      }, "WHATSAPP_BRIDGE_PORT");
-      const whatsappWebhookPath = await resolveLine("WHATSAPP_WEBHOOK_PATH", {
-        defaultValue: envMap.get("WHATSAPP_WEBHOOK_PATH") || "/webhook/whatsapp",
-        required: true,
-      }, "WHATSAPP_WEBHOOK_PATH");
-      const whatsappAllowedFrom = await resolveLine("WHATSAPP_ALLOWED_FROM (csv opcional, * para todos)", {
-        defaultValue: envMap.get("WHATSAPP_ALLOWED_FROM") || "",
-      }, "WHATSAPP_ALLOWED_FROM");
-      const whatsappBridgeUserId = await resolveLine("WHATSAPP_BRIDGE_USER_ID (opcional)", {
-        defaultValue: envMap.get("WHATSAPP_BRIDGE_USER_ID") || "",
-      }, "WHATSAPP_BRIDGE_USER_ID");
-      const whatsappApiVersion = await resolveLine("WHATSAPP_GRAPH_API_VERSION", {
-        defaultValue: envMap.get("WHATSAPP_GRAPH_API_VERSION") || "v22.0",
-        required: true,
-      }, "WHATSAPP_GRAPH_API_VERSION");
+      const whatsappBridgeHost = wizardMode === "advanced"
+        ? await resolveLine("WHATSAPP_BRIDGE_HOST", {
+            defaultValue: envMap.get("WHATSAPP_BRIDGE_HOST") || "0.0.0.0",
+            required: true,
+          }, "WHATSAPP_BRIDGE_HOST")
+        : envMap.get("WHATSAPP_BRIDGE_HOST") || "0.0.0.0";
+      const whatsappBridgePort = wizardMode === "advanced"
+        ? await resolveLine("WHATSAPP_BRIDGE_PORT", {
+            defaultValue: envMap.get("WHATSAPP_BRIDGE_PORT") || "3390",
+            required: true,
+            validate: (value) => {
+              if (!/^\d+$/.test(value)) {
+                return "Debe ser número entero.";
+              }
+              const parsed = Number.parseInt(value, 10);
+              if (parsed < 1 || parsed > 65535) {
+                return "Puerto fuera de rango (1-65535).";
+              }
+              return null;
+            },
+          }, "WHATSAPP_BRIDGE_PORT")
+        : envMap.get("WHATSAPP_BRIDGE_PORT") || "3390";
+      const whatsappWebhookPath = wizardMode === "advanced"
+        ? await resolveLine("WHATSAPP_WEBHOOK_PATH", {
+            defaultValue: envMap.get("WHATSAPP_WEBHOOK_PATH") || "/webhook/whatsapp",
+            required: true,
+          }, "WHATSAPP_WEBHOOK_PATH")
+        : envMap.get("WHATSAPP_WEBHOOK_PATH") || "/webhook/whatsapp";
+      const whatsappAllowedFrom = wizardMode === "advanced"
+        ? await resolveLine("WHATSAPP_ALLOWED_FROM (csv opcional, * para todos)", {
+            defaultValue: envMap.get("WHATSAPP_ALLOWED_FROM") || "",
+          }, "WHATSAPP_ALLOWED_FROM")
+        : envMap.get("WHATSAPP_ALLOWED_FROM") || "";
+      const whatsappBridgeUserId = wizardMode === "advanced"
+        ? await resolveLine("WHATSAPP_BRIDGE_USER_ID (opcional)", {
+            defaultValue: envMap.get("WHATSAPP_BRIDGE_USER_ID") || "",
+          }, "WHATSAPP_BRIDGE_USER_ID")
+        : envMap.get("WHATSAPP_BRIDGE_USER_ID") || "";
+      const whatsappApiVersion = wizardMode === "advanced"
+        ? await resolveLine("WHATSAPP_GRAPH_API_VERSION", {
+            defaultValue: envMap.get("WHATSAPP_GRAPH_API_VERSION") || "v22.0",
+            required: true,
+          }, "WHATSAPP_GRAPH_API_VERSION")
+        : envMap.get("WHATSAPP_GRAPH_API_VERSION") || "v22.0";
 
       envMap.set("WHATSAPP_VERIFY_TOKEN", whatsappVerifyToken);
       envMap.set("WHATSAPP_ACCESS_TOKEN", whatsappAccessToken);
@@ -986,48 +1074,56 @@ async function main(): Promise<void> {
       envMap.set("WHATSAPP_ALLOWED_FROM", whatsappAllowedFrom);
       envMap.set("WHATSAPP_BRIDGE_USER_ID", whatsappBridgeUserId);
       envMap.set("WHATSAPP_GRAPH_API_VERSION", whatsappApiVersion);
+      if (wizardMode === "simple") {
+        process.stdout.write("WhatsApp configurado con defaults recomendados (host/puerto/path/API version).\n");
+      }
     }
 
-    printHeading("\nPaso 7/8 - Integración externa opcional");
-    const enableLim = await resolveYesNo(
-      "Habilitar control de CONNECTOR externo",
-      (envMap.get("ENABLE_CONNECTOR_CONTROL") || "false").toLowerCase() === "true",
-    );
-    envMap.set("ENABLE_CONNECTOR_CONTROL", normalizeBoolean(enableLim));
-    if (enableLim) {
-      const connectorAppDir = normalizeDirValue(
-        await resolveLine("CONNECTOR_APP_DIR", {
-          defaultValue: envMap.get("CONNECTOR_APP_DIR") || "./connector-app",
-          required: true,
-        }, "CONNECTOR_APP_DIR"),
-        "./connector-app",
+    if (wizardMode === "advanced") {
+      printStep("Integración externa opcional");
+      const enableLim = await resolveYesNo(
+        "Habilitar control de CONNECTOR externo",
+        (envMap.get("ENABLE_CONNECTOR_CONTROL") || "false").toLowerCase() === "true",
       );
-      const connectorAppService = await resolveLine("CONNECTOR_APP_SERVICE", {
-        defaultValue: envMap.get("CONNECTOR_APP_SERVICE") || "houdi-connector-app.service",
-        required: true,
-      }, "CONNECTOR_APP_SERVICE");
-      const connectorTunnelService = await resolveLine("CONNECTOR_TUNNEL_SERVICE", {
-        defaultValue: envMap.get("CONNECTOR_TUNNEL_SERVICE") || "houdi-connector-tunnel.service",
-        required: true,
-      }, "CONNECTOR_TUNNEL_SERVICE");
-      const connectorLocalHealth = await resolveLine("CONNECTOR_LOCAL_HEALTH_URL", {
-        defaultValue: envMap.get("CONNECTOR_LOCAL_HEALTH_URL") || "http://127.0.0.1:3333/health",
-        required: true,
-      }, "CONNECTOR_LOCAL_HEALTH_URL");
-      const connectorPublicHealth = await resolveLine("CONNECTOR_PUBLIC_HEALTH_URL", {
-        defaultValue: envMap.get("CONNECTOR_PUBLIC_HEALTH_URL") || connectorLocalHealth,
-        required: true,
-      }, "CONNECTOR_PUBLIC_HEALTH_URL");
-      envMap.set("CONNECTOR_APP_DIR", connectorAppDir);
-      envMap.set("CONNECTOR_APP_SERVICE", connectorAppService);
-      envMap.set("CONNECTOR_TUNNEL_SERVICE", connectorTunnelService);
-      envMap.set("CONNECTOR_LOCAL_HEALTH_URL", connectorLocalHealth);
-      envMap.set("CONNECTOR_PUBLIC_HEALTH_URL", connectorPublicHealth);
+      envMap.set("ENABLE_CONNECTOR_CONTROL", normalizeBoolean(enableLim));
+      if (enableLim) {
+        const connectorAppDir = normalizeDirValue(
+          await resolveLine("CONNECTOR_APP_DIR", {
+            defaultValue: envMap.get("CONNECTOR_APP_DIR") || "./connector-app",
+            required: true,
+          }, "CONNECTOR_APP_DIR"),
+          "./connector-app",
+        );
+        const connectorAppService = await resolveLine("CONNECTOR_APP_SERVICE", {
+          defaultValue: envMap.get("CONNECTOR_APP_SERVICE") || "houdi-connector-app.service",
+          required: true,
+        }, "CONNECTOR_APP_SERVICE");
+        const connectorTunnelService = await resolveLine("CONNECTOR_TUNNEL_SERVICE", {
+          defaultValue: envMap.get("CONNECTOR_TUNNEL_SERVICE") || "houdi-connector-tunnel.service",
+          required: true,
+        }, "CONNECTOR_TUNNEL_SERVICE");
+        const connectorLocalHealth = await resolveLine("CONNECTOR_LOCAL_HEALTH_URL", {
+          defaultValue: envMap.get("CONNECTOR_LOCAL_HEALTH_URL") || "http://127.0.0.1:3333/health",
+          required: true,
+        }, "CONNECTOR_LOCAL_HEALTH_URL");
+        const connectorPublicHealth = await resolveLine("CONNECTOR_PUBLIC_HEALTH_URL", {
+          defaultValue: envMap.get("CONNECTOR_PUBLIC_HEALTH_URL") || connectorLocalHealth,
+          required: true,
+        }, "CONNECTOR_PUBLIC_HEALTH_URL");
+        envMap.set("CONNECTOR_APP_DIR", connectorAppDir);
+        envMap.set("CONNECTOR_APP_SERVICE", connectorAppService);
+        envMap.set("CONNECTOR_TUNNEL_SERVICE", connectorTunnelService);
+        envMap.set("CONNECTOR_LOCAL_HEALTH_URL", connectorLocalHealth);
+        envMap.set("CONNECTOR_PUBLIC_HEALTH_URL", connectorPublicHealth);
+      }
+    } else {
+      envMap.set("ENABLE_CONNECTOR_CONTROL", "false");
     }
 
-    printHeading("\nPaso 8/8 - Confirmación");
+    printStep("Confirmación");
     process.stdout.write(
       [
+        `- Modo wizard: ${wizardMode}`,
         `- Workspace: ${envMap.get("HOUDI_WORKSPACE_DIR")}`,
         `- Telegram IDs: ${envMap.get("TELEGRAM_ALLOWED_USER_IDS")}`,
         `- Telegram token: ${maskSecret(envMap.get("TELEGRAM_BOT_TOKEN") || "")}`,
@@ -1085,24 +1181,46 @@ async function main(): Promise<void> {
       await runCommand("npm", ["run", "build"], PROJECT_DIR);
     }
 
-    printHeading("\nModo de instalación de servicio");
-    process.stdout.write(
-      [
-        "- none: no instala servicio. Ejecutas el bot manualmente con npm start.",
-        "- user: instala systemd --user (sin sudo). Funciona para tu usuario.",
-        "- system: instala servicio global systemd (requiere sudo). Recomendado para producción.",
-        "",
-      ].join("\n"),
-    );
-    const serviceModeDefault = runtimeOptions.serviceMode ?? "none";
-    const serviceMode = await resolveChoice("Instalación de servicio", ["none", "user", "system"], serviceModeDefault);
+    printHeading("\nArranque automático del bot");
+    let serviceMode: "none" | "user" | "system";
+    if (runtimeOptions.serviceMode) {
+      serviceMode = runtimeOptions.serviceMode;
+      process.stdout.write(`Modo de servicio fijado por flag: ${serviceMode}\n`);
+    } else if (wizardMode === "simple") {
+      process.stdout.write(
+        [
+          "Recomendado para primera instalación:",
+          "- Sí: instala servicio user (sin sudo). El bot se levanta más fácil y estable.",
+          "- No: lo arrancas manualmente con npm start.",
+          "",
+        ].join("\n"),
+      );
+      const installUserService = await resolveYesNo("¿Instalar servicio persistente para tu usuario?", true);
+      serviceMode = installUserService ? "user" : "none";
+    } else {
+      process.stdout.write(
+        [
+          "- none: no instala servicio. Ejecutas el bot manualmente con npm start.",
+          "- user: instala systemd --user (sin sudo). Funciona para tu usuario.",
+          "- system: instala servicio global systemd (requiere sudo). Recomendado para producción.",
+          "",
+        ].join("\n"),
+      );
+      const serviceModeDefault = runtimeOptions.serviceMode ?? "none";
+      serviceMode = (await resolveChoice("Instalación de servicio", ["none", "user", "system"], serviceModeDefault)) as
+        | "none"
+        | "user"
+        | "system";
+    }
     let installedSlackBridgeService = false;
     let installedWhatsAppBridgeService = false;
     if (serviceMode === "user") {
       await runCommand("bash", ["./scripts/install-systemd-user-service.sh"], PROJECT_DIR);
       const hasSlackTokens = Boolean((envMap.get("SLACK_BOT_TOKEN") || "").trim() && (envMap.get("SLACK_APP_TOKEN") || "").trim());
       const installSlackBridge = await resolveYesNo(
-        "¿Instalar servicio Slack bridge (systemd --user)?",
+        wizardMode === "simple"
+          ? "¿Instalar también servicio de Slack bridge? (solo si ya configuraste Slack)"
+          : "¿Instalar servicio Slack bridge (systemd --user)?",
         hasSlackTokens,
       );
       if (installSlackBridge) {
@@ -1111,7 +1229,9 @@ async function main(): Promise<void> {
       }
       const hasWhatsAppTokens = Boolean((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim());
       const installWhatsAppBridge = await resolveYesNo(
-        "¿Instalar servicio WhatsApp bridge (systemd --user)?",
+        wizardMode === "simple"
+          ? "¿Instalar también servicio de WhatsApp bridge? (recomendado si configuraste WhatsApp)"
+          : "¿Instalar servicio WhatsApp bridge (systemd --user)?",
         hasWhatsAppTokens,
       );
       if (installWhatsAppBridge) {
@@ -1140,27 +1260,27 @@ async function main(): Promise<void> {
     printHeading("\nOnboarding completado");
     const nextSteps: string[] = [];
     if (serviceMode === "none") {
-      nextSteps.push("1) Inicia el bot manualmente: npm start");
+      nextSteps.push("Inicia el bot manualmente: npm start");
     } else if (serviceMode === "user") {
-      nextSteps.push("1) Verifica servicio user: systemctl --user status houdi-agent.service --no-pager");
+      nextSteps.push("Verifica servicio user: systemctl --user status houdi-agent.service --no-pager");
       if (installedSlackBridgeService) {
-        nextSteps.push("2) Verifica Slack bridge: systemctl --user status houdi-slack-bridge.service --no-pager");
+        nextSteps.push("Verifica Slack bridge: systemctl --user status houdi-slack-bridge.service --no-pager");
       }
       if (installedWhatsAppBridgeService) {
-        nextSteps.push("3) Verifica WhatsApp bridge: systemctl --user status houdi-whatsapp-bridge.service --no-pager");
+        nextSteps.push("Verifica WhatsApp bridge: systemctl --user status houdi-whatsapp-bridge.service --no-pager");
       }
     } else {
-      nextSteps.push("1) Verifica servicio system: systemctl status houdi-agent.service --no-pager");
-      nextSteps.push("2) Logs del servicio: sudo journalctl -u houdi-agent.service -f");
+      nextSteps.push("Verifica servicio system: systemctl status houdi-agent.service --no-pager");
+      nextSteps.push("Logs del servicio: sudo journalctl -u houdi-agent.service -f");
     }
     if (serviceMode !== "system") {
-      nextSteps.push("2) Logs runtime: tail -f houdi-agent.log");
+      nextSteps.push("Logs runtime: tail -f houdi-agent.log");
     }
-    nextSteps.push("3) Entra al CLI interactivo: npm run cli -- chat");
-    nextSteps.push('4) Envío único por CLI: npm run cli -- agent -m "hola"');
-    nextSteps.push("5) Diagnóstico rápido: /doctor en Telegram (y /status).");
-    nextSteps.push("6) Prueba Telegram con /status y un mensaje natural.");
-    process.stdout.write(`${nextSteps.join("\n")}\n`);
+    nextSteps.push("Entra al CLI interactivo: npm run cli -- chat");
+    nextSteps.push('Envío único por CLI: npm run cli -- agent -m "hola"');
+    nextSteps.push("Diagnóstico rápido: /doctor en Telegram (y /status).");
+    nextSteps.push("Prueba Telegram con /status y un mensaje natural.");
+    process.stdout.write(`${nextSteps.map((item, index) => `${index + 1}) ${item}`).join("\n")}\n`);
   } finally {
     closeReadline();
   }
