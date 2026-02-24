@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import JSZip from "jszip";
 import mammoth from "mammoth";
-import { PDFParse } from "pdf-parse";
 import * as XLSX from "xlsx";
 
 export type DocumentReadResult = {
@@ -364,6 +363,7 @@ export class DocumentReader {
 
   private async extractPdfText(filePath: string): Promise<string> {
     const buffer = await fs.readFile(filePath);
+    const { PDFParse } = await import("pdf-parse");
     const parser = new PDFParse({ data: buffer });
     try {
       const parsed = await parser.getText();
