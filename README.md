@@ -1,4 +1,4 @@
-# Houdi Agent | El primer Agente IA de LATAM
+# Houdi Agent | El primer Agente IA de LATAM | Whatsapp | Telgram | Slack
 
 Proyecto base desde cero para arrancar un asistente de operación de PC por Whastapp/Telegram/Slack, con una arquitectura simple que puedas escalar.
 
