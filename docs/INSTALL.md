@@ -2,7 +2,6 @@
 
 Versión actual: **0.63b**  
 Autor del repositorio: **licHoudini**  
-Contacto: **lichoudini@houdiagent.com**
 
 Esta guía deja una instalación reproducible para que cualquier persona pueda correr su propia instancia.
 Houdi Agent es un proyecto en desarrollo continuo: se recomienda actualizar con frecuencia para incorporar mejoras de estabilidad y seguridad.
@@ -287,3 +286,5 @@ Si usas servicio de usuario, reemplazar `systemctl` por `systemctl --user`.
 4. README actualizado.
 5. `docs/RUNBOOK.md` actualizado.
 6. Sin secretos en archivos versionados.
+
+Contacto operativo: patagonads@gmail.com

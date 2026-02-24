@@ -9,7 +9,6 @@ Repositorio oficial:
 
 Versión actual: **0.63b**  
 Autor del repositorio: **licHoudini**  
-Contacto: **lichoudini@houdiagent.com**
 
 ## Posicionamiento y comunicación del proyecto
 
@@ -1113,3 +1112,5 @@ npm run dev
 3. Políticas por chat/agent (RBAC)
 4. Cola de trabajos y workers separados
 5. Plugin system para acciones (archivos, browser, RDP, etc.)
+
+Contacto operativo: patagonads@gmail.com
