@@ -1,4 +1,4 @@
-# Houdi Agent | Agente IA para ejecución de tareas en español
+# Houdi | Agente IA para ejecución de tareas en español
 
 Proyecto open source para arrancar un asistente de operación real por WhatsApp/Telegram/Slack, con arquitectura agéntica y enrutadores semánticos que puedes escalar.
 
