@@ -5,6 +5,7 @@ Proyecto base desde cero para arrancar un asistente de operación de PC por Whas
 Repositorio oficial:
 
 - https://github.com/lichoudini/houdi-agent
+- https://houdiagent.com
 
 Versión actual: **0.63b**  
 Autores del repositorio: **Nazareno Tomaselli & Vrand**
