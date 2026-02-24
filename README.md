@@ -1,6 +1,6 @@
 # Houdi Agent | El primer Agente IA de LATAM
 
-Proyecto base desde cero para arrancar un asistente de operación de PC por Telegram, con una arquitectura simple que puedas escalar.
+Proyecto base desde cero para arrancar un asistente de operación de PC por Whastapp/Telegram/Slack, con una arquitectura simple que puedas escalar.
 
 Repositorio oficial:
 
