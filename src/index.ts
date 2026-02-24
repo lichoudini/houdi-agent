@@ -279,7 +279,7 @@ type SpecializedSubagentName =
   | "workspace-ops"
   | "web-research"
   | "memory-archivist"
-  | "lim-ops"
+  | "connector-ops"
   | "self-maintainer"
   | "schedule-ops";
 type SubagentMode = "auto" | "pinned";
@@ -346,7 +346,7 @@ type IndexedListContext = {
   createdAtMs: number;
 };
 const indexedListByChat = new Map<number, IndexedListContext>();
-const lastLimContextByChat = new Map<number, number>();
+const lastConnectorContextByChat = new Map<number, number>();
 let selfUpdateInProgress = false;
 let localBridgeServer: Server | null = null;
 let outboxRecoveryTimer: NodeJS.Timeout | null = null;
@@ -430,7 +430,7 @@ const SELF_RESTART_SERVICE_COMMAND = "systemctl restart houdi-agent.service";
 const SELF_UPDATE_APPROVAL_COMMAND = "__selfupdate__";
 const NEWS_MAX_AGE_DAYS = 7;
 const NEWS_MAX_SPECIALIZED_DOMAIN_QUERIES = 8;
-const LIM_CONTEXT_TTL_MS = 30 * 60 * 1000;
+const CONNECTOR_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const RECENT_EMAIL_ROUTER_CONTEXT_TURNS = 3;
 const RECENT_INTENT_ROUTER_CONTEXT_TURNS = 3;
 const RECENT_CONVERSATION_TURN_LIMIT = 40;
@@ -511,7 +511,7 @@ const KNOWN_TELEGRAM_COMMANDS = new Set([
   "images",
   "getfile",
   "web",
-  "lim",
+  "connector",
   "weather",
   "webopen",
   "webask",
@@ -1014,19 +1014,19 @@ function setSubagentAutoMode(chatId: number): void {
 }
 
 const SUBAGENT_ALLOWED_HANDLERS: Record<SpecializedSubagentName, ReadonlySet<string>> = {
-  coordinator: new Set(["self-maintenance", "lim", "schedule", "memory", "gmail-recipients", "gmail", "workspace", "document", "web"]),
+  coordinator: new Set(["self-maintenance", "connector", "schedule", "memory", "gmail-recipients", "gmail", "workspace", "document", "web"]),
   "mail-ops": new Set(["gmail", "gmail-recipients"]),
   "workspace-ops": new Set(["workspace", "document"]),
   "web-research": new Set(["web", "document"]),
   "memory-archivist": new Set(["memory"]),
-  "lim-ops": new Set(["lim"]),
+  "connector-ops": new Set(["connector"]),
   "self-maintainer": new Set(["self-maintenance"]),
   "schedule-ops": new Set(["schedule"]),
 };
 
 const SUBAGENT_BY_HANDLER: Record<string, SpecializedSubagentName> = {
   "self-maintenance": "self-maintainer",
-  lim: "lim-ops",
+  connector: "connector-ops",
   schedule: "schedule-ops",
   memory: "memory-archivist",
   "gmail-recipients": "mail-ops",
@@ -1415,7 +1415,7 @@ type CuratedNewsDomains = {
   en: string[];
 };
 
-type ConnectorNaturalAction = "status" | "start" | "stop" | "restart" | "query" | "list";
+type ConnectorNaturalAction = "status" | "start" | "stop" | "restart" | "query" | "list" | "account";
 
 type ConnectorNaturalIntent = {
   shouldHandle: boolean;
@@ -1519,7 +1519,7 @@ type GmailRecipientNaturalIntent = {
 
 type NaturalIntentHandlerName =
   | "self-maintenance"
-  | "lim"
+  | "connector"
   | "schedule"
   | "memory"
   | "gmail-recipients"
@@ -4127,11 +4127,11 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
   }
 
   const normalized = normalizeIntentText(original);
-  const mentionsConnector = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
+  const mentionsConnector = /\b\/?connector\b/.test(normalized) || /\bconnector-api\b/.test(normalized);
   const mentionsCloudflared = /\b(cloudflared|tunel|tunnel|cloudflare)\b/.test(normalized);
   const explicitContext = mentionsConnector || mentionsCloudflared;
 
-  const extractLimTaggedValue = (fieldPattern: string): string => {
+  const extractConnectorTaggedValue = (fieldPattern: string): string => {
     const match = original.match(
       new RegExp(
         `\\b${fieldPattern}\\s*[:=]\\s*([\\s\\S]*?)(?=\\s+(?:first[_\\s-]?name|last[_\\s-]?name|fuente|source|count)\\s*[:=]|$)`,
@@ -4140,19 +4140,24 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     );
     return (match?.[1] ?? "").trim();
   };
-  const firstName = extractLimTaggedValue("first[_\\s-]?name");
-  const lastName = extractLimTaggedValue("last[_\\s-]?name");
-  const sourceName = extractLimTaggedValue("(?:fuente|source)");
+  const firstName = extractConnectorTaggedValue("first[_\\s-]?name");
+  const lastName = extractConnectorTaggedValue("last[_\\s-]?name");
+  const sourceName = extractConnectorTaggedValue("(?:fuente|source)");
   const countMatch = original.match(/\bcount\s*[:=]\s*(\d{1,2})\b/i);
   const naturalCountMatch =
     original.match(/\b(?:ultimos?|últimos?)\s+(\d{1,2})\s+mensajes?\b/i) ??
     original.match(/\b(\d{1,2})\s+mensajes?\b/i);
   const parsedCount = Number.parseInt(countMatch?.[1] ?? naturalCountMatch?.[1] ?? "", 10);
-  const count = Number.isFinite(parsedCount) ? Math.max(1, Math.min(10, parsedCount)) : 3;
-  const historyCount = parseLimHistoryLimit(original, 10, 20);
+  const count = Number.isFinite(parsedCount) ? Math.max(1, Math.min(5, parsedCount)) : 5;
+  const historyCount = parseConnectorHistoryLimit(original, 5, 5);
+  const showConnectorRequested =
+    /^(?:ver|mostrar|mostra|mirar|mira)\s+\/?connector(?:\s+(?:lista|listado|historial|history|registros?|salidas?))?\s*$/.test(
+      normalized,
+    );
   const listRequested =
-    /\b(lista|listar|listame|historial|history|registro|registros|outputs?|salidas?)\b/.test(normalized) &&
-    /\b\/?lim\b/.test(normalized);
+    (/\b(lista|listar|listame|historial|history|registro|registros|outputs?|salidas?)\b/.test(normalized) &&
+      /\b\/?connector\b/.test(normalized)) ||
+    showConnectorRequested;
   const asksProspectOnly =
     /\b(prospecto|lead|contacto)\b/.test(normalized) ||
     /\b(no\s+(?:propios?|mios?|mías?|mias|nuestros?|nuestras?))\b/.test(normalized) ||
@@ -4162,7 +4167,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     /\b(consulta|consultar|busca|buscar|trae|traer|lee|leer|revisa|revisar|ver|mira|mirar|mensaje|mensajes)\b/.test(
       normalized,
     );
-  const hasLimParams = Boolean(firstName && lastName && sourceName);
+  const hasConnectorParams = Boolean(firstName && lastName && sourceName);
   if ((explicitContext || Boolean(options?.allowImplicit)) && listRequested) {
     return {
       shouldHandle: true,
@@ -4170,7 +4175,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       count: historyCount,
     };
   }
-  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && hasLimParams) {
+  if ((explicitContext || Boolean(options?.allowImplicit)) && queryVerb && hasConnectorParams) {
     return {
       shouldHandle: true,
       action: "query",
@@ -4232,12 +4237,12 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     };
   }
 
-  const afterLimRaw = original.match(/\b(?:\/?lim)\b[:\s,-]*(.+)$/i)?.[1]?.trim() ?? "";
-  const limInlineMatch = afterLimRaw.match(
+  const afterConnectorRaw = original.match(/\b(?:\/?connector)\b[:\s,-]*(.+)$/i)?.[1]?.trim() ?? "";
+  const connectorInlineMatch = afterConnectorRaw.match(
     /^(?:de\s+)?([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ'`.-]+)\s+(?:en|desde|fuente|source)\s+(.+)$/i,
   );
-  if ((explicitContext || Boolean(options?.allowImplicit)) && limInlineMatch) {
-    const sourceInline = (limInlineMatch[3] ?? "")
+  if ((explicitContext || Boolean(options?.allowImplicit)) && connectorInlineMatch) {
+    const sourceInline = (connectorInlineMatch[3] ?? "")
       .replace(/\bcount\s*[:=]\s*\d{1,2}\b/gi, "")
       .replace(/\b(?:ultimos?|últimos?)\s+\d{1,2}\s+mensajes?\b/gi, "")
       .trim();
@@ -4245,8 +4250,8 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
       return {
         shouldHandle: true,
         action: "query",
-        firstName: (limInlineMatch[1] ?? "").trim(),
-        lastName: (limInlineMatch[2] ?? "").trim(),
+        firstName: (connectorInlineMatch[1] ?? "").trim(),
+        lastName: (connectorInlineMatch[2] ?? "").trim(),
         sourceName: sourceInline,
         count,
         prospectOnly: asksProspectOnly,
@@ -4254,7 +4259,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     }
   }
 
-  // Fallback flexible: "lim Rodrigo Toscano Linkedin_Marylin [count:2]"
+  // Fallback flexible: "connector Persona Ejemplo source_linkedin_a [count:2]"
   const rawNoCount = original
     .replace(/^\s*(?:consulta(?:r)?|revisa(?:r)?|busca(?:r)?|trae(?:r)?|lee(?:r)?|mira(?:r)?|ver)\b\s*/i, " ")
     .replace(/\bcount\s*[:=]\s*\d{1,2}\b/gi, " ")
@@ -4266,7 +4271,7 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
     .filter(Boolean)
     .filter(
       (token) =>
-        !/^(lim|connector|message|retriever|mensajes?|mensaje|de|en|del|para|consulta|consultar|revisa|revisar|ver|mira|mirar|trae|traer|busca|buscar|lee|leer)$/i.test(
+        !/^(connector|connector|message|retriever|mensajes?|mensaje|de|en|del|para|consulta|consultar|revisa|revisar|ver|mira|mirar|trae|traer|busca|buscar|lee|leer)$/i.test(
           token,
         ),
     );
@@ -4285,6 +4290,39 @@ function detectConnectorNaturalIntent(text: string, options?: { allowImplicit?: 
         prospectOnly: asksProspectOnly,
       };
     }
+  }
+
+  const cleanedAccountCandidate = (value: string): string =>
+    value
+      .replace(/\bcount\s*[:=]\s*\d{1,2}\b/gi, " ")
+      .replace(/\b(?:ultimos?|últimos?)\s+\d{1,2}\s+mensajes?\b/gi, " ")
+      .replace(/\b\d{1,2}\b/g, " ")
+      .replace(/\b(?:mensajes?|mensaje|de|del|cuenta|account|fuente|source|para)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const accountTagged = extractConnectorTaggedValue("(?:account|cuenta)");
+  const accountCandidate =
+    cleanedAccountCandidate(accountTagged) ||
+    (hasConnectorParams ? "" : cleanedAccountCandidate(sourceName)) ||
+    cleanedAccountCandidate(afterConnectorRaw);
+  const accountControlWords =
+    /^(lista|listar|listame|historial|history|registro|registros|outputs?|salidas?|estado|status|arranca|arrancar|prende|prender|inicia|iniciar|reinicia|reiniciar|apaga|apagar|detene|detener|ver|mostrar|mostra|mirar|mira)$/i;
+  const accountCandidateLooksValid =
+    /^[A-Za-z0-9ÁÉÍÓÚáéíóúÑñ._-]+(?:\s+[A-Za-z0-9ÁÉÍÓÚáéíóúÑñ._-]+){0,2}$/.test(accountCandidate) &&
+    !/\b(por|favor|ahora|mismo|ya|gracias|please|pls|dale|che|quiero|necesito)\b/i.test(accountCandidate);
+  if (
+    (explicitContext || Boolean(options?.allowImplicit)) &&
+    !hasConnectorParams &&
+    accountCandidate &&
+    accountCandidateLooksValid &&
+    !accountControlWords.test(accountCandidate)
+  ) {
+    return {
+      shouldHandle: true,
+      action: "account",
+      sourceName: accountCandidate,
+      count,
+    };
   }
 
   const restartRequested = /\b(reinicia|reiniciar|reiniciala|reinicialo|restart|rearranca|rearrancar)\b/.test(
@@ -4349,7 +4387,7 @@ function tryParseConnectorIntentWithAi(raw: string): ConnectorNaturalIntent | nu
   try {
     const parsed = JSON.parse(withoutFence.slice(start, end + 1)) as Record<string, unknown>;
     const actionRaw = typeof parsed.action === "string" ? normalizeIntentText(parsed.action) : "";
-    const allowedActions = new Set<ConnectorNaturalAction>(["query", "status", "start", "stop", "restart", "list"]);
+    const allowedActions = new Set<ConnectorNaturalAction>(["query", "status", "start", "stop", "restart", "list", "account"]);
     if (!allowedActions.has(actionRaw as ConnectorNaturalAction)) {
       return null;
     }
@@ -4357,7 +4395,7 @@ function tryParseConnectorIntentWithAi(raw: string): ConnectorNaturalIntent | nu
     const lastName = typeof parsed.lastName === "string" ? parsed.lastName.trim() : "";
     const sourceName = typeof parsed.sourceName === "string" ? parsed.sourceName.trim() : "";
     const countRaw = Number.parseInt(String(parsed.count ?? ""), 10);
-    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : undefined;
+    const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(5, countRaw)) : undefined;
     const prospectOnly = typeof parsed.prospectOnly === "boolean" ? parsed.prospectOnly : undefined;
 
     return {
@@ -4383,10 +4421,10 @@ async function classifyConnectorIntentWithAi(params: { chatId: number; text: str
     return null;
   }
   const prompt = [
-    "Extrae intención LIM desde un mensaje de usuario.",
+    "Extrae intención CONNECTOR desde un mensaje de usuario.",
     "Responde SOLO JSON válido con estas claves:",
     "{",
-    '  "action": "query|status|start|stop|restart|list",',
+    '  "action": "query|status|start|stop|restart|list|account",',
     '  "firstName": "string|null",',
     '  "lastName": "string|null",',
     '  "sourceName": "string|null",',
@@ -4396,8 +4434,9 @@ async function classifyConnectorIntentWithAi(params: { chatId: number; text: str
     "",
     "Reglas:",
     "- Si pide mensajes/contacto, action=query.",
-    "- Si pide listar historial/output de LIM, action=list y usa count como límite (default 10).",
-    "- Si action=query, intenta extraer firstName, lastName, sourceName y count (default 3).",
+    "- Si pide listar historial/output de CONNECTOR, action=list y usa count como límite (default 5).",
+    "- Si action=query, intenta extraer firstName, lastName, sourceName y count (default 5).",
+    "- Si pide `connector <cuenta>` o `consulta connector por cuenta <cuenta>`, usa action=account y sourceName=<cuenta>.",
     "- No inventes datos; usa null si no está.",
     "- Si dice 'no propios/entrantes/prospecto', prospectOnly=true.",
     "",
@@ -5230,8 +5269,8 @@ function buildIntentRouterContextFilter(params: {
       getPendingWorkspaceDeletePath: (chatId) => pendingWorkspaceDeletePathByChat.get(chatId) ?? null,
       getLastGmailResultsCount: (chatId) => lastGmailResultsByChat.get(chatId)?.length ?? 0,
       getLastListedFilesCount: (chatId) => lastListedFilesByChat.get(chatId)?.length ?? 0,
-      getLastLimContextAt: (chatId) => lastLimContextByChat.get(chatId) ?? 0,
-      limContextTtlMs: LIM_CONTEXT_TTL_MS,
+      getLastConnectorContextAt: (chatId) => lastConnectorContextByChat.get(chatId) ?? 0,
+      connectorContextTtlMs: CONNECTOR_CONTEXT_TTL_MS,
     },
   );
   if (!decision) {
@@ -5493,8 +5532,8 @@ function buildRouteNarrowingClarificationQuestion(params: {
   if (/workspace|archivo|carpeta|documento/i.test(reason)) {
     return "Necesito más precisión para operar archivos sin riesgo. Indica acción + ruta/selector exacto.";
   }
-  if (/lim|connector/i.test(reason)) {
-    return "Necesito datos completos para LIM. Indica first_name, last_name y fuente en la misma frase.";
+  if (/connector|connector/i.test(reason)) {
+    return "Necesito datos completos para CONNECTOR. Indica first_name, last_name y fuente en la misma frase.";
   }
   return "Detecté señales contradictorias para evitar una acción equivocada. Reformula indicando dominio, acción y objetivo exacto.";
 }
@@ -5602,7 +5641,7 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
       delete: "Para borrar necesito ruta o selector. Ejemplo: eliminar archivo <ruta> o eliminar archivos que contienen \"...\".",
     },
   },
-  lim: {
+  connector: {
     extract: (text) => {
       const intent = detectConnectorNaturalIntent(text);
       if (!intent.shouldHandle || !intent.action) {
@@ -5629,7 +5668,7 @@ const TYPED_ROUTE_CONTRACTS: Partial<Record<Exclude<NaturalIntentHandlerName, "n
       };
     },
     clarificationsByAction: {
-      query: "Para consultar LIM necesito first_name, last_name y fuente. Ejemplo: revisar LIM de Juan Perez en account_demo_b_marylin.",
+      query: "Para consultar CONNECTOR necesito first_name, last_name y fuente. Ejemplo: revisar CONNECTOR de Juan Perez en account_demo.",
     },
   },
   schedule: {
@@ -5869,7 +5908,7 @@ function isSensitiveIntentRoute(route: Exclude<NaturalIntentHandlerName, "none">
     "gmail",
     "gmail-recipients",
     "workspace",
-    "lim",
+    "connector",
     "self-maintenance",
     "schedule",
     "memory",
@@ -5943,7 +5982,7 @@ function handlerLikelyMatchesText(handler: Exclude<NaturalIntentHandlerName, "no
   switch (handler) {
     case "self-maintenance":
       return detectSelfMaintenanceIntent(text).shouldHandle;
-    case "lim":
+    case "connector":
       return detectConnectorNaturalIntent(text).shouldHandle;
     case "schedule":
       return detectScheduleNaturalIntent(text).shouldHandle;
@@ -6221,7 +6260,7 @@ function tryParseNaturalRouteDecision(raw: string): {
     const handler = typeof parsed.handler === "string" ? parsed.handler.trim().toLowerCase() : "";
     const allowed = new Set<NaturalIntentHandlerName>([
       "self-maintenance",
-      "lim",
+      "connector",
       "schedule",
       "memory",
       "gmail-recipients",
@@ -6264,7 +6303,7 @@ async function classifyNaturalIntentRouteWithAi(params: {
     "",
     "Handlers disponibles:",
     "- self-maintenance: tareas del propio agente (skills, update, restart).",
-    "- lim: estado/start/stop/restart de LIM/tunnel y consulta de mensajes LIM (first_name, last_name, fuente).",
+    "- connector: estado/start/stop/restart de CONNECTOR/tunnel y consulta de mensajes CONNECTOR (first_name, last_name, fuente).",
     "- schedule: crear/listar/editar/eliminar tareas o recordatorios.",
     "- memory: preguntas de memoria/recuerdo/contexto previo.",
     "- gmail-recipients: ABM de destinatarios guardados.",
@@ -6361,7 +6400,7 @@ async function classifySequencedIntentPlanWithAi(params: {
     "Si es sequence, devuelve pasos concretos en orden de ejecucion.",
     "Devuelve SOLO JSON valido.",
     "",
-    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, lim, self-maintenance.",
+    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, connector, self-maintenance.",
     "",
     "Reglas:",
     "- Usa mode=sequence solo si hay 2 o mas acciones distintas o dependientes.",
@@ -8111,7 +8150,7 @@ function shouldTreatAsClarificationReply(params: {
   ) {
     return true;
   }
-  if (missing.size > 0 && /\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|email|web|lim|memoria|recordatorio|tarea)\b/i.test(raw)) {
+  if (missing.size > 0 && /\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|email|web|connector|memoria|recordatorio|tarea)\b/i.test(raw)) {
     return true;
   }
 
@@ -8136,7 +8175,7 @@ function shouldDropPendingClarificationForFreshIntent(text: string): boolean {
   const verbs =
     /\b(ver|mostrar|lista|listar|crear|crea|editar|edita|enviar|enviame|buscar|busca|abrir|abre|eliminar|borra|programa|recorda|recordar|ejecuta|revisar|consulta|analiza|resumi|resumir|actualiza|modifica|mueve|renombra)\b/;
   const domains =
-    /\b(gmail|correo|email|destinatario|workspace|archivo|carpeta|documento|pdf|tarea|task|tsk|web|url|noticia|memoria|lim|shell|exec|comando|skill|habilidad)\b/;
+    /\b(gmail|correo|email|destinatario|workspace|archivo|carpeta|documento|pdf|tarea|task|tsk|web|url|noticia|memoria|connector|shell|exec|comando|skill|habilidad)\b/;
   return verbs.test(normalized) || domains.test(normalized);
 }
 
@@ -8870,8 +8909,8 @@ function sanitizeSystemdUnitName(raw: string, fallback: string): string {
 
 function getConnectorUnitNames(): { appUnit: string; tunnelUnit: string } {
   return {
-    appUnit: sanitizeSystemdUnitName(config.limAppService, "houdi-lim-app.service"),
-    tunnelUnit: sanitizeSystemdUnitName(config.limTunnelService, "houdi-lim-tunnel.service"),
+    appUnit: sanitizeSystemdUnitName(config.connectorAppService, "houdi-connector-app.service"),
+    tunnelUnit: sanitizeSystemdUnitName(config.connectorTunnelService, "houdi-connector-tunnel.service"),
   };
 }
 
@@ -8893,12 +8932,12 @@ function normalizeConnectorHealthUrl(raw: string, fallback: string): string {
 
 function getConnectorHealthUrls(): { localUrl: string; publicUrl: string } {
   return {
-    localUrl: normalizeConnectorHealthUrl(config.limLocalHealthUrl, "http://127.0.0.1:3333/health"),
-    publicUrl: normalizeConnectorHealthUrl(config.limPublicHealthUrl, "http://127.0.0.1:3333/health"),
+    localUrl: normalizeConnectorHealthUrl(config.connectorLocalHealthUrl, "http://127.0.0.1:3333/health"),
+    publicUrl: normalizeConnectorHealthUrl(config.connectorPublicHealthUrl, "http://127.0.0.1:3333/health"),
   };
 }
 
-type LimQueryResult = {
+type ConnectorQueryResult = {
   ok: boolean;
   found?: boolean;
   account?: string;
@@ -8916,7 +8955,7 @@ type LimQueryResult = {
   detail?: string;
 };
 
-type LimOutputHistoryEntry = {
+type ConnectorOutputHistoryEntry = {
   id: string;
   recordedAt: string;
   traceId?: string | null;
@@ -8943,16 +8982,36 @@ type LimOutputHistoryEntry = {
   } | null;
 };
 
-type LimHistoryResult = {
+type ConnectorHistoryResult = {
   ok: boolean;
   totalStored?: number;
   maxStored?: number;
-  outputs?: LimOutputHistoryEntry[];
+  outputs?: ConnectorOutputHistoryEntry[];
   error?: string;
   detail?: string;
 };
 
-function normalizeLimSourceKey(value: string): string {
+type ConnectorAccountHistoryMessage = {
+  account: string;
+  contact: string;
+  direction?: string;
+  time?: string;
+  text?: string;
+  recordedAt?: string;
+};
+
+type ConnectorAccountHistoryResult = {
+  ok: boolean;
+  accountQuery?: string;
+  matchedAccounts?: string[];
+  totalMessages?: number;
+  returnedMessages?: number;
+  messages?: ConnectorAccountHistoryMessage[];
+  error?: string;
+  detail?: string;
+};
+
+function normalizeConnectorSourceKey(value: string): string {
   return value
     .normalize("NFD")
     .replace(/\p{Diacritic}/gu, "")
@@ -8961,7 +9020,11 @@ function normalizeLimSourceKey(value: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
-function resolveLimAccountFromSource(sourceName: string): { account?: string; error?: string } {
+const CONNECTOR_DEFAULT_SOURCE_ACCOUNT_ALIASES: Record<string, string> = {
+  actualidad: "account_news",
+};
+
+function resolveConnectorAccountFromSource(sourceName: string): { account?: string; error?: string } {
   const raw = sourceName.trim();
   if (!raw) {
     return { error: "fuente vacia" };
@@ -8969,15 +9032,16 @@ function resolveLimAccountFromSource(sourceName: string): { account?: string; er
   if (/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw)) {
     return { error: "fuente no puede ser email" };
   }
-  const normalized = normalizeLimSourceKey(raw);
+  const normalized = normalizeConnectorSourceKey(raw);
   if (!normalized) {
     return { error: "fuente invalida" };
   }
-  const fromMap = config.limSourceAccountMap[normalized];
-  return { account: fromMap || normalized };
+  const fromDefaultMap = CONNECTOR_DEFAULT_SOURCE_ACCOUNT_ALIASES[normalized];
+  const fromMap = config.connectorSourceAccountMap[normalized];
+  return { account: fromMap || fromDefaultMap || normalized };
 }
 
-function buildLimMessagesUrl(account: string, firstName: string, lastName: string, count: number): string {
+function buildConnectorMessagesUrl(account: string, firstName: string, lastName: string, count: number): string {
   const { localUrl } = getConnectorHealthUrls();
   const base = new URL(localUrl);
   base.pathname = "/messages";
@@ -8985,11 +9049,11 @@ function buildLimMessagesUrl(account: string, firstName: string, lastName: strin
   base.searchParams.set("account", account);
   base.searchParams.set("first_name", firstName);
   base.searchParams.set("last_name", lastName);
-  base.searchParams.set("count", String(Math.max(1, Math.min(10, Math.floor(count)))));
+  base.searchParams.set("count", String(Math.max(1, Math.min(5, Math.floor(count)))));
   return base.toString();
 }
 
-function parseLimHistoryLimit(raw: string, fallback = 10, maxLimit = 20): number {
+function parseConnectorHistoryLimit(raw: string, fallback = 5, maxLimit = 5): number {
   const tagged = raw.match(/\b(?:limit|limite|l[ií]mite|top)\s*[:=]?\s*(\d{1,2})\b/i);
   const natural = raw.match(/\b(?:ultimos?|[uú]ltimos?)\s+(\d{1,2})\b/i);
   const trailing = raw.match(/\b(?:list|lista|listar|historial|history|registro|registros|outputs?|salidas?)\s+(\d{1,2})\b/i);
@@ -8998,20 +9062,22 @@ function parseLimHistoryLimit(raw: string, fallback = 10, maxLimit = 20): number
   return Math.max(1, Math.min(maxLimit, Math.floor(limit)));
 }
 
-function buildLimHistoryUrl(limit: number): string {
+const CONNECTOR_HISTORY_FETCH_MAX = 500;
+
+function buildConnectorHistoryUrl(limit: number): string {
   const { localUrl } = getConnectorHealthUrls();
   const base = new URL(localUrl);
-  base.pathname = "/lim/list";
+  base.pathname = "/connector/list";
   base.search = "";
-  base.searchParams.set("limit", String(Math.max(1, Math.min(20, Math.floor(limit)))));
+  base.searchParams.set("limit", String(Math.max(1, Math.min(CONNECTOR_HISTORY_FETCH_MAX, Math.floor(limit)))));
   return base.toString();
 }
 
-async function queryLimOutputHistory(limitInput?: number): Promise<LimHistoryResult> {
-  const limit = Math.max(1, Math.min(20, Math.floor(limitInput ?? 10)));
-  const endpoint = buildLimHistoryUrl(limit);
+async function queryConnectorOutputHistory(limitInput?: number): Promise<ConnectorHistoryResult> {
+  const limit = Math.max(1, Math.min(CONNECTOR_HISTORY_FETCH_MAX, Math.floor(limitInput ?? 5)));
+  const endpoint = buildConnectorHistoryUrl(limit);
   const controller = new AbortController();
-  const timeoutMs = Math.max(30_000, config.limHealthTimeoutMs * 4);
+  const timeoutMs = Math.max(30_000, config.connectorHealthTimeoutMs * 4);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(endpoint, {
@@ -9052,7 +9118,7 @@ async function queryLimOutputHistory(limitInput?: number): Promise<LimHistoryRes
           ? outputRaw.messages
               .map((entry) => (typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : null))
               .filter((entry): entry is Record<string, unknown> => Boolean(entry))
-              .slice(0, 3)
+              .slice(0, 5)
               .map((entry) => ({
                 direction: typeof entry.direction === "string" ? entry.direction : undefined,
                 text: typeof entry.text === "string" ? entry.text : undefined,
@@ -9086,7 +9152,7 @@ async function queryLimOutputHistory(limitInput?: number): Promise<LimHistoryRes
                 messages: outputMessages,
               }
             : null,
-        } satisfies LimOutputHistoryEntry;
+        } satisfies ConnectorOutputHistoryEntry;
       });
 
     return {
@@ -9107,53 +9173,280 @@ async function queryLimOutputHistory(limitInput?: number): Promise<LimHistoryRes
   }
 }
 
-function formatLimHistoryText(result: LimHistoryResult, requestedLimit: number): string {
+function formatConnectorHistoryText(result: ConnectorHistoryResult, requestedLimit: number): string {
   const outputs = result.outputs ?? [];
   const lines: string[] = [];
-  lines.push(`LIM historial | últimos ${outputs.length} (solicitado: ${requestedLimit})`);
-  lines.push(`Buffer: ${result.totalStored ?? outputs.length}/${result.maxStored ?? "?"}`);
+  const formatDateLabel = (value?: string): string => {
+    const raw = (value ?? "").trim();
+    if (!raw) {
+      return "sin fecha";
+    }
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) {
+      return raw;
+    }
+    return parsed.toLocaleString("es-AR", { hour12: false });
+  };
+  const formatDirectionLabel = (value?: string): string => {
+    const direction = normalizeIntentText(value ?? "");
+    if (!direction) {
+      return "Mensaje";
+    }
+    if (/\b(out|outgoing|sent|mine|my|self|own|agent|bot|me|yo|mio|mia|propio|nuestra)\b/.test(direction)) {
+      return "Enviado por tu cuenta";
+    }
+    if (/\b(in|incoming|inbound|received|prospect|lead|contact|cliente|reply)\b/.test(direction)) {
+      return "Recibido del contacto";
+    }
+    return "Mensaje";
+  };
+  lines.push("Historial de consultas CONNECTOR");
+  lines.push(`Mostrando ${outputs.length} resultado(s) recientes (pediste ${requestedLimit}).`);
+  if (typeof result.maxStored === "number" && result.maxStored > 0) {
+    lines.push(`Consultas guardadas: ${result.totalStored ?? outputs.length} de ${result.maxStored}.`);
+  } else {
+    lines.push(`Consultas guardadas: ${result.totalStored ?? outputs.length}.`);
+  }
   if (outputs.length === 0) {
-    lines.push("Sin outputs registrados todavía.");
+    lines.push("Todavía no hay consultas registradas.");
     return lines.join("\n");
   }
   lines.push("");
   outputs.forEach((entry, index) => {
-    const who = [entry.query?.first_name, entry.query?.last_name].filter(Boolean).join(" ").trim() || "-";
-    const sample = (entry.output?.messages ?? [])
-      .map((msg) => truncateInline(msg.text || "(sin texto)", 90))
-      .slice(0, 2);
-    lines.push(
-      [
-        `${index + 1}. [${entry.recordedAt || "-"}] cuenta=${entry.account || "-"} status=${entry.workerStatus ?? 0} id=${entry.id || "-"}`,
-        `   contacto=${entry.output?.contact || who} | ok=${entry.output?.ok === true ? "sí" : "no"} | found=${entry.output?.found === true ? "sí" : "no"} | msgs=${entry.output?.returnedMessages ?? 0}`,
-        ...(sample.length > 0 ? [`   muestra: ${sample.join(" | ")}`] : []),
-      ].join("\n"),
-    );
+    const contactName = [entry.query?.first_name, entry.query?.last_name].filter(Boolean).join(" ").trim();
+    const contact = entry.output?.contact || contactName || "Contacto sin nombre";
+    const account = entry.account || entry.query?.source || "sin cuenta";
+    const messages = entry.output?.messages ?? [];
+    const shownMessages = entry.output?.returnedMessages ?? messages.length;
+    const found = entry.output?.found === true || shownMessages > 0;
+    lines.push(`${index + 1}. ${contact}`);
+    lines.push(`   Fecha: ${formatDateLabel(entry.recordedAt)}`);
+    lines.push(`   Cuenta: ${account}`);
+    lines.push(`   Resultado: ${found ? "Se encontraron mensajes." : "Sin mensajes encontrados."}`);
+    lines.push(`   Mensajes mostrados: ${shownMessages}`);
+    if (messages.length > 0) {
+      lines.push("   Vista rápida:");
+      for (const message of messages.slice(0, 5)) {
+        lines.push(`   - ${formatDirectionLabel(message.direction)}: ${message.text || "(sin texto)"}`);
+      }
+    }
+    if (index < outputs.length - 1) {
+      lines.push("");
+    }
   });
   return lines.join("\n");
 }
 
-async function queryLimMessages(params: {
+function formatConnectorQueryText(result: ConnectorQueryResult, fallbackContact: string): string {
+  const formatDateLabel = (value?: string): string => {
+    const raw = (value ?? "").trim();
+    if (!raw) {
+      return "sin fecha";
+    }
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) {
+      return raw;
+    }
+    return parsed.toLocaleString("es-AR", { hour12: false });
+  };
+  const formatDirectionLabel = (value?: string): string => {
+    const direction = normalizeIntentText(value ?? "");
+    if (!direction) {
+      return "Mensaje";
+    }
+    if (/\b(out|outgoing|sent|mine|my|self|own|agent|bot|me|yo|mio|mia|propio|nuestra)\b/.test(direction)) {
+      return "Enviado por tu cuenta";
+    }
+    if (/\b(in|incoming|inbound|received|prospect|lead|contact|cliente|reply)\b/.test(direction)) {
+      return "Recibido del contacto";
+    }
+    return "Mensaje";
+  };
+  const messages = result.messages ?? [];
+  const shownMessages = result.returnedMessages ?? messages.length;
+  const totalMessages = result.totalMessages ?? shownMessages;
+  const found = result.found === true || shownMessages > 0;
+  const contact = result.contact || fallbackContact;
+  const lines: string[] = [];
+  lines.push(`Consulta CONNECTOR: ${contact}`);
+  lines.push(`Cuenta consultada: ${result.account || "-"}`);
+  lines.push(`Resultado: ${found ? "Se encontraron mensajes." : "No se encontraron mensajes."}`);
+  lines.push(`Mensajes disponibles: ${totalMessages} | Mensajes mostrados: ${shownMessages}`);
+  if (messages.length === 0) {
+    lines.push("");
+    lines.push("No hay mensajes para mostrar.");
+    return lines.join("\n");
+  }
+  lines.push("");
+  lines.push("Mensajes recientes:");
+  for (const [index, message] of messages.entries()) {
+    lines.push(`${index + 1}. ${formatDirectionLabel(message.direction)} (${formatDateLabel(message.time)})`);
+    lines.push(`   ${message.text || "(sin texto)"}`);
+  }
+  return lines.join("\n");
+}
+
+function buildConnectorAccountSelectors(sourceName: string): string[] {
+  const raw = sourceName.trim();
+  if (!raw) {
+    return [];
+  }
+  const normalizedRaw = normalizeConnectorSourceKey(raw);
+  const resolved = resolveConnectorAccountFromSource(raw);
+  const normalizedResolved = normalizedRaw
+    ? normalizeConnectorSourceKey(resolved.account ?? "")
+    : "";
+  const selectors = new Set<string>();
+  const addSelector = (value: string): void => {
+    const normalized = normalizeConnectorSourceKey(value);
+    if (!normalized) {
+      return;
+    }
+    selectors.add(normalized);
+    const root = normalized.split("_")[0]?.trim() ?? "";
+    if (root.length >= 3) {
+      selectors.add(root);
+    }
+  };
+  addSelector(normalizedRaw);
+  if (normalizedResolved) {
+    addSelector(normalizedResolved);
+  }
+  return [...selectors];
+}
+
+function doesConnectorAccountMatchAnySelector(accountRaw: string, selectors: string[]): boolean {
+  const normalizedAccount = normalizeConnectorSourceKey(accountRaw);
+  if (!normalizedAccount || selectors.length === 0) {
+    return false;
+  }
+  return selectors.some((selector) => normalizedAccount === selector || normalizedAccount.startsWith(`${selector}_`));
+}
+
+async function queryConnectorMessagesByAccount(params: {
+  sourceName: string;
+  count?: number;
+}): Promise<ConnectorAccountHistoryResult> {
+  const sourceName = params.sourceName.trim();
+  if (!sourceName) {
+    return { ok: false, error: "missing_source", detail: "cuenta/fuente obligatoria" };
+  }
+  const selectors = buildConnectorAccountSelectors(sourceName);
+  if (selectors.length === 0) {
+    return { ok: false, error: "invalid_source", detail: "fuente invalida" };
+  }
+  const history = await queryConnectorOutputHistory(CONNECTOR_HISTORY_FETCH_MAX);
+  if (!history.ok) {
+    return {
+      ok: false,
+      error: history.error || "lim_history_failed",
+      detail: history.detail || "No pude leer historial CONNECTOR.",
+    };
+  }
+  const outputs = history.outputs ?? [];
+  const maxRows = Math.max(1, Math.min(5, Math.floor(params.count ?? 5)));
+  const matchedAccounts = new Set<string>();
+  const collected: ConnectorAccountHistoryMessage[] = [];
+  let totalMessages = 0;
+  for (const entry of outputs) {
+    const account = (entry.account || entry.query?.source || "").trim();
+    if (!doesConnectorAccountMatchAnySelector(account, selectors)) {
+      continue;
+    }
+    matchedAccounts.add(account || "sin_cuenta");
+    const contactName = [entry.query?.first_name, entry.query?.last_name].filter(Boolean).join(" ").trim();
+    const contact = entry.output?.contact || contactName || "Contacto sin nombre";
+    const messages = [...(entry.output?.messages ?? [])].reverse();
+    for (const message of messages) {
+      totalMessages += 1;
+      collected.push({
+        account: account || "sin_cuenta",
+        contact,
+        direction: message.direction,
+        time: message.time,
+        text: message.text,
+        recordedAt: entry.recordedAt,
+      });
+    }
+  }
+  return {
+    ok: true,
+    accountQuery: sourceName,
+    matchedAccounts: [...matchedAccounts],
+    totalMessages,
+    returnedMessages: Math.min(maxRows, collected.length),
+    messages: collected.slice(0, maxRows),
+  };
+}
+
+function formatConnectorAccountQueryText(result: ConnectorAccountHistoryResult): string {
+  const formatDateLabel = (value?: string): string => {
+    const raw = (value ?? "").trim();
+    if (!raw) {
+      return "sin fecha";
+    }
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) {
+      return raw;
+    }
+    return parsed.toLocaleString("es-AR", { hour12: false });
+  };
+  const formatDirectionLabel = (value?: string): string => {
+    const direction = normalizeIntentText(value ?? "");
+    if (!direction) {
+      return "Mensaje";
+    }
+    if (/\b(out|outgoing|sent|mine|my|self|own|agent|bot|me|yo|mio|mia|propio|nuestra)\b/.test(direction)) {
+      return "Enviado por tu cuenta";
+    }
+    if (/\b(in|incoming|inbound|received|prospect|lead|contact|cliente|reply)\b/.test(direction)) {
+      return "Recibido del contacto";
+    }
+    return "Mensaje";
+  };
+  const messages = result.messages ?? [];
+  const lines: string[] = [];
+  lines.push(`Consulta CONNECTOR por cuenta: ${result.accountQuery || "-"}`);
+  lines.push(`Perfiles detectados: ${(result.matchedAccounts ?? []).join(", ") || "ninguno"}`);
+  lines.push(`Mensajes encontrados: ${result.totalMessages ?? 0} | Mensajes mostrados: ${result.returnedMessages ?? messages.length}`);
+  if (messages.length === 0) {
+    lines.push("");
+    lines.push("No hay mensajes para mostrar para esa cuenta.");
+    return lines.join("\n");
+  }
+  lines.push("");
+  lines.push("Mensajes recientes:");
+  for (const [index, message] of messages.entries()) {
+    lines.push(
+      `${index + 1}. ${formatDirectionLabel(message.direction)} (${formatDateLabel(message.time || message.recordedAt)})`,
+    );
+    lines.push(`   Cuenta: ${message.account} | Perfil: ${message.contact}`);
+    lines.push(`   ${message.text || "(sin texto)"}`);
+  }
+  return lines.join("\n");
+}
+
+async function queryConnectorMessages(params: {
   firstName: string;
   lastName: string;
   sourceName: string;
   count?: number;
   prospectOnly?: boolean;
-}): Promise<LimQueryResult> {
+}): Promise<ConnectorQueryResult> {
   const firstName = params.firstName.trim();
   const lastName = params.lastName.trim();
   const sourceName = params.sourceName.trim();
   if (!firstName || !lastName || !sourceName) {
     return { ok: false, error: "missing_params", detail: "first_name, last_name y fuente son obligatorios." };
   }
-  const resolved = resolveLimAccountFromSource(sourceName);
+  const resolved = resolveConnectorAccountFromSource(sourceName);
   if (!resolved.account) {
     return { ok: false, error: "invalid_source", detail: resolved.error || "fuente invalida" };
   }
 
-  const endpoint = buildLimMessagesUrl(resolved.account, firstName, lastName, params.count ?? 3);
+  const endpoint = buildConnectorMessagesUrl(resolved.account, firstName, lastName, params.count ?? 5);
   const controller = new AbortController();
-  const timeoutMs = Math.max(120_000, config.limHealthTimeoutMs * 8);
+  const timeoutMs = Math.max(120_000, config.connectorHealthTimeoutMs * 8);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(endpoint, {
@@ -9205,7 +9498,7 @@ async function queryLimMessages(params: {
       return true;
     };
     const filteredRows = params.prospectOnly ? mappedRows.filter((row) => isProspectDirection(row.direction)) : mappedRows;
-    const maxRows = Math.max(1, Math.min(10, Math.floor(params.count ?? 3)));
+    const maxRows = Math.max(1, Math.min(5, Math.floor(params.count ?? 5)));
     const selectedRowsPrimary = filteredRows.slice(0, maxRows);
     const selectedRows =
       params.prospectOnly && selectedRowsPrimary.length === 0 && mappedRows.length > 0
@@ -9299,7 +9592,7 @@ function stringifyProbeValue(value: unknown): string {
 async function probeConnectorHealth(url: string): Promise<ConnectorEndpointProbe> {
   const startedAt = Date.now();
   const controller = new AbortController();
-  const timeoutMs = Math.max(1000, config.limHealthTimeoutMs);
+  const timeoutMs = Math.max(1000, config.connectorHealthTimeoutMs);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -9400,14 +9693,14 @@ function buildConnectorStatusText(params: {
 }): string {
   const { localUrl, publicUrl } = getConnectorHealthUrls();
   const lines = [
-    params.actionLabel ? params.actionLabel : "Estado LIM:",
+    params.actionLabel ? params.actionLabel : "Estado CONNECTOR:",
     `App: ${formatConnectorServiceState(params.snapshot.app)}`,
     `Tunnel: ${formatConnectorServiceState(params.snapshot.tunnel)}`,
     `Health local (${localUrl}): ${formatConnectorProbe(params.snapshot.localProbe)}`,
     `Health publico (${publicUrl}): ${formatConnectorProbe(params.snapshot.publicProbe)}`,
   ];
   if (params.snapshot.app.loadState === "not-found" || (params.includeTunnel && params.snapshot.tunnel.loadState === "not-found")) {
-    lines.push("Setup pendiente: ejecuta scripts/install-lim-user-services.sh");
+    lines.push("Setup pendiente: ejecuta scripts/install-connector-user-services.sh");
   }
   return lines.join("\n");
 }
@@ -11321,9 +11614,9 @@ async function maybeHandleNaturalConnectorInstruction(params: {
   const chatId = params.ctx.chat.id;
   const now = Date.now();
   const normalizedText = normalizeIntentText(params.text);
-  const hasExplicitLimCue = /\b\/?lim\b/.test(normalizedText) || /\blim-api\b/.test(normalizedText);
+  const hasExplicitConnectorCue = /\b\/?connector\b/.test(normalizedText) || /\bconnector-api\b/.test(normalizedText);
 
-  if (!hasExplicitLimCue) {
+  if (!hasExplicitConnectorCue) {
     return false;
   }
 
@@ -11355,10 +11648,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
   if (!intent.shouldHandle || !intent.action) {
     return false;
   }
-  if (!config.enableLimControl) {
-    await params.ctx.reply("LIM está deshabilitado por configuración (ENABLE_LIM_CONTROL=false).");
+  if (!config.enableConnectorControl) {
+    await params.ctx.reply("CONNECTOR está deshabilitado por configuración (ENABLE_CONNECTOR_CONTROL=false).");
     await safeAudit({
-      type: "lim.intent_disabled",
+      type: "connector.intent_disabled",
       chatId,
       userId: params.userId,
       details: {
@@ -11369,7 +11662,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     return true;
   }
 
-  lastLimContextByChat.set(chatId, now);
+  lastConnectorContextByChat.set(chatId, now);
 
   if (params.persistUserTurn) {
     await appendConversationTurn({
@@ -11382,18 +11675,18 @@ async function maybeHandleNaturalConnectorInstruction(params: {
   }
 
   if (intent.action === "list") {
-    const requestedLimit = Math.max(1, Math.min(20, Math.floor(intent.count ?? 10)));
-    await replyProgress(params.ctx, `Consultando historial LIM (últimos ${requestedLimit})...`);
-    const history = await queryLimOutputHistory(requestedLimit);
+    const requestedLimit = Math.max(1, Math.min(5, Math.floor(intent.count ?? 5)));
+    await replyProgress(params.ctx, `Consultando historial CONNECTOR (últimos ${requestedLimit})...`);
+    const history = await queryConnectorOutputHistory(requestedLimit);
     if (!history.ok) {
       await params.ctx.reply(
         [
-          "No pude listar historial de LIM.",
+          "No pude listar historial de CONNECTOR.",
           `Detalle: ${truncateInline(history.detail || history.error || "error desconocido", 260)}`,
         ].join("\n"),
       );
       await safeAudit({
-        type: "lim.intent_list_failed",
+        type: "connector.intent_list_failed",
         chatId,
         userId: params.userId,
         details: {
@@ -11406,17 +11699,17 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       });
       return true;
     }
-    const responseText = formatLimHistoryText(history, requestedLimit);
+    const responseText = formatConnectorHistoryText(history, requestedLimit);
     await replyLong(params.ctx, responseText);
     await appendConversationTurn({
       chatId,
       userId: params.userId,
       role: "assistant",
       text: truncateInline(responseText, 3200),
-      source: `${params.source}:lim-intent`,
+      source: `${params.source}:connector-intent`,
     });
     await safeAudit({
-      type: "lim.intent_list",
+      type: "connector.intent_list",
       chatId,
       userId: params.userId,
       details: {
@@ -11430,34 +11723,92 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     return true;
   }
 
+  if (intent.action === "account") {
+    const sourceName = intent.sourceName?.trim() ?? "";
+    if (!sourceName) {
+      await params.ctx.reply('Para consultar por cuenta indica: "connector account_demo" o "connector actualidad".');
+      return true;
+    }
+    await replyProgress(params.ctx, `Consultando CONNECTOR por cuenta: ${sourceName}...`);
+    const result = await queryConnectorMessagesByAccount({
+      sourceName,
+      count: intent.count ?? 5,
+    });
+    if (!result.ok) {
+      await params.ctx.reply(
+        [
+          "No pude consultar CONNECTOR por cuenta.",
+          `Detalle: ${truncateInline(result.detail || result.error || "error desconocido", 260)}`,
+        ].join("\n"),
+      );
+      await safeAudit({
+        type: "connector.intent_account_failed",
+        chatId,
+        userId: params.userId,
+        details: {
+          source: params.source,
+          action: intent.action,
+          sourceName,
+          count: intent.count ?? 5,
+          error: result.error || "",
+          detail: result.detail || "",
+        },
+      });
+      return true;
+    }
+    const responseText = formatConnectorAccountQueryText(result);
+    await replyLong(params.ctx, responseText);
+    await appendConversationTurn({
+      chatId,
+      userId: params.userId,
+      role: "assistant",
+      text: truncateInline(responseText, 3000),
+      source: `${params.source}:connector-intent`,
+    });
+    await safeAudit({
+      type: "connector.intent_account",
+      chatId,
+      userId: params.userId,
+      details: {
+        source: params.source,
+        action: intent.action,
+        sourceName,
+        count: intent.count ?? 5,
+        returnedMessages: result.returnedMessages ?? 0,
+        totalMessages: result.totalMessages ?? 0,
+      },
+    });
+    return true;
+  }
+
   if (intent.action === "query") {
     const firstName = intent.firstName?.trim() ?? "";
     const lastName = intent.lastName?.trim() ?? "";
     const sourceName = intent.sourceName?.trim() ?? "";
     if (!firstName || !lastName || !sourceName) {
       await params.ctx.reply(
-        'Para consultar LIM indica: "consulta LIM first_name:Juan last_name:Perez fuente:account_demo_c_jack [count:3]".',
+        'Para consultar CONNECTOR indica: "consulta CONNECTOR first_name:Juan last_name:Perez fuente:source_demo [count:5]".',
       );
       return true;
     }
 
-    await replyProgress(params.ctx, `Consultando LIM: ${firstName} ${lastName} | fuente ${sourceName}...`);
-    const result = await queryLimMessages({
+    await replyProgress(params.ctx, `Consultando CONNECTOR: ${firstName} ${lastName} | fuente ${sourceName}...`);
+    const result = await queryConnectorMessages({
       firstName,
       lastName,
       sourceName,
-      count: intent.count ?? 3,
+      count: intent.count ?? 5,
       prospectOnly: intent.prospectOnly ?? false,
     });
     if (!result.ok) {
       await params.ctx.reply(
         [
-          "No pude consultar LIM.",
+          "No pude consultar CONNECTOR.",
           `Detalle: ${truncateInline(result.detail || result.error || "error desconocido", 260)}`,
         ].join("\n"),
       );
       await safeAudit({
-        type: "lim.intent_query_failed",
+        type: "connector.intent_query_failed",
         chatId,
         userId: params.userId,
         details: {
@@ -11466,7 +11817,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
           firstName,
           lastName,
           sourceName,
-          count: intent.count ?? 3,
+          count: intent.count ?? 5,
           error: result.error || "",
           detail: result.detail || "",
         },
@@ -11474,36 +11825,17 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       return true;
     }
 
-    const lines: string[] = [];
-    lines.push(`LIM | ${result.contact || `${firstName} ${lastName}`}`);
-    lines.push(`Cuenta: ${result.account || "-"}`);
-    lines.push(`Encontrado: ${result.found ? "sí" : "no"} | Total: ${result.totalMessages ?? 0} | Devueltos: ${result.returnedMessages ?? 0}`);
-    if (result.queryUsed) {
-      lines.push(`Query usada: ${result.queryUsed}`);
-    }
-    if ((result.messages?.length ?? 0) > 0) {
-      lines.push("");
-      lines.push("Mensajes:");
-      for (const [index, message] of (result.messages ?? []).entries()) {
-        lines.push(
-          [
-            `${index + 1}. ${truncateInline(message.text || "(sin texto)", 280)}`,
-            `dir: ${message.direction || "-"} | hora: ${message.time || "-"} | idx: ${message.index ?? "-"}`,
-          ].join("\n"),
-        );
-      }
-    }
-    const responseText = lines.join("\n");
+    const responseText = formatConnectorQueryText(result, `${firstName} ${lastName}`);
     await replyLong(params.ctx, responseText);
     await appendConversationTurn({
       chatId,
       userId: params.userId,
       role: "assistant",
       text: truncateInline(responseText, 3000),
-      source: `${params.source}:lim-intent`,
+      source: `${params.source}:connector-intent`,
     });
     await safeAudit({
-      type: "lim.intent_query",
+      type: "connector.intent_query",
       chatId,
       userId: params.userId,
       details: {
@@ -11512,7 +11844,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         firstName,
         lastName,
         sourceName,
-        count: intent.count ?? 3,
+        count: intent.count ?? 5,
         account: result.account || "",
         found: result.found ?? false,
         returnedMessages: result.returnedMessages ?? 0,
@@ -11530,7 +11862,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       ].join("\n"),
     );
     await safeAudit({
-      type: "lim.intent_blocked_agent",
+      type: "connector.intent_blocked_agent",
       chatId,
       userId: params.userId,
       details: {
@@ -11559,10 +11891,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         userId: params.userId,
         role: "assistant",
         text: truncateInline(responseText, 2800),
-        source: `${params.source}:lim-intent`,
+        source: `${params.source}:connector-intent`,
       });
       await safeAudit({
-        type: "lim.intent_status",
+        type: "connector.intent_status",
         chatId,
         userId: params.userId,
         details: {
@@ -11580,7 +11912,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     if (adminSecurity.isPanicModeEnabled()) {
       await params.ctx.reply("Panic mode está activo: ejecución bloqueada.");
       await safeAudit({
-        type: "lim.intent_blocked_panic",
+        type: "connector.intent_blocked_panic",
         chatId,
         userId: params.userId,
         details: {
@@ -11599,10 +11931,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         profile,
         commandLine,
         kind: "exec",
-        note: `lim natural intent (${intent.action})`,
+        note: `connector natural intent (${intent.action})`,
       });
       await safeAudit({
-        type: "lim.intent_approval_queued",
+        type: "connector.intent_approval_queued",
         chatId,
         userId: params.userId,
         details: {
@@ -11615,7 +11947,7 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       return true;
     }
 
-    await replyProgress(params.ctx, `Gestionando LIM (${intent.action})...`);
+    await replyProgress(params.ctx, `Gestionando CONNECTOR (${intent.action})...`);
     const commandResult = await runProfileCommandCapture({
       profile,
       commandLine,
@@ -11628,14 +11960,14 @@ async function maybeHandleNaturalConnectorInstruction(params: {
         `status=${commandResult.status} exit=${commandResult.exitCode ?? "null"}`;
       await params.ctx.reply(
         [
-          `No pude ejecutar la acción LIM (${intent.action}).`,
+          `No pude ejecutar la acción CONNECTOR (${intent.action}).`,
           `Comando: ${commandLine}`,
           `Detalle: ${truncateInline(detail, 280)}`,
-          "Si faltan units, ejecuta scripts/install-lim-user-services.sh",
+          "Si faltan units, ejecuta scripts/install-connector-user-services.sh",
         ].join("\n"),
       );
       await safeAudit({
-        type: "lim.intent_command_failed",
+        type: "connector.intent_command_failed",
         chatId,
         userId: params.userId,
         details: {
@@ -11665,10 +11997,10 @@ async function maybeHandleNaturalConnectorInstruction(params: {
       userId: params.userId,
       role: "assistant",
       text: truncateInline(responseText, 2800),
-      source: `${params.source}:lim-intent`,
+      source: `${params.source}:connector-intent`,
     });
     await safeAudit({
-      type: "lim.intent_command_ok",
+      type: "connector.intent_command_ok",
       chatId,
       userId: params.userId,
       details: {
@@ -11685,9 +12017,9 @@ async function maybeHandleNaturalConnectorInstruction(params: {
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await params.ctx.reply(`No pude operar LIM: ${message}`);
+    await params.ctx.reply(`No pude operar CONNECTOR: ${message}`);
     await safeAudit({
-      type: "lim.intent_failed",
+      type: "connector.intent_failed",
       chatId,
       userId: params.userId,
       details: {
@@ -15569,7 +15901,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
     }) => Promise<boolean>;
   }> = [
     { name: "self-maintenance", fn: maybeHandleNaturalSelfMaintenanceInstruction },
-    { name: "lim", fn: maybeHandleNaturalConnectorInstruction },
+    { name: "connector", fn: maybeHandleNaturalConnectorInstruction },
     { name: "schedule", fn: maybeHandleNaturalScheduleInstruction },
     { name: "memory", fn: maybeHandleNaturalMemoryInstruction },
     { name: "gmail-recipients", fn: maybeHandleNaturalGmailRecipientsInstruction },
@@ -15616,8 +15948,8 @@ async function maybeHandleNaturalIntentPipeline(params: {
     hasMemoryRecallCue,
     indexedListKind: indexedListContext?.kind ?? null,
     hasPendingWorkspaceDelete: hasPendingWorkspaceDeleteConfirmation(params.ctx.chat.id),
-    hasRecentLimContext: lastLimContextByChat.get(params.ctx.chat.id)
-      ? lastLimContextByChat.get(params.ctx.chat.id)! + LIM_CONTEXT_TTL_MS > Date.now()
+    hasRecentConnectorContext: lastConnectorContextByChat.get(params.ctx.chat.id)
+      ? lastConnectorContextByChat.get(params.ctx.chat.id)! + CONNECTOR_CONTEXT_TTL_MS > Date.now()
       : false,
   });
   const hierarchyNarrowed = hierarchyDecision
@@ -16102,7 +16434,7 @@ async function maybeHandleNaturalIntentPipeline(params: {
           source: delegatedSource,
         }),
     });
-    if (handled && handler.name !== "lim") {
+    if (handled && handler.name !== "connector") {
       const gotResponse = handlerObservedReply || hasAssistantResponseSince(params.ctx.chat.id, handlerStartedAtMs);
       if (!gotResponse) {
         const guardMessage = `No pude confirmar la respuesta del dominio ${handler.name}. Reintentá la instrucción en una sola frase.`;
@@ -16517,8 +16849,9 @@ bot.command("help", async (ctx) => {
     "/agent set <nombre> - Cambiar agente activo para este chat",
     "/subagent [status|list|set <nombre>|auto] - Fijar/soltar delegación de subagentes",
     "/session [status|list] - Estado de session routing/mirroring para este chat",
-    '/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3] - Consultar LIM',
-    "/lim list [limit:10] - Listar historial de outputs LIM",
+    '/connector first_name:<nombre> last_name:<apellido> fuente:<origen> [count:5] - Consultar CONNECTOR',
+    "/connector list [limit:5] - Listar historial de outputs CONNECTOR",
+    "/connector <cuenta> - Consultar mensajes recientes por cuenta/perfiles (ej: /connector account_demo)",
     "/selfskill <instrucción> - Agregar habilidad persistente en AGENTS.md",
     "/selfskill list - Ver habilidades agregadas",
     "/selfskill del <n|last|#id> - Eliminar habilidad agregada",
@@ -16701,7 +17034,7 @@ bot.command("status", async (ctx) => {
       `Lector docs: maxFile=${Math.round(config.docMaxFileBytes / (1024 * 1024))}MB | maxText=${config.docMaxTextChars} chars`,
       `Web browse: ${config.enableWebBrowse ? `on (max results ${config.webSearchMaxResults})` : "off"}`,
       `Gmail account: ${gmailSummary}`,
-      `LIM control: ${config.enableLimControl ? `on | appDir=${toProjectRelativePath(config.limAppDir)} | appUnit=${config.limAppService} | tunnelUnit=${config.limTunnelService}` : "off"}`,
+      `CONNECTOR control: ${config.enableConnectorControl ? `on | appDir=${toProjectRelativePath(config.connectorAppDir)} | appUnit=${config.connectorAppService} | tunnelUnit=${config.connectorTunnelService}` : "off"}`,
       `Archivos inbound: maxFile=${Math.round(config.fileMaxFileBytes / (1024 * 1024))}MB | store=${toProjectRelativePath(path.join(config.workspaceDir, "files"))}`,
       `Imagenes: maxFile=${Math.round(config.imageMaxFileBytes / (1024 * 1024))}MB | store=${imageStorePath}`,
       `Agenda: pending=${scheduledPendingCount} | poll=${config.schedulePollMs}ms`,
@@ -17352,7 +17685,7 @@ bot.command("subagent", async (ctx) => {
     "workspace-ops",
     "web-research",
     "memory-archivist",
-    "lim-ops",
+    "connector-ops",
     "self-maintainer",
     "schedule-ops",
   ];
@@ -18595,9 +18928,9 @@ bot.command("web", async (ctx) => {
   });
 });
 
-bot.command("lim", async (ctx) => {
-  if (!config.enableLimControl) {
-    await ctx.reply("LIM está deshabilitado por configuración (ENABLE_LIM_CONTROL=false).");
+bot.command("connector", async (ctx) => {
+  if (!config.enableConnectorControl) {
+    await ctx.reply("CONNECTOR está deshabilitado por configuración (ENABLE_CONNECTOR_CONTROL=false).");
     return;
   }
 
@@ -18606,27 +18939,28 @@ bot.command("lim", async (ctx) => {
     await ctx.reply(
       [
         "Uso:",
-        "/lim first_name:<nombre> last_name:<apellido> fuente:<origen> [count:3]",
-        "/lim list [limit:10]",
+        "/connector first_name:<nombre> last_name:<apellido> fuente:<origen> [count:5]",
+        "/connector list [limit:5]",
+        "/connector <cuenta>  (ej: /connector account_demo, /connector actualidad)",
       ].join("\n"),
     );
     return;
   }
 
-  const listIntent = detectConnectorNaturalIntent(`lim ${input}`, { allowImplicit: true });
+  const listIntent = detectConnectorNaturalIntent(`connector ${input}`, { allowImplicit: true });
   if (listIntent.shouldHandle && listIntent.action === "list") {
-    const requestedLimit = Math.max(1, Math.min(20, Math.floor(listIntent.count ?? parseLimHistoryLimit(input, 10, 20))));
-    await replyProgress(ctx, `Consultando historial LIM (últimos ${requestedLimit})...`);
-    const history = await queryLimOutputHistory(requestedLimit);
+    const requestedLimit = Math.max(1, Math.min(5, Math.floor(listIntent.count ?? parseConnectorHistoryLimit(input, 5, 5))));
+    await replyProgress(ctx, `Consultando historial CONNECTOR (últimos ${requestedLimit})...`);
+    const history = await queryConnectorOutputHistory(requestedLimit);
     if (!history.ok) {
       await ctx.reply(
         [
-          "No pude listar historial de LIM.",
+          "No pude listar historial de CONNECTOR.",
           `Detalle: ${truncateInline(history.detail || history.error || "error desconocido", 260)}`,
         ].join("\n"),
       );
       await safeAudit({
-        type: "lim.command_list_failed",
+        type: "connector.command_list_failed",
         chatId: ctx.chat.id,
         userId: ctx.from?.id,
         details: {
@@ -18637,10 +18971,10 @@ bot.command("lim", async (ctx) => {
       });
       return;
     }
-    const responseText = formatLimHistoryText(history, requestedLimit);
+    const responseText = formatConnectorHistoryText(history, requestedLimit);
     await replyLong(ctx, responseText);
     await safeAudit({
-      type: "lim.command_list",
+      type: "connector.command_list",
       chatId: ctx.chat.id,
       userId: ctx.from?.id,
       details: {
@@ -18652,7 +18986,54 @@ bot.command("lim", async (ctx) => {
     return;
   }
 
-  const extractLimTaggedValue = (fieldPattern: string): string => {
+  if (listIntent.shouldHandle && listIntent.action === "account") {
+    const sourceName = listIntent.sourceName?.trim() ?? "";
+    if (!sourceName) {
+      await ctx.reply('Para consultar por cuenta usa: "/connector account_demo" o "/connector actualidad".');
+      return;
+    }
+    await replyProgress(ctx, `Consultando CONNECTOR por cuenta: ${sourceName}...`);
+    const result = await queryConnectorMessagesByAccount({
+      sourceName,
+      count: listIntent.count ?? 5,
+    });
+    if (!result.ok) {
+      await ctx.reply(
+        [
+          "No pude consultar CONNECTOR por cuenta.",
+          `Detalle: ${truncateInline(result.detail || result.error || "error desconocido", 260)}`,
+        ].join("\n"),
+      );
+      await safeAudit({
+        type: "connector.command_account_failed",
+        chatId: ctx.chat.id,
+        userId: ctx.from?.id,
+        details: {
+          sourceName,
+          count: listIntent.count ?? 5,
+          error: result.error || "",
+          detail: result.detail || "",
+        },
+      });
+      return;
+    }
+    const responseText = formatConnectorAccountQueryText(result);
+    await replyLong(ctx, responseText);
+    await safeAudit({
+      type: "connector.command_account",
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      details: {
+        sourceName,
+        count: listIntent.count ?? 5,
+        totalMessages: result.totalMessages ?? 0,
+        returnedMessages: result.returnedMessages ?? 0,
+      },
+    });
+    return;
+  }
+
+  const extractConnectorTaggedValue = (fieldPattern: string): string => {
     const match = input.match(
       new RegExp(
         `\\b${fieldPattern}\\s*[:=]\\s*([\\s\\S]*?)(?=\\s+(?:first[_\\s-]?name|last[_\\s-]?name|fuente|source|count)\\s*[:=]|$)`,
@@ -18661,25 +19042,26 @@ bot.command("lim", async (ctx) => {
     );
     return (match?.[1] ?? "").trim();
   };
-  const firstName = extractLimTaggedValue("first[_\\s-]?name");
-  const lastName = extractLimTaggedValue("last[_\\s-]?name");
-  const sourceName = extractLimTaggedValue("(?:fuente|source)");
+  const firstName = extractConnectorTaggedValue("first[_\\s-]?name");
+  const lastName = extractConnectorTaggedValue("last[_\\s-]?name");
+  const sourceName = extractConnectorTaggedValue("(?:fuente|source)");
   const countRaw = Number.parseInt(input.match(/\bcount\s*[:=]\s*(\d{1,2})\b/i)?.[1] ?? "", 10);
-  const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(10, countRaw)) : 3;
+  const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(5, countRaw)) : 5;
 
   if (!firstName || !lastName || !sourceName) {
     await ctx.reply(
       [
         "Faltan parámetros.",
-        "Uso consulta: /lim first_name:Juan last_name:Perez fuente:account_demo_c_jack [count:3]",
-        "Uso listado: /lim list [limit:10]",
+        "Uso consulta: /connector first_name:Juan last_name:Perez fuente:source_demo [count:5]",
+        "Uso listado: /connector list [limit:5]",
+        "Uso por cuenta: /connector account_demo",
       ].join("\n"),
     );
     return;
   }
 
-  await replyProgress(ctx, `Consultando LIM: ${firstName} ${lastName}...`);
-  const result = await queryLimMessages({
+  await replyProgress(ctx, `Consultando CONNECTOR: ${firstName} ${lastName}...`);
+  const result = await queryConnectorMessages({
     firstName,
     lastName,
     sourceName,
@@ -18690,12 +19072,12 @@ bot.command("lim", async (ctx) => {
   if (!result.ok) {
     await ctx.reply(
       [
-        "No pude consultar LIM.",
+        "No pude consultar CONNECTOR.",
         `Detalle: ${truncateInline(result.detail || result.error || "error desconocido", 260)}`,
       ].join("\n"),
     );
     await safeAudit({
-      type: "lim.command_query_failed",
+      type: "connector.command_query_failed",
       chatId: ctx.chat.id,
       userId: ctx.from?.id,
       details: {
@@ -18710,29 +19092,10 @@ bot.command("lim", async (ctx) => {
     return;
   }
 
-  const lines: string[] = [];
-  lines.push(`LIM | ${result.contact || `${firstName} ${lastName}`}`);
-  lines.push(`Cuenta: ${result.account || "-"}`);
-  lines.push(`Encontrado: ${result.found ? "sí" : "no"} | Total: ${result.totalMessages ?? 0} | Devueltos: ${result.returnedMessages ?? 0}`);
-  if (result.queryUsed) {
-    lines.push(`Query usada: ${result.queryUsed}`);
-  }
-  if ((result.messages?.length ?? 0) > 0) {
-    lines.push("");
-    lines.push("Mensajes:");
-    for (const [index, message] of (result.messages ?? []).entries()) {
-      lines.push(
-        [
-          `${index + 1}. ${truncateInline(message.text || "(sin texto)", 280)}`,
-          `dir: ${message.direction || "-"} | hora: ${message.time || "-"} | idx: ${message.index ?? "-"}`,
-        ].join("\n"),
-      );
-    }
-  }
-  const responseText = lines.join("\n");
+  const responseText = formatConnectorQueryText(result, `${firstName} ${lastName}`);
   await replyLong(ctx, responseText);
   await safeAudit({
-    type: "lim.command_query",
+    type: "connector.command_query",
     chatId: ctx.chat.id,
     userId: ctx.from?.id,
     details: {
@@ -20456,7 +20819,7 @@ async function handleIncomingTextMessage(params: {
       });
     }
     const responseText =
-      "SAFE mode: detecté una orden operativa, pero no hubo ejecución confirmada. Reformulá con acción+parámetros o usa comando explícito (/workspace, /gmail, /schedule, /lim, /shell).";
+      "SAFE mode: detecté una orden operativa, pero no hubo ejecución confirmada. Reformulá con acción+parámetros o usa comando explícito (/workspace, /gmail, /schedule, /connector, /shell).";
     await params.ctx.reply(responseText);
     await appendConversationTurn({
       chatId: params.ctx.chat.id,

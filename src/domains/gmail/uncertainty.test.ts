@@ -4,7 +4,7 @@ import { shouldBypassGmailRecipientsAmbiguity } from "./uncertainty.js";
 
 test("bypass ambiguity for explicit email send request", () => {
   assert.equal(
-    shouldBypassGmailRecipientsAmbiguity("escribir un email a nazareno.tomaselli@vrand.biz con noticias de porno"),
+    shouldBypassGmailRecipientsAmbiguity("escribir un email a usuario@example.com con noticias de porno"),
     true,
   );
 });

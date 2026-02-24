@@ -3,7 +3,7 @@ import path from "node:path";
 
 type IntentRouteName =
   | "self-maintenance"
-  | "lim"
+  | "connector"
   | "schedule"
   | "memory"
   | "gmail-recipients"
@@ -74,7 +74,7 @@ type LegacyIntentRouteName = IntentRouteName | "connector";
 
 const KNOWN_ROUTE_NAMES: IntentRouteName[] = [
   "self-maintenance",
-  "lim",
+  "connector",
   "schedule",
   "memory",
   "gmail-recipients",
@@ -85,7 +85,7 @@ const KNOWN_ROUTE_NAMES: IntentRouteName[] = [
 ];
 
 const LEGACY_ROUTE_ALIASES: Record<string, IntentRouteName> = {
-  connector: "lim",
+  connector: "connector",
 };
 
 const SPANISH_STOPWORDS = new Set([
@@ -174,20 +174,20 @@ const DEFAULT_ROUTES: SemanticRouteConfig[] = [
     ],
   },
   {
-    name: "lim",
+    name: "connector",
     threshold: 0.3,
     utterances: [
-      "inicia lim",
-      "deten lim",
-      "reinicia lim",
+      "inicia connector",
+      "deten connector",
+      "reinicia connector",
       "estado del conector",
       "arranca el tunnel",
       "detener cloudflared",
-      "consulta lim first_name",
-      "buscar mensajes en lim",
-      "trae mensajes de contacto en lim",
-      "listar lim",
-      "historial lim",
+      "consulta connector first_name",
+      "buscar mensajes en connector",
+      "trae mensajes de contacto en connector",
+      "listar connector",
+      "historial connector",
     ],
   },
   {
@@ -685,7 +685,7 @@ export class IntentSemanticRouter {
     if (noiseRatio >= 0.22) {
       adaptive -= 0.06;
     }
-    if (/\b(gmail|mail|email|lim|workspace|archivo|carpeta|recordatorio|noticias|web)\b/.test(normalizedText)) {
+    if (/\b(gmail|mail|email|connector|workspace|archivo|carpeta|recordatorio|noticias|web)\b/.test(normalizedText)) {
       adaptive += 0.03;
     }
     return clamp(adaptive, 0.05, 0.95);

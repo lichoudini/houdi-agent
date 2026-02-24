@@ -1,7 +1,7 @@
 # Houdi Agent - Instalación en Otra PC
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Nazareno Tomaselli & Vrand**
+Autores del repositorio: **Houdi Contributors**
 
 Esta guía deja una instalación reproducible para que cualquier persona pueda correr su propia instancia.
 

@@ -2,7 +2,7 @@
 
 ## 0. Perfiles de operación
 - `full-control` (host propio): mantener `DEFAULT_AGENT=operator` y usar `/agent set admin` solo para acciones puntuales de alto privilegio. Monitorear `journalctl`.
-- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false`/`ENABLE_LIM_CONTROL=false` salvo necesidad.
+- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false`/`ENABLE_CONNECTOR_CONTROL=false` salvo necesidad.
 
 ## 1. Arranque normal
 ```bash
@@ -88,9 +88,6 @@ Comandos operativos:
 - `/intentcurate [n] [apply]`: promoción de utterances desde errores
 - `/intentversion [list|save|rollback]`: snapshots y rollback
 - `/intentcanary [status|set <id> <pct>|off]`: rollout canary
-- `npm run dataset:report:accuracy -- --limit=3000 --target=0.9`: accuracy por dominio (semantic/shadow + ejecución)
-- `npm run dataset:report:accuracy:non-lim -- --limit=3000`: accuracy por dominio operativo (excluye `lim`)
-- `npm run debug:intent:last20:non-lim`: revisión rápida de los últimos 20 intentos con estado `exec=OK|FAIL|NO_EXEC`
 
 Workers automáticos en segundo plano:
 

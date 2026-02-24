@@ -7,7 +7,7 @@ Repositorio oficial:
 - https://github.com/lichoudini/houdi-agent
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Nazareno Tomaselli & Vrand**
+Autores del repositorio: **Houdi Contributors**
 
 ## Posicionamiento y comunicación del proyecto
 
@@ -70,14 +70,14 @@ Perfil `full-control` (equipo propio y de confianza):
 
 - Objetivo: máxima autonomía operativa.
 - Mantener `DEFAULT_AGENT=operator` y cambiar temporalmente a `admin` solo para acciones puntuales.
-- Sugerido: habilitar solo lo que realmente uses (`ENABLE_REBOOT_COMMAND`, `ENABLE_LIM_CONTROL`, `ENABLE_GMAIL_ACCOUNT`).
+- Sugerido: habilitar solo lo que realmente uses (`ENABLE_REBOOT_COMMAND`, `ENABLE_CONNECTOR_CONTROL`, `ENABLE_GMAIL_ACCOUNT`).
 - Ejecutar en host dedicado y con monitoreo de logs.
 
 Perfil `moderated` (entorno compartido o más estricto):
 
 - Objetivo: minimizar riesgo de ejecución accidental.
 - Requerido: `DEFAULT_AGENT=operator` (default del proyecto).
-- Sugerido: mantener `ENABLE_REBOOT_COMMAND=false` y `ENABLE_LIM_CONTROL=false` si no son imprescindibles.
+- Sugerido: mantener `ENABLE_REBOOT_COMMAND=false` y `ENABLE_CONNECTOR_CONTROL=false` si no son imprescindibles.
 - Para tareas sensibles, cambiar agente temporalmente: `/agent set admin` y luego volver a `/agent set operator`.
 - Reducir allowlists en `agents/operator.json` y reservar `agents/admin.json` para casos puntuales.
 
@@ -305,14 +305,14 @@ cp .env.example .env
 - `GMAIL_REFRESH_TOKEN` (refresh token del usuario Gmail)
 - `GMAIL_ACCOUNT_EMAIL` (opcional, solo informativo)
 - `GMAIL_MAX_RESULTS` (default: `10`)
-- `ENABLE_LIM_CONTROL` (default: `false`)
-- `LIM_APP_DIR` (default: `./lim-app`)
-- `LIM_APP_SERVICE` (default: `houdi-lim-app.service`)
-- `LIM_TUNNEL_SERVICE` (default: `houdi-lim-tunnel.service`)
-- `LIM_LOCAL_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
-- `LIM_PUBLIC_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
-- `LIM_HEALTH_TIMEOUT_MS` (default: `7000`)
-- `LIM_SOURCE_ACCOUNT_MAP_JSON` (opcional, mapeo `fuente -> account`, JSON string)
+- `ENABLE_CONNECTOR_CONTROL` (default: `false`)
+- `CONNECTOR_APP_DIR` (default: `./connector-app`)
+- `CONNECTOR_APP_SERVICE` (default: `houdi-connector-app.service`)
+- `CONNECTOR_TUNNEL_SERVICE` (default: `houdi-connector-tunnel.service`)
+- `CONNECTOR_LOCAL_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
+- `CONNECTOR_PUBLIC_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
+- `CONNECTOR_HEALTH_TIMEOUT_MS` (default: `7000`)
+- `CONNECTOR_SOURCE_ACCOUNT_MAP_JSON` (opcional, mapeo `fuente -> account`, JSON string)
 - `HOUDI_LOCAL_API_ENABLED` (default: `true`, habilita bridge local CLI->bot)
 - `HOUDI_LOCAL_API_HOST` (default: `127.0.0.1`)
 - `HOUDI_LOCAL_API_PORT` (default: `3210`)
@@ -412,66 +412,10 @@ Persistir bridge WhatsApp con systemd --user:
 - `Meta Graph API (HTTP)`: bridge de WhatsApp Cloud API (webhook + outbound).
 - `dotenv`, `typescript`, `tsx`: configuración y toolchain de ejecución.
 
-## Dataset LATAM rapido (intent router)
+## Nota de privacidad del repositorio
 
-Flujo recomendado para ampliar cobertura regional (AR/CL/MX) y validar sin tocar produccion:
-
-1. Generar semilla LATAM:
-
-```bash
-npm run dataset:seed:latam
-```
-
-2. Extraer dataset debil desde ultimos mensajes Telegram (log temporal):
-
-```bash
-npm run dataset:from:last20
-```
-
-Opcional (recomendado): extraer intents reales desde `houdi-audit.log`:
-
-```bash
-npm run dataset:from:audit
-```
-
-3. Preparar merge + dedupe + split train/holdout:
-
-```bash
-node tools/experiments/intent-dataset-prepare.mjs \
-  --inputs=houdi-intent-router-dataset.jsonl,datasets/intent-latam.seed.jsonl,datasets/intent-from-last20.jsonl,datasets/intent-from-audit.jsonl
-```
-
-4. Evaluar holdout:
-
-```bash
-npm run dataset:eval:holdout
-```
-
-Reporte de accuracy (interpretación + ejecución por dominio):
-
-```bash
-npm run dataset:report:accuracy -- --limit=3000 --target=0.9
-npm run dataset:report:accuracy:non-lim -- --limit=3000
-```
-
-5. Optimizar router en dry-run (sin tocar `intent-routes.json`):
-
-```bash
-npm run dataset:optimize:router
-```
-
-Para aplicar cambios de thresholds/negativos al router:
-
-```bash
-npm run dataset:optimize:router -- --apply
-```
-
-Atajos utiles:
-- `npm run dataset:prepare`: usa defaults (base + semilla LATAM).
-- `npm run debug:last20`: muestra resumen rapido de `runtime/telegram-last20.jsonl`.
-- `npm run debug:intent:last20`: muestra ultimas rutas `intent.route` con estado de ejecución (`exec=OK|FAIL|NO_EXEC`).
-- `npm run debug:intent:last20:non-lim`: igual, excluyendo ruta `lim`.
-- Salidas por default: `workspace/state/intent-dataset-train.jsonl` y `workspace/state/intent-dataset-holdout.jsonl`.
+Este repositorio excluye datasets y utilidades experimentales derivadas de conversaciones reales
+(`last20`, `audit-derived`) para evitar publicar contexto operativo o datos de usuario.
 
 Requisitos Slack (Socket Mode, inspirado en flujo OpenClaw):
 1. Crear Slack App.
@@ -634,7 +578,7 @@ Memoria por CLI:
 
 ```bash
 npm run cli -- memory status
-npm run cli -- memory search "LIM"
+npm run cli -- memory search "CONNECTOR"
 npm run cli -- memory view memory/2026-02-20.md 1 80
 npm run cli -- remember "nota rápida desde CLI"
 ```
@@ -813,54 +757,58 @@ Nota de seguridad:
 - El bot exige que el agente activo tenga `gmail-api` en `allowCommands` (incluido en `operator` y `admin`).
 - En las respuestas, los IDs se muestran como `#<valor>` (además del valor crudo en `` `...` ``), sin prefijo `id_`.
 
-## Control LIM (natural)
+## Control CONNECTOR (natural)
 
-Con `ENABLE_LIM_CONTROL=true`, puedes operar una app externa y su túnel sin comandos:
+Con `ENABLE_CONNECTOR_CONTROL=true`, puedes operar una app externa y su túnel sin comandos:
 
-- `estado de LIM`
-- `levantá LIM`
-- `reiniciá LIM`
-- `apagá LIM`
-- `levantá LIM solo app` (sin tunnel)
+- `estado de CONNECTOR`
+- `levantá CONNECTOR`
+- `reiniciá CONNECTOR`
+- `apagá CONNECTOR`
+- `levantá CONNECTOR solo app` (sin tunnel)
 
 Regla de activación:
 
-- El dominio LIM solo se activa si el mensaje incluye explícitamente `LIM`/`lim` (o `/lim`).
-- Si no aparece `lim`, el bot no entra al flujo LIM (evita confusiones con otras conversaciones).
+- El dominio CONNECTOR solo se activa si el mensaje incluye explícitamente `CONNECTOR`/`connector` (o `/connector`).
+- Si no aparece `connector`, el bot no entra al flujo CONNECTOR (evita confusiones con otras conversaciones).
 
-Consulta directa de mensajes LIM (contacto + fuente):
+Consulta directa de mensajes CONNECTOR (contacto + fuente):
 
-- `/lim first_name:Juan last_name:Perez fuente:account_demo_c_jack count:3`
-- `/lim list [limit:10]`
-- `consulta LIM first_name:Juan last_name:Perez fuente:account_demo_c_jack`
-- `revisar LIM de Rodrigo Toscano en linkedin marylin`
-- `trae los ultimos 3 mensajes de Rodrigo Toscano en linkedin marylin`
-- `historial lim 10`
+- `/connector first_name:Juan last_name:Perez fuente:source_demo count:5`
+- `/connector list [limit:5]`
+- `/connector account_demo` (consulta por cuenta/perfiles)
+- `/connector actualidad` (alias a `account_news`)
+- `consulta CONNECTOR first_name:Juan last_name:Perez fuente:source_demo`
+- `revisar CONNECTOR de Persona Ejemplo en linkedin profile_a`
+- `trae los ultimos 5 mensajes de Persona Ejemplo en linkedin profile_a`
+- `historial connector`
+- `connector account_demo`
 
-Notas de consulta LIM:
+Notas de consulta CONNECTOR:
 
-- En lenguaje natural, `count` por defecto es `3` (max `10`).
+- En lenguaje natural, `count` por defecto es `5` (max `5`).
 - La lectura prioriza mensajes del prospecto (entrantes/no propios).
 - El parser usa estrategia híbrida (reglas + fallback IA) para extraer `first_name`, `last_name`, `fuente` y reducir errores de interpretación en frases libres.
-- En `/lim list`, `limit` por defecto es `10` y el máximo es `20`.
+- En `/connector list`, `limit` por defecto es `5` y el máximo es `5`.
+- Consulta por cuenta (`connector <cuenta>`) usa historial global CONNECTOR y devuelve hasta 5 mensajes recientes cruzando todos los perfiles de esa cuenta.
 
 `fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
 
 ```env
-LIM_SOURCE_ACCOUNT_MAP_JSON={"linkedin":"linkedin_marylin","linkedin_marylin":"linkedin_marylin","linkedin_martin":"linkedin_martin","account_demo_b":"account_demo_b_marylin","account_demo_b_manuel":"account_demo_b_manuel","account_demo_c":"account_demo_c_jack","account_demo_a":"account_demo_a"}
+CONNECTOR_SOURCE_ACCOUNT_MAP_JSON={"source_a":"account_main","source_b":"account_ops","news":"account_news"}
 ```
 
 Instalación de servicios `systemd --user` para dejarlo persistente:
 
 ```bash
 cd /home/houdi/houdi-agent
-./scripts/install-lim-user-services.sh
+./scripts/install-connector-user-services.sh
 ```
 
 El script crea:
-- `houdi-lim-app.service`
-- `houdi-lim-tunnel.service`
-- `houdi-lim-stack.target`
+- `houdi-connector-app.service`
+- `houdi-connector-tunnel.service`
+- `houdi-connector-stack.target`
 
 ## Navegación Web
 

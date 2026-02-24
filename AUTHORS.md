@@ -1,4 +1,3 @@
 # Authors
 
-- Nazareno Tomaselli
-- Vrand
+- Houdi Contributors

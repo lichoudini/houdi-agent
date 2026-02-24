@@ -19,7 +19,7 @@ Elevar robustez del enrutamiento natural para reducir:
    - dominios macro: `communication`, `files`, `operations`, `planning-memory`, `knowledge`, `social`
    - archivo: `src/domains/router/hierarchical.ts`
 3. filtro contextual:
-   - pending confirm, referencias indexadas, follow-up corto, pistas explicitas LIM/Gmail/workspace
+   - pending confirm, referencias indexadas, follow-up corto, pistas explicitas CONNECTOR/Gmail/workspace
    - archivo: `src/domains/router/context-filter.ts`
 4. router semantico hibrido:
    - lexical cosine + BM25 + char n-grams + negativos por ruta
@@ -59,7 +59,7 @@ Formula conceptual:
 - gating de campos requeridos para acciones sensibles:
   - `gmail.send`: `to`, `subject/body` segun accion
   - `workspace`: ruta/selectores/nuevo nombre segun accion
-  - `connector(LIM)`: `first_name`, `last_name`, `fuente`
+  - `connector(CONNECTOR)`: `first_name`, `last_name`, `fuente`
   - `schedule edit/delete`: identificador de tarea
   - `gmail-recipients`: nombre/email segun ABM
 

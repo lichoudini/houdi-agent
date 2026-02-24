@@ -43,18 +43,17 @@ test("gmail recipients manager cleans legacy noisy Carla rows on list", async ()
   });
   store.upsert({
     chatId,
-    name: "naza",
-    nameKey: "naza",
-    email: "nazareno.tomaselli@vrand.biz",
+    name: "alias",
+    nameKey: "alias",
+    email: "usuario@example.com",
   });
 
   const manager = new GmailRecipientsManager(store, normalizeIntentText);
   const rows = manager.list(chatId);
   assert.equal(rows.length, 2);
-  assert.equal(rows[0]?.name, "Carla");
-  assert.equal(rows[0]?.email, "carla.ops@empresa.com");
-  assert.equal(rows[1]?.name, "naza");
+  const byName = new Map(rows.map((row) => [row.name, row]));
+  assert.equal(byName.get("Carla")?.email, "carla.ops@empresa.com");
+  assert.equal(byName.has("alias"), true);
 
   await fs.rm(tempDir, { recursive: true, force: true });
 });
-

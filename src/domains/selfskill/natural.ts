@@ -128,7 +128,7 @@ export function isLikelySelfSkillDraftLine(text: string, textNormalized: string)
   }
 
   const likelyOtherDomain =
-    /\b(envia|enviar|correo|gmail|email|mail|workspace|archivo|carpeta|noticias|web|internet|recordame|recordar|agenda|tarea|lim|conector|reboot|reinicia|actualiza)\b/.test(
+    /\b(envia|enviar|correo|gmail|email|mail|workspace|archivo|carpeta|noticias|web|internet|recordame|recordar|agenda|tarea|connector|conector|reboot|reinicia|actualiza)\b/.test(
       textNormalized,
     );
   if (likelyOtherDomain) {

@@ -67,36 +67,36 @@ const deps = {
   shouldAvoidLiteralBodyFallback: parsers.shouldAvoidLiteralBodyFallback,
   parseNaturalLimit: parsers.parseNaturalLimit,
   buildNaturalGmailQuery: parsers.buildNaturalGmailQuery,
-  gmailAccountEmail: "jose@vrand.biz",
+  gmailAccountEmail: "owner@example.com",
 };
 
 test("gmail send with news topic keeps auto-content mode and avoids missing-subject AI override", () => {
   const intent = detectGmailNaturalIntent(
-    "Enviar un correo a nazareno.tomaselli@vrand.biz con las ultimas novedades de boca juniors.",
+    "Enviar un correo a usuario@example.com con las ultimas novedades de boca juniors.",
     deps,
   );
   assert.equal(intent.shouldHandle, true);
   assert.equal(intent.action, "send");
-  assert.equal(intent.to, "nazareno.tomaselli@vrand.biz");
+  assert.equal(intent.to, "usuario@example.com");
   assert.equal(intent.autoContentKind, "news");
   assert.notEqual(intent.forceAiByMissingSubject, true);
 });
 
 test("gmail send with typoed news words still routes to news auto-content", () => {
   const intent = detectGmailNaturalIntent(
-    "enviar un correo a nazareno.tomaselli@vrand.biz con la sultimas noveades de boca juniors",
+    "enviar un correo a usuario@example.com con la sultimas noveades de boca juniors",
     deps,
   );
   assert.equal(intent.shouldHandle, true);
   assert.equal(intent.action, "send");
-  assert.equal(intent.to, "nazareno.tomaselli@vrand.biz");
+  assert.equal(intent.to, "usuario@example.com");
   assert.equal(intent.autoContentKind, "news");
   assert.notEqual(intent.forceAiByMissingSubject, true);
 });
 
 test("gmail send with explicit subject/body keeps explicit values", () => {
   const intent = detectGmailNaturalIntent(
-    "Enviar correo a nazareno.tomaselli@vrand.biz asunto:Hola mensaje:Te escribo para confirmar.",
+    "Enviar correo a usuario@example.com asunto:Hola mensaje:Te escribo para confirmar.",
     deps,
   );
   assert.equal(intent.shouldHandle, true);
@@ -107,24 +107,24 @@ test("gmail send with explicit subject/body keeps explicit values", () => {
 
 test("gmail send parses natural cc syntax without labels", () => {
   const intent = detectGmailNaturalIntent(
-    "Enviar un correo a nazareno.tomaselli@vrand.biz cc a patagonads@gmail.com",
+    "Enviar un correo a usuario@example.com cc a copia@example.com",
     deps,
   );
   assert.equal(intent.shouldHandle, true);
   assert.equal(intent.action, "send");
-  assert.equal(intent.to, "nazareno.tomaselli@vrand.biz");
-  assert.equal(intent.cc, "patagonads@gmail.com");
+  assert.equal(intent.to, "usuario@example.com");
+  assert.equal(intent.cc, "copia@example.com");
 });
 
 test("gmail send with 'sobre temas de' requests auto-generated body flow", () => {
   const intent = detectGmailNaturalIntent(
-    "Enviar correo a nazareno.tomaselli@vrand.biz con cc patagonads@gmail.com sobre temas de marketing",
+    "Enviar correo a usuario@example.com con cc copia@example.com sobre temas de marketing",
     deps,
   );
   assert.equal(intent.shouldHandle, true);
   assert.equal(intent.action, "send");
-  assert.equal(intent.to, "nazareno.tomaselli@vrand.biz");
-  assert.equal(intent.cc, "patagonads@gmail.com");
+  assert.equal(intent.to, "usuario@example.com");
+  assert.equal(intent.cc, "copia@example.com");
   assert.equal(intent.draftRequested, true);
   assert.notEqual(intent.forceAiByMissingSubject, true);
 });

@@ -45,7 +45,7 @@ const parsers = createGmailTextParsers({
 
 test("extractNewsTopicFromText obtiene tema en envio con novedades y destinatario", () => {
   const topic = parsers.extractNewsTopicFromText(
-    "Enviar un correo a nazareno.tomaselli@vrand.biz con las ultimas novedades de boca juniors.",
+    "Enviar un correo a usuario@example.com con las ultimas novedades de boca juniors.",
   );
   assert.equal(topic, "boca juniors");
 });

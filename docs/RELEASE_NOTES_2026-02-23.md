@@ -17,8 +17,8 @@ Este release endurece el enrutado por contexto, mejora la operación de comandos
   - Exposición operativa de `/eco on|off|status`.
   - Estado visible en `/status`.
   - Variables de configuración para default y tope de tokens.
-- LIM:
-  - Soporte explícito de `/lim list [limit:10]` para historial de outputs.
+- CONNECTOR:
+  - Soporte explícito de `/connector list [limit:10]` para historial de outputs.
   - Auditoría específica para éxito/falla de listados.
 - UX de salida:
   - Formateo "touch-friendly" para IDs (`messageId/threadId/draftId`) y rutas de `workspace` en respuestas de chat.
@@ -38,7 +38,7 @@ Este release endurece el enrutado por contexto, mejora la operación de comandos
 - README actualizado con:
   - comando `/mode`,
   - sección de Modo ECO,
-  - ejemplos y límites de `/lim list`.
+  - ejemplos y límites de `/connector list`.
 - `docs/PROJECT.md` actualizado con un overview alineado al estado actual del sistema.
 
 ## Validación

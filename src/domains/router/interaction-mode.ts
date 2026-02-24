@@ -7,7 +7,7 @@ function hasOperationalVerb(normalizedText: string): boolean {
 }
 
 function hasOperationalNoun(normalizedText: string): boolean {
-  return /\b(workspace|archivo|carpeta|correo|gmail|email|mail|recordatorio|tarea|lim|web|internet|noticia|noticias|documento|pdf|csv|json|html|skill|habilidad|regla)\b/.test(
+  return /\b(workspace|archivo|carpeta|correo|gmail|email|mail|recordatorio|tarea|connector|web|internet|noticia|noticias|documento|pdf|csv|json|html|skill|habilidad|regla)\b/.test(
     normalizedText,
   );
 }

@@ -1,7 +1,7 @@
 # Houdi Agent - Project Overview
 
 Versión actual: **0.63b**  
-Autores del repositorio: **Nazareno Tomaselli & Vrand**
+Autores del repositorio: **Houdi Contributors**
 
 ## Objetivo
 Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a automatizar tareas en una PC Linux con controles de seguridad por capas, auditoría y operación continua.
@@ -12,7 +12,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 - Pipeline de intención híbrido (reglas + router semántico + fallback IA) para operar en lenguaje natural.
 - Persistencia de estado en SQLite para contexto crítico de operación.
 - Modo de seguridad por agentes (`operator` por defecto, `admin` para elevación puntual) con allowlist y aprobaciones explícitas.
-- Integraciones productivas: Gmail, web browsing/documentos, tareas programadas, memoria y control LIM.
+- Integraciones productivas: Gmail, web browsing/documentos, tareas programadas, memoria y control CONNECTOR.
 
 ## Capacidades funcionales
 
@@ -28,7 +28,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 - Productividad:
   - Tareas programadas (`/task`) y recordatorios con parsing natural de fecha/hora.
   - Integración Gmail (listado, lectura, draft, envío, reply/forward, libreta de destinatarios).
-  - Integración LIM (`/lim`) para consulta operativa y listado de historial (`/lim list`).
+  - Integración CONNECTOR (`/connector`) para consulta operativa y listado de historial (`/connector list`).
 - Memoria y aprendizaje:
   - Notas y memoria operativa (`/remember`, `/memory ...`).
   - Aprendizaje local de intereses y sugerencias proactivas con cuota diaria.
@@ -57,7 +57,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 - Núcleo:
   - normalización y clasificación de interacción,
   - route narrowing por capas,
-  - enrutado por dominio (gmail, workspace, document, web, lim, schedule, memory, self-maintenance),
+  - enrutado por dominio (gmail, workspace, document, web, connector, schedule, memory, self-maintenance),
   - ejecución de acción con policy checks y auditoría.
 - Salida:
   - respuestas largas segmentadas,

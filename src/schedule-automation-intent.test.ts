@@ -35,14 +35,14 @@ const deps = {
   sanitizeTitle,
 };
 
-test("detects daily lim automation", () => {
+test("detects daily connector automation", () => {
   const parsed = detectScheduledAutomationIntent({
-    text: "Todos los dias 9am ejecutar lista lim",
+    text: "Todos los dias 9am ejecutar lista connector",
     ...deps,
   });
   assert.equal(parsed.recurrenceDaily, true);
-  assert.equal(parsed.domain, "lim");
-  assert.equal(parsed.instruction, "lista lim");
+  assert.equal(parsed.domain, "connector");
+  assert.equal(parsed.instruction, "lista connector");
 });
 
 test("detects scheduled web automation", () => {

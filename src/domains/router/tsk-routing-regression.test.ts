@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { applyIntentRouteLayers } from "./route-layers.js";
 import { buildIntentRouterContextFilter } from "./context-filter.js";
 
-const candidates = ["self-maintenance", "lim", "schedule", "memory", "gmail-recipients", "gmail", "workspace", "document", "web"];
+const candidates = ["self-maintenance", "connector", "schedule", "memory", "gmail-recipients", "gmail", "workspace", "document", "web"];
 
 function baseDeps() {
   return {
@@ -21,8 +21,8 @@ function baseDeps() {
     getPendingWorkspaceDeletePath: () => null,
     getLastGmailResultsCount: () => 0,
     getLastListedFilesCount: () => 0,
-    getLastLimContextAt: () => 0,
-    limContextTtlMs: 60_000,
+    getLastConnectorContextAt: () => 0,
+    connectorContextTtlMs: 60_000,
   };
 }
 

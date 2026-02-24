@@ -132,7 +132,7 @@ Se incorporaron mejoras de robustez del pipeline de enrutamiento natural:
 
 - Router semántico híbrido con BM25, alpha adaptivo por ruta/mensaje y penalización de negativos.
 - Capa jerárquica coarse->fine para reducción temprana de candidatos por dominio.
-- Filtro contextual reforzado para casos críticos (`/lim`, Gmail, workspace, confirmaciones pendientes).
+- Filtro contextual reforzado para casos críticos (`/connector`, Gmail, workspace, confirmaciones pendientes).
 - Abstención por incertidumbre (clarificación automática) y gating tipado para parámetros requeridos.
 - Soporte multi-intent secuencial con resumen final por pasos.
 - Dataset de enrutamiento enriquecido con señales de capas, jerarquía, ensemble y extracción tipada.

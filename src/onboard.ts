@@ -588,7 +588,7 @@ async function main(): Promise<void> {
         "",
         "Qué hace:",
         "- Configura .env paso a paso (Telegram, OpenAI, Gmail, workspace, bridge local y WhatsApp bridge).",
-        "- Configura integración externa opcional (LIM).",
+        "- Configura integración externa opcional (CONNECTOR).",
         "- Opcionalmente ejecuta npm install, npm run build e instala servicio systemd.",
         "",
         "Flags:",
@@ -771,12 +771,12 @@ async function main(): Promise<void> {
       "WHATSAPP_REPLY_CHUNK_MAX_CHARS",
       "WHATSAPP_EVENT_DEDUPE_TTL_MS",
       "WHATSAPP_SEND_BRIDGE_ERRORS_TO_USER",
-      "ENABLE_LIM_CONTROL",
-      "LIM_APP_DIR",
-      "LIM_APP_SERVICE",
-      "LIM_TUNNEL_SERVICE",
-      "LIM_LOCAL_HEALTH_URL",
-      "LIM_PUBLIC_HEALTH_URL",
+      "ENABLE_CONNECTOR_CONTROL",
+      "CONNECTOR_APP_DIR",
+      "CONNECTOR_APP_SERVICE",
+      "CONNECTOR_TUNNEL_SERVICE",
+      "CONNECTOR_LOCAL_HEALTH_URL",
+      "CONNECTOR_PUBLIC_HEALTH_URL",
     ]);
 
     printHeading("Paso 1/7 - Configuración base");
@@ -990,39 +990,39 @@ async function main(): Promise<void> {
 
     printHeading("\nPaso 7/8 - Integración externa opcional");
     const enableLim = await resolveYesNo(
-      "Habilitar control de LIM externo",
-      (envMap.get("ENABLE_LIM_CONTROL") || "false").toLowerCase() === "true",
+      "Habilitar control de CONNECTOR externo",
+      (envMap.get("ENABLE_CONNECTOR_CONTROL") || "false").toLowerCase() === "true",
     );
-    envMap.set("ENABLE_LIM_CONTROL", normalizeBoolean(enableLim));
+    envMap.set("ENABLE_CONNECTOR_CONTROL", normalizeBoolean(enableLim));
     if (enableLim) {
-      const limAppDir = normalizeDirValue(
-        await resolveLine("LIM_APP_DIR", {
-          defaultValue: envMap.get("LIM_APP_DIR") || "./lim-app",
+      const connectorAppDir = normalizeDirValue(
+        await resolveLine("CONNECTOR_APP_DIR", {
+          defaultValue: envMap.get("CONNECTOR_APP_DIR") || "./connector-app",
           required: true,
-        }, "LIM_APP_DIR"),
-        "./lim-app",
+        }, "CONNECTOR_APP_DIR"),
+        "./connector-app",
       );
-      const limAppService = await resolveLine("LIM_APP_SERVICE", {
-        defaultValue: envMap.get("LIM_APP_SERVICE") || "houdi-lim-app.service",
+      const connectorAppService = await resolveLine("CONNECTOR_APP_SERVICE", {
+        defaultValue: envMap.get("CONNECTOR_APP_SERVICE") || "houdi-connector-app.service",
         required: true,
-      }, "LIM_APP_SERVICE");
-      const limTunnelService = await resolveLine("LIM_TUNNEL_SERVICE", {
-        defaultValue: envMap.get("LIM_TUNNEL_SERVICE") || "houdi-lim-tunnel.service",
+      }, "CONNECTOR_APP_SERVICE");
+      const connectorTunnelService = await resolveLine("CONNECTOR_TUNNEL_SERVICE", {
+        defaultValue: envMap.get("CONNECTOR_TUNNEL_SERVICE") || "houdi-connector-tunnel.service",
         required: true,
-      }, "LIM_TUNNEL_SERVICE");
-      const limLocalHealth = await resolveLine("LIM_LOCAL_HEALTH_URL", {
-        defaultValue: envMap.get("LIM_LOCAL_HEALTH_URL") || "http://127.0.0.1:3333/health",
+      }, "CONNECTOR_TUNNEL_SERVICE");
+      const connectorLocalHealth = await resolveLine("CONNECTOR_LOCAL_HEALTH_URL", {
+        defaultValue: envMap.get("CONNECTOR_LOCAL_HEALTH_URL") || "http://127.0.0.1:3333/health",
         required: true,
-      }, "LIM_LOCAL_HEALTH_URL");
-      const limPublicHealth = await resolveLine("LIM_PUBLIC_HEALTH_URL", {
-        defaultValue: envMap.get("LIM_PUBLIC_HEALTH_URL") || limLocalHealth,
+      }, "CONNECTOR_LOCAL_HEALTH_URL");
+      const connectorPublicHealth = await resolveLine("CONNECTOR_PUBLIC_HEALTH_URL", {
+        defaultValue: envMap.get("CONNECTOR_PUBLIC_HEALTH_URL") || connectorLocalHealth,
         required: true,
-      }, "LIM_PUBLIC_HEALTH_URL");
-      envMap.set("LIM_APP_DIR", limAppDir);
-      envMap.set("LIM_APP_SERVICE", limAppService);
-      envMap.set("LIM_TUNNEL_SERVICE", limTunnelService);
-      envMap.set("LIM_LOCAL_HEALTH_URL", limLocalHealth);
-      envMap.set("LIM_PUBLIC_HEALTH_URL", limPublicHealth);
+      }, "CONNECTOR_PUBLIC_HEALTH_URL");
+      envMap.set("CONNECTOR_APP_DIR", connectorAppDir);
+      envMap.set("CONNECTOR_APP_SERVICE", connectorAppService);
+      envMap.set("CONNECTOR_TUNNEL_SERVICE", connectorTunnelService);
+      envMap.set("CONNECTOR_LOCAL_HEALTH_URL", connectorLocalHealth);
+      envMap.set("CONNECTOR_PUBLIC_HEALTH_URL", connectorPublicHealth);
     }
 
     printHeading("\nPaso 8/8 - Confirmación");
@@ -1035,7 +1035,7 @@ async function main(): Promise<void> {
         `- Gmail: ${envMap.get("ENABLE_GMAIL_ACCOUNT") === "true" ? "on" : "off"}`,
         `- Bridge local: ${envMap.get("HOUDI_LOCAL_API_ENABLED") === "true" ? "on" : "off"}`,
         `- Bridge WhatsApp: ${((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim()) ? "configurado" : "off"}`,
-        `- LIM externo: ${envMap.get("ENABLE_LIM_CONTROL") === "true" ? "on" : "off"}`,
+        `- CONNECTOR externo: ${envMap.get("ENABLE_CONNECTOR_CONTROL") === "true" ? "on" : "off"}`,
         "",
       ].join("\n"),
     );

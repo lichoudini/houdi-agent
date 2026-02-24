@@ -24,8 +24,8 @@ export type RouterContextFilterDeps = {
   getPendingWorkspaceDeletePath: (chatId: number) => { expiresAtMs: number } | null;
   getLastGmailResultsCount: (chatId: number) => number;
   getLastListedFilesCount: (chatId: number) => number;
-  getLastLimContextAt: (chatId: number) => number;
-  limContextTtlMs: number;
+  getLastConnectorContextAt: (chatId: number) => number;
+  connectorContextTtlMs: number;
 };
 
 function uniqueCandidates(candidates: string[]): string[] {
@@ -171,20 +171,20 @@ export function buildIntentRouterContextFilter(
     }
   }
 
-  const hasRecentLimContext = deps.getLastLimContextAt(params.chatId) + deps.limContextTtlMs > now;
-  const limControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
+  const hasRecentConnectorContext = deps.getLastConnectorContextAt(params.chatId) + deps.connectorContextTtlMs > now;
+  const connectorControlVerb = /\b(inicia|iniciar|arranca|arrancar|enciende|deten|detener|apaga|reinicia|reiniciar|estado|status)\b/.test(
     normalized,
   );
-  const explicitLimCue = /\b\/?lim\b/.test(normalized) || /\blim-api\b/.test(normalized);
+  const explicitConnectorCue = /\b\/?connector\b/.test(normalized) || /\bconnector-api\b/.test(normalized);
   const mentionsOtherDomain = /\b(gmail|correo|correos|email|emails|mail|mails|archivo|carpeta|workspace|documento|pdf|internet|web|noticias)\b/.test(
     normalized,
   );
-  if (hasRecentLimContext && explicitLimCue && limControlVerb && !mentionsOtherDomain) {
-    applyNarrow(["lim"], "recent-lim-context", { strict: true });
+  if (hasRecentConnectorContext && explicitConnectorCue && connectorControlVerb && !mentionsOtherDomain) {
+    applyNarrow(["connector"], "recent-connector-context", { strict: true });
   }
 
-  if (explicitLimCue && !mentionsOtherDomain) {
-    applyNarrow(["lim"], "explicit-lim-route", { strict: true });
+  if (explicitConnectorCue && !mentionsOtherDomain) {
+    applyNarrow(["connector"], "explicit-connector-route", { strict: true });
   }
 
   if (
@@ -208,7 +208,7 @@ export function buildIntentRouterContextFilter(
   if (
     !conversationalOnly &&
     /\b(workspace|archivo|carpeta|renombr|mover|copiar|pegar|borrar|eliminar|abrir|leer)\b/.test(normalized) &&
-    !/\b(gmail|correo|correos|mail|mails|email|emails|lim|web|internet|noticias)\b/.test(normalized) &&
+    !/\b(gmail|correo|correos|mail|mails|email|emails|connector|web|internet|noticias)\b/.test(normalized) &&
     !/(?:\b|_)tsk(?:[-_][a-z0-9._-]*)?\b/.test(normalized)
   ) {
     applyNarrow(["workspace", "document"], "explicit-workspace-route", { strict: true });
