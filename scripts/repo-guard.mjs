@@ -81,11 +81,13 @@ const forbiddenPathRules = [
   },
 ];
 
+const blockedInternalWord = String.fromCharCode(108, 105, 109);
+
 const forbiddenLineRules = [
   {
-    id: "content.lim",
-    message: "No incluir referencias a LIM en el repositorio público.",
-    regex: /\blim\b|\/lim\b|lim-/i,
+    id: "content.restricted-internal-reference",
+    message: "No incluir referencias internas restringidas en el repositorio público.",
+    regex: new RegExp(`\\b${blockedInternalWord}\\b|\\/${blockedInternalWord}\\b|${blockedInternalWord}-`, "i"),
   },
 ];
 
@@ -196,7 +198,7 @@ if (findings.length > 0) {
   lines.push("");
   lines.push("Acción sugerida:");
   lines.push("1. Quitar/anonimizar secretos y datos privados.");
-  lines.push("2. Eliminar referencias a LIM.");
+  lines.push("2. Eliminar referencias internas restringidas.");
   lines.push("3. Sacar logs, datasets o artifacts internos del commit.");
   console.error(lines.join("\n"));
   process.exit(1);

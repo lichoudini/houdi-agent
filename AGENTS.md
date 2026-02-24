@@ -13,7 +13,7 @@ Estas reglas son obligatorias para cualquier agente humano/IA antes de hacer `pu
 
 - No subir credenciales ni secretos (tokens, API keys, refresh tokens, secretos OAuth).
 - No subir memoria/conversaciones del usuario ni logs de auditoría.
-- No subir referencias a `LIM` (el repositorio público debe omitir LIM por completo).
+- No subir referencias internas restringidas (el repositorio público debe omitirlas por completo).
 - No subir datasets internos o experimentos temporales.
 
 ## Activación de hook local

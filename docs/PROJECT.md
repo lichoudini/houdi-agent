@@ -18,6 +18,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 
 - Conversación IA y ejecución asistida:
   - `/ask`, chat natural y análisis contextual por historial.
+  - Soporte multi-proveedor IA (OpenAI, Claude, Gemini) con selección global por `AI_PROVIDER`.
   - `/shell` y `/shellmode` (siempre restringido por allowlist del agente activo).
   - Selección dinámica de modelo por chat con `/model` y alias `/mode`.
   - Modo ECO por chat (`/eco`) para respuestas compactas y control de costo/tokens.
@@ -41,7 +42,7 @@ Houdi Agent es un agente operativo para Telegram/Slack/WhatsApp orientado a auto
 ## Persistencia y datos
 
 - Base de estado SQLite (`workspace/state/houdi-state.sqlite` por defecto):
-  - settings por chat (agente activo, shellmode, safe, eco, modelo OpenAI),
+  - settings por chat (agente activo, shellmode, safe, eco, modelo IA),
   - outbox y dead-letter,
   - idempotencia,
   - contexto de listas indexadas para referencias tipo "abrí el 2",

@@ -60,6 +60,10 @@ Alternativa desde Telegram:
 - Bot no responde:
   - revisar `systemctl status` y `journalctl`
   - validar token y usuario permitido en `.env`
+- IA no responde en `/ask` o análisis:
+  - validar `AI_PROVIDER` en `.env`
+  - verificar key del proveedor seleccionado (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`)
+  - recordar que audio requiere `OPENAI_API_KEY`
 - Error de reboot por privilegios:
   - revisar `REBOOT_COMMAND` en `.env`
   - validar `sudoers` en `/etc/sudoers.d/houdi-agent-reboot`

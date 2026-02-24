@@ -7,7 +7,7 @@ Este proyecto usa un guard de publicación para prevenir leaks de información s
 - Ausencia de secretos hardcodeados.
 - Ausencia de archivos `.env` reales y backups.
 - Ausencia de logs/DB de runtime.
-- Ausencia de referencias a `LIM`.
+- Ausencia de referencias internas restringidas.
 - Ausencia de datasets y experimentos internos en el repo público.
 
 ## Comando

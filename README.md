@@ -47,6 +47,7 @@ Buenas prácticas mínimas:
 - `docs/INTENT_ROUTER_HARDENING.md`: pipeline, tuning y operación del enrutador de intenciones
 - `docs/RELEASE_NOTES_2026-02-21.md`: cambios funcionales y operativos del release
 - `docs/RELEASE_NOTES_2026-02-23.md`: mejoras de enrutado contextual, modo ECO y UX de comandos
+- `docs/RELEASE_NOTES_2026-02-24.md`: soporte multi-proveedor IA (OpenAI/Claude/Gemini) y mejoras de onboarding
 - `docs/REPO_PUBLISH_GUARD.md`: política y guard automático para push seguro
 
 ## Enfoque de seguridad del MVP
@@ -103,7 +104,25 @@ Perfil `moderated` (entorno compartido o más estricto):
 - Node.js 22+
 - Un bot token de Telegram (BotFather)
 - Tu user ID de Telegram
-- (Opcional) API key de OpenAI para `/ask`, chat libre y transcripción de audio
+- (Opcional) API key de OpenAI, Claude o Gemini para `/ask` y chat libre
+- Para transcripción de audio se requiere OpenAI (`OPENAI_API_KEY`)
+
+### Soporte IA multi-proveedor
+
+- Proveedores soportados:
+  - OpenAI (`OPENAI_API_KEY`)
+  - Claude/Anthropic (`ANTHROPIC_API_KEY`)
+  - Gemini (`GEMINI_API_KEY`)
+- Selector global de proveedor: `AI_PROVIDER=auto|openai|anthropic|gemini`.
+- `AI_PROVIDER=auto` usa prioridad: OpenAI -> Claude -> Gemini (si tienen key configurada).
+- Puedes forzar modelo por chat con `/model set <modelo>` y el proveedor se detecta por prefijo:
+  - `gpt-*`, `o*`, `whisper-*` -> OpenAI
+  - `claude-*` -> Claude
+  - `gemini-*` -> Gemini
+- Capacidades por proveedor:
+  - Texto (`/ask`, chat libre, síntesis): OpenAI / Claude / Gemini.
+  - Visión (análisis de imagen): OpenAI / Claude / Gemini.
+  - Audio (transcripción): OpenAI.
 
 ## Configuración
 
@@ -309,9 +328,14 @@ cp .env.example .env
 - `HOUDI_SUGGESTIONS_POLL_MS` (default: `600000`)
 - `HOUDI_AGENT_POLICY_FILE` (default: `./workspace/state/agent-policy.json`)
 - `HOUDI_AGENTIC_CANARY_PERCENT` (default: `100`, rollout por chat de controles agénticos)
-- `OPENAI_API_KEY` (opcional, necesaria para `/ask`)
+- `AI_PROVIDER` (`auto|openai|anthropic|gemini`, default: `auto`)
+- `OPENAI_API_KEY` (opcional)
 - `OPENAI_MODEL` (default: `gpt-4o-mini`)
-- `OPENAI_MAX_OUTPUT_TOKENS` (default: `800`)
+- `ANTHROPIC_API_KEY` (opcional, habilita Claude)
+- `ANTHROPIC_MODEL` (default: `claude-3-5-sonnet-latest`)
+- `GEMINI_API_KEY` (opcional, habilita Gemini)
+- `GEMINI_MODEL` (default: `gemini-2.0-flash`)
+- `OPENAI_MAX_OUTPUT_TOKENS` (default: `350`)
 - `HOUDI_PROGRESS_NOTICES` (default: `false`, muestra/oculta avisos intermedios con variantes cómicas de estado mientras piensa/carga)
 - `OPENAI_AUDIO_MODEL` (default: `whisper-1`)
 - `OPENAI_AUDIO_LANGUAGE` (default sugerido: `es`)
@@ -536,28 +560,29 @@ Si intentas levantar otra, Houdi Agent lo bloqueará para evitar conflictos de T
 - `/task running`
 - `/kill <taskId>`
 
-También puedes escribir mensajes normales (sin `/`) y el bot responderá con OpenAI.
+También puedes escribir mensajes normales (sin `/`) y el bot responderá con el proveedor IA configurado.
 Si detecta intención de web (buscar en internet o analizar una URL), lo hace en modo natural sin comandos.
 Si detecta intención de recordatorios/tareas con fecha/hora, las agenda en lenguaje natural.
 Si activas `/shellmode on`, esos mensajes también podrán disparar ejecución shell (siempre limitada por la allowlist del agente activo).
 También puedes enviar nota de voz/audio: el bot lo transcribe y responde sobre ese contenido.
 Si envías un archivo por Telegram (document), lo guarda automáticamente en `workspace/files/`.
-Si envías una imagen/foto, la guarda en `workspace/images/` y además puede analizarla con OpenAI Vision.
+Si envías una imagen/foto, la guarda en `workspace/images/` y además puede analizarla con IA multimodal.
 También puedes pedir en lenguaje natural operaciones sobre `workspace` (listar, crear carpeta, crear archivo simple, mover, renombrar, eliminar y enviar archivos).
 Para acciones sensibles (exec, send de Gmail y borrado en workspace), puede requerir `Plan Preview` y confirmación explícita con `/confirm`.
 
-## Seleccion de modelo OpenAI por chat
+## Seleccion de modelo IA por chat
 
-Ademas del default global por `.env` (`OPENAI_MODEL`), puedes cambiar el modelo en runtime para un chat especifico:
+Además del default global por `.env` (`OPENAI_MODEL` / `ANTHROPIC_MODEL` / `GEMINI_MODEL`), puedes cambiar el modelo en runtime para un chat específico:
 
 - `/model` o `/mode` o `/model show`: muestra modelo actual del chat, default global y lista sugerida por costo.
 - `/model list`: muestra solo la lista sugerida (menor -> mayor costo).
-- `/model set <modelo>`: fija override por chat (ej. `gpt-4o-mini`).
+- `/model set <modelo>`: fija override por chat (ej. `gpt-4o-mini`, `claude-3-5-sonnet-latest`, `gemini-2.0-flash`).
 - `/model reset`: vuelve al default de `.env`.
 
 Notas:
 - El override persiste en la base de estado (sobrevive reinicios), no modifica `.env`.
 - Aplica a consultas IA de chat, analisis de imagen y planificacion de `/shell`.
+- En `/status`, el bot informa proveedor detectado para el modelo activo del chat.
 
 ## Modo ECO (ahorro de tokens)
 
@@ -574,17 +599,17 @@ Configuración relacionada:
 
 - `/health`: salud runtime (cola, circuit-breakers, outbox, SQLite, workspace).
 - `/doctor`: ejecuta chequeos rápidos de runtime, permisos, credenciales y seguridad base.
-- `/usage`: muestra tokens/costo estimado OpenAI acumulado desde que inició el proceso.
-- `/usage reset`: reinicia contadores locales de uso OpenAI.
+- `/usage`: muestra tokens/costo estimado IA acumulado desde que inició el proceso.
+- `/usage reset`: reinicia contadores locales de uso IA.
 - `/metrics`: snapshot de observabilidad (counters/timings/colas/outbox).
 - `/domains`: lista dominios modulares activos (router/workspace/gmail) y sus capacidades.
-- Estado runtime crítico persistente en SQLite: aprobaciones, planes pendientes, confirmaciones de borrado, panic mode y settings por chat (agente activo, shellmode, eco, safe y modelo OpenAI).
+- Estado runtime crítico persistente en SQLite: aprobaciones, planes pendientes, confirmaciones de borrado, panic mode y settings por chat (agente activo, shellmode, eco, safe y modelo IA).
 
 ## CLI local
 
 Además de Telegram, puedes consultar al agente desde terminal.
 Por defecto, la CLI usa `--transport auto`: si detecta bridge local activo, enruta al mismo pipeline natural de Telegram (paridad de funciones de texto).
-Si no hay bridge disponible, cae a modo local con OpenAI.
+Si no hay bridge disponible, cae a modo local con el proveedor IA configurado.
 
 One-shot:
 
@@ -867,7 +892,7 @@ Para pedidos de noticias en lenguaje natural, el buscador prioriza lo más recie
 Comandos:
 
 - `/readfile <ruta> [previewChars]`: extrae texto del archivo y muestra vista previa.
-- `/askfile <ruta> <pregunta>`: extrae texto y consulta OpenAI sobre ese documento.
+- `/askfile <ruta> <pregunta>`: extrae texto y consulta IA sobre ese documento.
 
 Modo natural:
 
@@ -1033,7 +1058,7 @@ Si devuelve `FAIL`, corrige antes de usar `/reboot`.
 
 Genera snapshot en `backups/` con:
 - unidad systemd visible por usuario
-- `.env` sanitizado (`TELEGRAM_BOT_TOKEN` y `OPENAI_API_KEY` redacted)
+- `.env` sanitizado (`TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` y `GEMINI_API_KEY` redacted)
 - perfiles de agentes
 - manifiesto con checksums
 

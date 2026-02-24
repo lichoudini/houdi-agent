@@ -28,9 +28,12 @@
   - Ejecución de procesos (`spawn`, `shell: false`)
   - Timeout, captura de stdout/stderr y kill de tareas
 - `src/openai-client.ts`
-  - Consultas IA (`/ask`)
+  - Capa IA multi-proveedor (`openai|anthropic|gemini`)
+  - Consultas IA (`/ask`, chat libre, síntesis)
   - Planeación de acción shell (`/shell`)
-  - Visión sobre imágenes (análisis de fotos/adjuntos)
+  - Visión sobre imágenes (análisis de fotos/adjuntos) en OpenAI/Claude/Gemini
+  - Transcripción de audio (OpenAI)
+  - Resolución de proveedor por `AI_PROVIDER`, modelo seleccionado y fallback automático
   - Soporte de modelo override por llamada (además del default de `.env`)
   - Construcción de prompt estructurado (personalidad, lineamientos, memoria, runtime)
 - `src/gmail-account.ts`
@@ -96,7 +99,7 @@
 - `src/doctor.ts`
   - Healthchecks operativos de runtime/config/permisos (`/doctor`)
 - `src/openai-usage.ts`
-  - Agregación de tokens y costo estimado por modelo/fuente (`/usage`, `/status`)
+  - Agregación de tokens y costo estimado por modelo/fuente para IA (`/usage`, `/status`)
 - `src/run-trace.ts`
   - Trazas por ejecución con `run_id` y métricas de duración/estado
 - `src/single-instance-lock.ts`
@@ -123,6 +126,7 @@
 5. Para consultas IA:
    - se arma contexto de workspace
    - se hace recall de memoria relevante
+   - se resuelve proveedor/modelo activo (OpenAI/Claude/Gemini)
    - se envía prompt estructurado al modelo
 6. Se registra evento de auditoría cuando aplica.
 7. Pipeline natural del router:

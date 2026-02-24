@@ -166,7 +166,7 @@ export async function runWebSlashOpenCommand(params: {
     if (!deps.isOpenAiConfigured()) {
       await deps.replyLong(
         ctx,
-        [header, "", "OpenAI no está configurado para análisis. Usa /webopen sin pregunta para ver contenido."].join("\n"),
+        [header, "", "La IA no está configurada para análisis. Usa /webopen sin pregunta para ver contenido."].join("\n"),
       );
       return;
     }
@@ -246,7 +246,7 @@ export async function runWebSlashAskCommand(params: {
     return;
   }
   if (!deps.isOpenAiConfigured()) {
-    await ctx.reply("OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.");
+    await ctx.reply("IA no configurada. Define OPENAI_API_KEY, ANTHROPIC_API_KEY o GEMINI_API_KEY en .env.");
     return;
   }
 

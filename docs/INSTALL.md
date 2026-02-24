@@ -11,13 +11,13 @@ Esta guía deja una instalación reproducible para que cualquier persona pueda c
 - Node.js 22+ y `npm`.
 - Cuenta de Telegram con bot token.
 - User ID de Telegram autorizado.
-- (Opcional) clave OpenAI.
+- (Opcional) clave de proveedor IA (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` o `GEMINI_API_KEY`).
 - (Opcional) credenciales OAuth de Gmail.
 
 ## 2. Clonar proyecto
 
 ```bash
-git clone <URL_DEL_REPO_PRIVADO> houdi-agent
+git clone https://github.com/lichoudini/houdi-agent.git houdi-agent
 cd houdi-agent
 ```
 
@@ -88,6 +88,28 @@ Si usas `--yes`, toma valores desde:
 1) variables de entorno del proceso, 2) `.env` actual, 3) `.env.example` como fallback.
 Si falta un valor obligatorio, falla con mensaje explícito indicando qué variable definir.
 
+### 4.1 Configuración IA (OpenAI / Claude / Gemini)
+
+El wizard pregunta el proveedor principal con `AI_PROVIDER`:
+
+- `auto`: fallback automático en orden OpenAI -> Claude -> Gemini.
+- `openai`: fuerza OpenAI.
+- `claude`: fuerza Anthropic (internamente `anthropic`).
+- `gemini`: fuerza Gemini.
+
+Variables nuevas:
+
+- `AI_PROVIDER=auto|openai|anthropic|gemini`
+- `OPENAI_API_KEY` + `OPENAI_MODEL`
+- `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL`
+- `GEMINI_API_KEY` + `GEMINI_MODEL`
+
+Notas:
+
+- Texto y visión funcionan con OpenAI, Claude y Gemini.
+- Transcripción de audio requiere OpenAI (`OPENAI_API_KEY` + `OPENAI_AUDIO_MODEL`).
+- Puedes cambiar modelo por chat en runtime con `/model set <modelo>`.
+
 ## 5. Ejecutar en local (smoke test)
 
 ```bash
@@ -99,9 +121,10 @@ Validar desde Telegram:
 
 1. `/status`
 2. `/agent`
-3. `hola`
-4. `/memory`
-5. `/web noticias ia hoy`
+3. `/model`
+4. `/ask hola`
+5. `/memory`
+6. `/web noticias ia hoy`
 
 Detener con `Ctrl+C` cuando la prueba esté OK.
 

@@ -734,7 +734,7 @@ async function main(): Promise<void> {
     if (!openAi) {
       openAi = new OpenAiService();
       if (!openAi.isConfigured()) {
-        throw new Error("OPENAI_API_KEY no está configurada en .env");
+        throw new Error(openAi.getNotConfiguredMessage("text"));
       }
     }
     const prompt = promptInput.trim();
@@ -827,7 +827,7 @@ async function main(): Promise<void> {
     openAi = new OpenAiService();
     if (!openAi.isConfigured()) {
       throw new Error(
-        `No encontré bridge local activo (${bridgeBaseUrl}) y OPENAI_API_KEY tampoco está configurada para modo local.`,
+        `No encontré bridge local activo (${bridgeBaseUrl}) y tampoco hay proveedor IA configurado para modo local.`,
       );
     }
   }

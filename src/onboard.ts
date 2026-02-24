@@ -601,7 +601,7 @@ async function main(): Promise<void> {
         "  npm run onboard -- --wizard-mode advanced",
         "",
         "Qué hace:",
-        "- Configura .env paso a paso (Telegram, OpenAI, Gmail, workspace, bridge local y WhatsApp bridge).",
+        "- Configura .env paso a paso (Telegram, IA provider, Gmail, workspace, bridge local y WhatsApp bridge).",
         "- Modo simple (default): menos decisiones, defaults seguros y explicación para primera instalación.",
         "- Modo advanced: control total de parámetros.",
         "- Configura integración externa opcional (CONNECTOR).",
@@ -620,7 +620,8 @@ async function main(): Promise<void> {
         "",
         "Modo no interactivo (variables mínimas recomendadas):",
         "- TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS",
-        "- OPENAI_API_KEY (opcional), OPENAI_MODEL (opcional)",
+        "- AI_PROVIDER (auto|openai|anthropic|gemini)",
+        "- OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY (según proveedor)",
         "- ENABLE_GMAIL_ACCOUNT + credenciales Gmail (si aplica)",
       ].join("\n"),
     );
@@ -646,7 +647,7 @@ async function main(): Promise<void> {
   process.stdout.write("Antes de arrancar, tené a mano:\n");
   process.stdout.write("- TELEGRAM_BOT_TOKEN (de BotFather)\n");
   process.stdout.write("- TELEGRAM_ALLOWED_USER_IDS (tu user id o lista CSV)\n");
-  process.stdout.write("- OPENAI_API_KEY (opcional)\n");
+  process.stdout.write("- API key del proveedor IA que elijas (OpenAI / Claude / Gemini)\n");
   process.stdout.write("- Credenciales Gmail OAuth (solo si lo vas a usar)\n\n");
   process.stdout.write("- Credenciales Meta WhatsApp Cloud API (opcional)\n\n");
 
@@ -785,8 +786,13 @@ async function main(): Promise<void> {
       "DEFAULT_AGENT",
       "TELEGRAM_BOT_TOKEN",
       "TELEGRAM_ALLOWED_USER_IDS",
+      "AI_PROVIDER",
       "OPENAI_API_KEY",
       "OPENAI_MODEL",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_MODEL",
+      "GEMINI_API_KEY",
+      "GEMINI_MODEL",
       "ENABLE_WEB_BROWSE",
       "ENABLE_GMAIL_ACCOUNT",
       "GMAIL_ACCOUNT_EMAIL",
@@ -881,13 +887,76 @@ async function main(): Promise<void> {
     }, "TELEGRAM_ALLOWED_USER_IDS");
     envMap.set("TELEGRAM_ALLOWED_USER_IDS", allowedUserIds);
 
-    printStep("OpenAI");
-    process.stdout.write("Si no defines OPENAI_API_KEY, Houdi funcionará pero sin capacidades IA avanzadas.\n\n");
-    const openAiApiKey = await resolveLine("OPENAI_API_KEY (opcional)", {
-      defaultValue: envMap.get("OPENAI_API_KEY") || "",
-      displayDefault: false,
-    }, "OPENAI_API_KEY");
+    printStep("IA (OpenAI / Claude / Gemini)");
+    process.stdout.write(
+      [
+        "Elige proveedor principal de IA para respuestas y análisis.",
+        "- auto: usa el primer proveedor configurado (OpenAI > Claude > Gemini).",
+        "- openai: fuerza OpenAI.",
+        "- claude: fuerza Anthropic Claude.",
+        "- gemini: fuerza Google Gemini.",
+        "",
+      ].join("\n"),
+    );
+    const providerRaw = await resolveChoice(
+      "Proveedor IA",
+      ["auto", "openai", "claude", "gemini"],
+      (() => {
+        const current = (envMap.get("AI_PROVIDER") || envExampleMap.get("AI_PROVIDER") || "auto").trim().toLowerCase();
+        if (current === "anthropic") {
+          return "claude";
+        }
+        if (["auto", "openai", "claude", "gemini"].includes(current)) {
+          return current;
+        }
+        return "auto";
+      })(),
+    );
+    const aiProvider = providerRaw === "claude" ? "anthropic" : providerRaw;
+    envMap.set("AI_PROVIDER", aiProvider);
+
+    const openAiKeyRequired = aiProvider === "openai";
+    const anthropicKeyRequired = aiProvider === "anthropic";
+    const geminiKeyRequired = aiProvider === "gemini";
+
+    const openAiApiKey = await resolveLine(
+      openAiKeyRequired
+        ? "OPENAI_API_KEY (requerido para proveedor openai)"
+        : "OPENAI_API_KEY (opcional, recomendado para fallback/audio)",
+      {
+        defaultValue: envMap.get("OPENAI_API_KEY") || "",
+        required: openAiKeyRequired,
+        displayDefault: false,
+      },
+      "OPENAI_API_KEY",
+    );
     envMap.set("OPENAI_API_KEY", openAiApiKey);
+
+    const anthropicApiKey = await resolveLine(
+      anthropicKeyRequired
+        ? "ANTHROPIC_API_KEY (requerido para proveedor claude)"
+        : "ANTHROPIC_API_KEY (opcional)",
+      {
+        defaultValue: envMap.get("ANTHROPIC_API_KEY") || "",
+        required: anthropicKeyRequired,
+        displayDefault: false,
+      },
+      "ANTHROPIC_API_KEY",
+    );
+    envMap.set("ANTHROPIC_API_KEY", anthropicApiKey);
+
+    const geminiApiKey = await resolveLine(
+      geminiKeyRequired
+        ? "GEMINI_API_KEY (requerido para proveedor gemini)"
+        : "GEMINI_API_KEY (opcional)",
+      {
+        defaultValue: envMap.get("GEMINI_API_KEY") || "",
+        required: geminiKeyRequired,
+        displayDefault: false,
+      },
+      "GEMINI_API_KEY",
+    );
+    envMap.set("GEMINI_API_KEY", geminiApiKey);
 
     const openAiModel = wizardMode === "advanced"
       ? await resolveLine("OPENAI_MODEL", {
@@ -896,8 +965,33 @@ async function main(): Promise<void> {
         }, "OPENAI_MODEL")
       : envMap.get("OPENAI_MODEL") || envExampleMap.get("OPENAI_MODEL") || "gpt-4o-mini";
     envMap.set("OPENAI_MODEL", openAiModel);
+
+    const anthropicModel = wizardMode === "advanced"
+      ? await resolveLine("ANTHROPIC_MODEL", {
+          defaultValue: envMap.get("ANTHROPIC_MODEL") || envExampleMap.get("ANTHROPIC_MODEL") || "claude-3-5-sonnet-latest",
+          required: true,
+        }, "ANTHROPIC_MODEL")
+      : envMap.get("ANTHROPIC_MODEL") || envExampleMap.get("ANTHROPIC_MODEL") || "claude-3-5-sonnet-latest";
+    envMap.set("ANTHROPIC_MODEL", anthropicModel);
+
+    const geminiModel = wizardMode === "advanced"
+      ? await resolveLine("GEMINI_MODEL", {
+          defaultValue: envMap.get("GEMINI_MODEL") || envExampleMap.get("GEMINI_MODEL") || "gemini-2.0-flash",
+          required: true,
+        }, "GEMINI_MODEL")
+      : envMap.get("GEMINI_MODEL") || envExampleMap.get("GEMINI_MODEL") || "gemini-2.0-flash";
+    envMap.set("GEMINI_MODEL", geminiModel);
+
     if (wizardMode === "simple") {
-      process.stdout.write(`Modelo IA: ${openAiModel} (default recomendado).\n`);
+      process.stdout.write(
+        [
+          `Proveedor IA: ${providerRaw}`,
+          `Modelo OpenAI: ${openAiModel}`,
+          `Modelo Claude: ${anthropicModel}`,
+          `Modelo Gemini: ${geminiModel}`,
+          "",
+        ].join("\n"),
+      );
     }
 
     const enableWebBrowse = await resolveYesNo(
@@ -1127,7 +1221,10 @@ async function main(): Promise<void> {
         `- Workspace: ${envMap.get("HOUDI_WORKSPACE_DIR")}`,
         `- Telegram IDs: ${envMap.get("TELEGRAM_ALLOWED_USER_IDS")}`,
         `- Telegram token: ${maskSecret(envMap.get("TELEGRAM_BOT_TOKEN") || "")}`,
+        `- Proveedor IA: ${envMap.get("AI_PROVIDER") || "auto"}`,
         `- OpenAI key: ${maskSecret(envMap.get("OPENAI_API_KEY") || "")}`,
+        `- Claude key: ${maskSecret(envMap.get("ANTHROPIC_API_KEY") || "")}`,
+        `- Gemini key: ${maskSecret(envMap.get("GEMINI_API_KEY") || "")}`,
         `- Gmail: ${envMap.get("ENABLE_GMAIL_ACCOUNT") === "true" ? "on" : "off"}`,
         `- Bridge local: ${envMap.get("HOUDI_LOCAL_API_ENABLED") === "true" ? "on" : "off"}`,
         `- Bridge WhatsApp: ${((envMap.get("WHATSAPP_VERIFY_TOKEN") || "").trim() && (envMap.get("WHATSAPP_ACCESS_TOKEN") || "").trim()) ? "configurado" : "off"}`,

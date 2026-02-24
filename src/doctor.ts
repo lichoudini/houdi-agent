@@ -105,14 +105,14 @@ export async function runDoctor(input: DoctorRuntimeInput): Promise<DoctorReport
   }
 
   if (input.openAiConfigured) {
-    checks.push(buildCheck("ok", "openai.key", "OPENAI_API_KEY configurada"));
+    checks.push(buildCheck("ok", "ai.provider", "Proveedor de IA configurado"));
   } else {
     checks.push(
       buildCheck(
         "warn",
-        "openai.key",
-        "OPENAI_API_KEY no configurada",
-        "Funciones IA (/ask, visión, transcripción) quedarán deshabilitadas.",
+        "ai.provider",
+        "Proveedor de IA no configurado",
+        "Define OPENAI_API_KEY, ANTHROPIC_API_KEY o GEMINI_API_KEY en .env.",
       ),
     );
   }

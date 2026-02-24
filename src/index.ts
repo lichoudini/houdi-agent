@@ -286,17 +286,29 @@ type SubagentMode = "auto" | "pinned";
 const subagentModeByChat = new Map<number, SubagentMode>();
 const subagentPinnedByChat = new Map<number, SpecializedSubagentName>();
 const subagentLastByChat = new Map<number, SpecializedSubagentName>();
-const OPENAI_MODELS_BY_COST: Array<{ model: string; tier: "bajo" | "medio" | "alto"; notes: string }> = [
-  { model: "gpt-5-nano", tier: "bajo", notes: "ultra económico para tareas simples y alto volumen" },
-  { model: "gpt-4.1-nano", tier: "bajo", notes: "muy económico para clasificación/automatizaciones ligeras" },
-  { model: "gpt-4o-mini", tier: "bajo", notes: "rápido y económico, recomendado para uso general" },
-  { model: "gpt-4.1-mini", tier: "bajo", notes: "económico con buen razonamiento general" },
-  { model: "gpt-4.1", tier: "medio", notes: "mejor calidad para tareas exigentes" },
-  { model: "gpt-4o", tier: "medio", notes: "muy buen balance multimodal" },
-  { model: "o3-mini", tier: "medio", notes: "razonamiento fuerte en costo intermedio" },
-  { model: "o3", tier: "alto", notes: "máximo razonamiento, mayor costo" },
-  { model: "o1", tier: "alto", notes: "razonamiento profundo, alto costo" },
-];
+const MODELS_BY_PROVIDER: Record<"openai" | "anthropic" | "gemini", Array<{ model: string; tier: "bajo" | "medio" | "alto"; notes: string }>> = {
+  openai: [
+    { model: "gpt-5-nano", tier: "bajo", notes: "ultra económico para tareas simples y alto volumen" },
+    { model: "gpt-4.1-nano", tier: "bajo", notes: "muy económico para clasificación/automatizaciones ligeras" },
+    { model: "gpt-4o-mini", tier: "bajo", notes: "rápido y económico, recomendado para uso general" },
+    { model: "gpt-4.1-mini", tier: "bajo", notes: "económico con buen razonamiento general" },
+    { model: "gpt-4.1", tier: "medio", notes: "mejor calidad para tareas exigentes" },
+    { model: "gpt-4o", tier: "medio", notes: "muy buen balance multimodal" },
+    { model: "o3-mini", tier: "medio", notes: "razonamiento fuerte en costo intermedio" },
+    { model: "o3", tier: "alto", notes: "máximo razonamiento, mayor costo" },
+    { model: "o1", tier: "alto", notes: "razonamiento profundo, alto costo" },
+  ],
+  anthropic: [
+    { model: "claude-3-5-haiku-latest", tier: "bajo", notes: "rápido para tareas frecuentes y respuestas breves" },
+    { model: "claude-3-5-sonnet-latest", tier: "medio", notes: "balance recomendado para uso general" },
+    { model: "claude-3-opus-latest", tier: "alto", notes: "máxima calidad, mayor costo" },
+  ],
+  gemini: [
+    { model: "gemini-2.0-flash-lite", tier: "bajo", notes: "económico para alto volumen" },
+    { model: "gemini-2.0-flash", tier: "medio", notes: "rápido y balanceado para uso general" },
+    { model: "gemini-1.5-pro", tier: "alto", notes: "más contexto/razonamiento, mayor costo" },
+  ],
+};
 const lastWebResultsByChat = new Map<number, WebSearchResult[]>();
 type LastDocumentSnapshot = {
   path: string;
@@ -1154,7 +1166,7 @@ function shouldEnforceOperationalExecution(chatId: number, text: string): boolea
 
 function getOpenAiModelForChat(chatId: number): string {
   const custom = openAiModelByChat.get(chatId)?.trim();
-  return custom || config.openAiModel;
+  return custom || openAi.getModel();
 }
 
 function setOpenAiModelForChat(chatId: number, model: string): void {
@@ -1174,25 +1186,38 @@ function resetOpenAiModelForChat(chatId: number): void {
   persistRuntimeStateSnapshot("runtime:resetOpenAiModel");
 }
 
-function buildOpenAiModelListText(): string {
-  const lines = OPENAI_MODELS_BY_COST.map((item, index) => {
-    return `${index + 1}. ${item.model} | costo ${item.tier} | ${item.notes}`;
-  });
-  return ["Modelos sugeridos (menor -> mayor costo):", ...lines].join("\n");
+function buildOpenAiModelListText(chatId: number): string {
+  const currentModel = getOpenAiModelForChat(chatId);
+  const detectedProvider = openAi.getProviderLabel(currentModel);
+  const sections: string[] = [
+    `Proveedor detectado para el modelo actual: ${detectedProvider}`,
+    "Modelos sugeridos por proveedor (menor -> mayor costo):",
+  ];
+  const providerOrder: Array<"openai" | "anthropic" | "gemini"> = ["openai", "anthropic", "gemini"];
+  for (const provider of providerOrder) {
+    const providerName = provider === "openai" ? "OpenAI" : provider === "anthropic" ? "Claude" : "Gemini";
+    sections.push(`${providerName}:`);
+    const lines = MODELS_BY_PROVIDER[provider].map((item, index) => {
+      return `${index + 1}. ${item.model} | costo ${item.tier} | ${item.notes}`;
+    });
+    sections.push(...lines);
+    sections.push("");
+  }
+  return sections.join("\n").trim();
 }
 
 function buildOpenAiUsageLines(limit = 6): string[] {
   const snapshot = openAi.getUsageSnapshot();
   const top = snapshot.byModelAndSource.slice(0, Math.max(1, limit));
   const lines = [
-    `OpenAI usage (desde proceso): calls=${snapshot.totalCalls} | in=${snapshot.totalInputTokens} | out=${snapshot.totalOutputTokens} | total=${snapshot.totalTokens} | estUSD=${formatUsageUsd(snapshot.estimatedCostUsd)}`,
+    `IA usage (desde proceso): calls=${snapshot.totalCalls} | in=${snapshot.totalInputTokens} | out=${snapshot.totalOutputTokens} | total=${snapshot.totalTokens} | estUSD=${formatUsageUsd(snapshot.estimatedCostUsd)}`,
   ];
   if (top.length === 0) {
-    lines.push("OpenAI usage top: sin llamadas registradas");
+    lines.push("IA usage top: sin llamadas registradas");
     return lines;
   }
   lines.push(
-    `OpenAI usage top: ${top
+    `IA usage top: ${top
       .map(
         (item) =>
           `${item.model}/${item.source} calls=${item.calls} tok=${item.totalTokens} usd=${formatUsageUsd(item.estimatedCostUsd)}`,
@@ -1289,7 +1314,7 @@ async function buildRuntimeHealthSnapshot(): Promise<{
   const outboxDue = sqliteState.listDueOutboxMessages({ limit: 500 }).length;
   checks.outbox = { ok: outboxDue < 200, detail: `due=${outboxDue}` };
 
-  checks.openai = { ok: openAi.isConfigured(), detail: openAi.isConfigured() ? "configured" : "not_configured" };
+  checks.ai = { ok: openAi.isConfigured(), detail: openAi.isConfigured() ? "configured" : "not_configured" };
 
   const failedChecks = Object.values(checks).filter((item) => !item.ok).length;
   return {
@@ -10688,7 +10713,7 @@ async function requestAgentSelfUpdate(params: {
 async function executeAiShellInstruction(ctx: ChatReplyContext, instruction: string): Promise<void> {
   if (!openAi.isConfigured()) {
     await ctx.reply(
-      "OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.",
+      openAi.getNotConfiguredMessage("text"),
     );
     return;
   }
@@ -14015,7 +14040,7 @@ async function maybeHandleNaturalDocumentInstruction(params: {
     const message = error instanceof Error ? error.message : String(error);
     const preview = truncateInline(documentResult.text, 2800);
     const fallbackText = [
-      `No pude analizar el documento con OpenAI: ${message}`,
+      `No pude analizar el documento con IA: ${message}`,
       "Te dejo una vista previa para continuar:",
       "",
       `Documento: ${documentResult.path}`,
@@ -14103,11 +14128,11 @@ async function maybeHandleNaturalImageReferenceInstruction(params: {
       `mime: ${mimeType}`,
     ].join("\n");
 
-    if (!openAi.isConfigured()) {
+    if (!openAi.isConfiguredForFeature("vision")) {
       const responseNoAi = [
         summaryHeader,
         "",
-        "OpenAI no está configurado para analizar la imagen (falta OPENAI_API_KEY).",
+        openAi.getNotConfiguredMessage("vision"),
       ].join("\n");
       await replyLong(params.ctx, responseNoAi);
       await appendConversationTurn({
@@ -14302,7 +14327,7 @@ async function maybeHandleNaturalWebInstruction(params: {
           "",
           openAi.isConfigured()
             ? "Si quieres análisis, pide algo como: 'de este link, resumilo en 5 puntos'."
-            : "OpenAI no está configurado para análisis; puedo mostrar contenido y fuentes.",
+            : "La IA no está configurada para análisis; puedo mostrar contenido y fuentes.",
         ].join("\n");
         await replyLong(params.ctx, responseText);
         await appendConversationTurn({
@@ -15184,10 +15209,10 @@ async function maybeHandleNaturalGmailInstruction(params: {
           if (!openAi.isConfigured()) {
             await params.ctx.reply(
               [
-                "No envié el correo: falta OPENAI para improvisar asunto y cuerpo.",
+                "No envié el correo: falta un proveedor IA para improvisar asunto y cuerpo.",
                 "Opciones:",
                 '1) Define asunto y cuerpo explícitos (ej: asunto: X cuerpo: Y).',
-                "2) Configura OPENAI_API_KEY.",
+                "2) Configura API key del proveedor IA (OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY).",
               ].join("\n"),
             );
             return true;
@@ -16797,8 +16822,8 @@ bot.command("help", async (ctx) => {
   const operatorCommands = [
     "Comandos:",
     "/version - Ver versión del agente",
-    "/model|/mode [show|list|set <modelo>|reset] - Ver/cambiar modelo OpenAI para este chat",
-    "/ask <pregunta> - Consultar IA de OpenAI",
+    "/model|/mode [show|list|set <modelo>|reset] - Ver/cambiar modelo IA para este chat",
+    "/ask <pregunta> - Consultar IA (OpenAI/Claude/Gemini)",
     "/health - Salud runtime (cola, circuit-breakers, outbox, SQLite, workspace)",
     "/readfile <ruta> - Extraer texto de PDF/documentos de oficina",
     "/askfile <ruta> <pregunta> - Consultar IA sobre archivo local",
@@ -16831,7 +16856,7 @@ bot.command("help", async (ctx) => {
     "Enviar nota de voz/audio - Se transcribe y se responde con IA.",
     "Enviar archivo (document) - Se guarda directo en workspace/files/.",
     "Enviar imagen/foto - Se guarda directo en workspace/images/.",
-    "Chat libre: escribe un mensaje normal (sin /) y responde OpenAI.",
+    "Chat libre: escribe un mensaje normal (sin /) y responde la IA configurada.",
     "Si pides tareas/recordatorios con fecha y hora, se agenda automáticamente.",
     "Si pides correo Gmail, web o archivos en lenguaje natural, lo resuelve sin comando estricto.",
   ];
@@ -16841,7 +16866,7 @@ bot.command("help", async (ctx) => {
     "Comandos de administración/sistema (solo admin):",
     "/status - Estado del host y tareas en ejecución",
     "/doctor - Diagnóstico operativo rápido del agente",
-    "/usage [topN|reset] - Métricas de tokens/costo OpenAI desde el arranque",
+    "/usage [topN|reset] - Métricas de tokens/costo IA desde el arranque",
     "/domains - Estado de dominios modulares cargados",
     "/policy - Política agéntica activa (preview/approval/safe blocks)",
     "/agenticcanary [status|<0-100>] - Rollout runtime de controles agénticos",
@@ -16900,10 +16925,12 @@ async function handleModelCommand(ctx: ChatReplyContext, inputRaw: string): Prom
     const isDefault = !openAiModelByChat.has(ctx.chat.id);
     await ctx.reply(
       [
-        `Modelo OpenAI actual (chat): ${current}`,
-        `Modelo OpenAI default (.env): ${config.openAiModel}`,
+        `Modelo IA actual (chat): ${current}`,
+        `Proveedor detectado: ${openAi.getProviderLabel(current)}`,
+        `Modelo IA default (.env): ${openAi.getModel()}`,
         `Origen: ${isDefault ? "default" : "override por chat"}`,
-        buildOpenAiModelListText(),
+        "",
+        buildOpenAiModelListText(ctx.chat.id),
         "Uso: /model list | /model set <modelo> | /model reset",
       ].join("\n"),
     );
@@ -16911,19 +16938,23 @@ async function handleModelCommand(ctx: ChatReplyContext, inputRaw: string): Prom
   }
 
   if (["list", "models"].includes(sub)) {
-    await ctx.reply(buildOpenAiModelListText());
+    await ctx.reply(buildOpenAiModelListText(ctx.chat.id));
     return;
   }
 
   if (["set", "use"].includes(sub)) {
     if (!value) {
-      await ctx.reply("Uso: /model set <modelo>\nEjemplo: /model set gpt-4o-mini");
+      await ctx.reply("Uso: /model set <modelo>\nEjemplo: /model set gpt-4o-mini | claude-3-5-sonnet-latest | gemini-2.0-flash");
       return;
     }
     try {
       setOpenAiModelForChat(ctx.chat.id, value);
       await ctx.reply(
-        `Modelo OpenAI actualizado para este chat: ${getOpenAiModelForChat(ctx.chat.id)}\n(override runtime, no modifica .env)`,
+        [
+          `Modelo IA actualizado para este chat: ${getOpenAiModelForChat(ctx.chat.id)}`,
+          `Proveedor detectado: ${openAi.getProviderLabel(getOpenAiModelForChat(ctx.chat.id))}`,
+          "(override runtime, no modifica .env)",
+        ].join("\n"),
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -16934,7 +16965,7 @@ async function handleModelCommand(ctx: ChatReplyContext, inputRaw: string): Prom
 
   if (["reset", "clear", "default"].includes(sub)) {
     resetOpenAiModelForChat(ctx.chat.id);
-    await ctx.reply(`Modelo OpenAI reseteado al default: ${config.openAiModel}`);
+    await ctx.reply(`Modelo IA reseteado al default: ${openAi.getModel()}`);
     return;
   }
 
@@ -17022,8 +17053,8 @@ bot.command("status", async (ctx) => {
       `Outbox pendiente (chat): ${pendingOutboxCount} | dead-letter recientes: ${deadLetterOutboxCount}`,
       `Incoming queue: depth(chat)=${queueDepthChat} | chats activos=${queueActiveChats} | max/chat=${config.incomingQueueMaxPerChat} | max/global=${config.incomingQueueMaxTotal}`,
       `Handler resilience: timeout=${config.handlerTimeoutMs}ms | circuitFail=${config.handlerCircuitBreakerFailures} | circuitOpen=${config.handlerCircuitBreakerOpenMs}ms | retries=${config.transientRetryAttempts}`,
-      `OpenAI: ${openAi.isConfigured() ? `configurado (chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurado"}`,
-      `OpenAI audio model: ${openAi.isConfigured() ? config.openAiAudioModel : "n/d"}`,
+      `IA: ${openAi.isConfigured() ? `configurada (proveedor=${openAi.getProviderLabel(getOpenAiModelForChat(ctx.chat.id))} | chat=${getOpenAiModelForChat(ctx.chat.id)} | default=${openAi.getModel()})` : "no configurada"}`,
+      `IA audio model: ${openAi.isConfiguredForFeature("audio") ? config.openAiAudioModel : "n/d"}`,
       ...buildOpenAiUsageLines(3),
       `Intent router: routes=${semanticIntentRouter.listRoutes().length} | alpha=${semanticIntentRouter.getHybridAlpha().toFixed(2)} | minGap=${semanticIntentRouter.getMinScoreGap().toFixed(3)} | file=${toProjectRelativePath(config.intentRouterRoutesFile)}`,
       `Intent router versions: file=${toProjectRelativePath(config.intentRouterVersionsFile)} | snapshots=${routerVersionStore.listSnapshots().length} | active=${routerVersionStore.getActiveSnapshot()?.id ?? "n/a"}`,
@@ -17120,7 +17151,7 @@ bot.command("usage", async (ctx) => {
   const normalized = input.toLowerCase();
   if (normalized === "reset") {
     openAi.resetUsageSnapshot();
-    await ctx.reply("Métricas OpenAI reiniciadas para este proceso.");
+    await ctx.reply("Métricas IA reiniciadas para este proceso.");
     return;
   }
 
@@ -18147,12 +18178,15 @@ bot.command("ask", async (ctx) => {
 
   if (!openAi.isConfigured()) {
     await ctx.reply(
-      "OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.",
+      openAi.getNotConfiguredMessage("text"),
     );
     return;
   }
 
-  await replyProgress(ctx, `Consultando OpenAI (${getOpenAiModelForChat(ctx.chat.id)})...`);
+  await replyProgress(
+    ctx,
+    `Consultando IA (${openAi.getProviderLabel(getOpenAiModelForChat(ctx.chat.id))} - ${getOpenAiModelForChat(ctx.chat.id)})...`,
+  );
 
   try {
     await appendConversationTurn({
@@ -18176,7 +18210,7 @@ bot.command("ask", async (ctx) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`Error al consultar OpenAI: ${message}`);
+    await ctx.reply(`Error al consultar IA: ${message}`);
   }
 });
 
@@ -18802,7 +18836,7 @@ bot.command("askfile", async (ctx) => {
 
   if (!openAi.isConfigured()) {
     await ctx.reply(
-      "OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.",
+      openAi.getNotConfiguredMessage("text"),
     );
     return;
   }
@@ -18845,7 +18879,10 @@ bot.command("askfile", async (ctx) => {
     `Pregunta del usuario: ${question}`,
   ].join("\n");
 
-  await replyProgress(ctx, `Consultando OpenAI (${getOpenAiModelForChat(ctx.chat.id)})...`);
+  await replyProgress(
+    ctx,
+    `Consultando IA (${openAi.getProviderLabel(getOpenAiModelForChat(ctx.chat.id))} - ${getOpenAiModelForChat(ctx.chat.id)})...`,
+  );
 
   try {
     await appendConversationTurn({
@@ -18884,7 +18921,7 @@ bot.command("askfile", async (ctx) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await ctx.reply(`Error al consultar OpenAI sobre el archivo: ${message}`);
+    await ctx.reply(`Error al consultar IA sobre el archivo: ${message}`);
     await safeAudit({
       type: "doc.ask_failed",
       chatId: ctx.chat.id,
@@ -20204,12 +20241,12 @@ bot.on(["message:photo", "message:document"], async (ctx, next) => {
       `mime: ${resolvedMimeType}`,
     ].join("\n");
 
-    if (!openAi.isConfigured()) {
+    if (!openAi.isConfiguredForFeature("vision")) {
       await ctx.reply(
         [
           summaryHeader,
           "",
-          "OpenAI no está configurado para analizar la imagen (falta OPENAI_API_KEY).",
+          openAi.getNotConfiguredMessage("vision"),
         ].join("\n"),
       );
       await safeAudit({
@@ -20423,9 +20460,9 @@ bot.on(["message:voice", "message:audio", "message:document"], async (ctx, next)
     return;
   }
 
-  if (!openAi.isConfigured()) {
+  if (!openAi.isConfiguredForFeature("audio")) {
     await ctx.reply(
-      "OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.",
+      openAi.getNotConfiguredMessage("audio"),
     );
     return;
   }
@@ -20863,12 +20900,15 @@ async function handleIncomingTextMessage(params: {
 
   if (!openAi.isConfigured()) {
     await params.ctx.reply(
-      "OpenAI no está configurado. Agrega OPENAI_API_KEY en .env y reinicia el bot.",
+      openAi.getNotConfiguredMessage("text"),
     );
     return;
   }
 
-  await replyProgress(params.ctx, "Pensando con OpenAI...");
+  await replyProgress(
+    params.ctx,
+    `Pensando con IA (${openAi.getProviderLabel(getOpenAiModelForChat(params.ctx.chat.id))} - ${getOpenAiModelForChat(params.ctx.chat.id)})...`,
+  );
 
   try {
     const promptContext = await buildPromptContextForQuery(textWithReplyReference, {
@@ -20894,7 +20934,7 @@ async function handleIncomingTextMessage(params: {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await params.ctx.reply(`Error al consultar OpenAI: ${message}`);
+    await params.ctx.reply(`Error al consultar IA: ${message}`);
   }
 }
 
