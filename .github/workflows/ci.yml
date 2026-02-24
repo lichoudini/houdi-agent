@@ -34,7 +34,9 @@ jobs:
             grep -nE "not ok|ERR_|Error \\[|failureType|exitCode" ci-test.log | tail -n 80 || true
             echo "---- tail(ci-test.log) ----"
             tail -n 200 ci-test.log || true
-            details=$(tail -n 60 ci-test.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g')
+            markers=$(grep -nE "not ok|ERR_|Error \\[|failureType|exitCode" ci-test.log | tail -n 40 || true)
+            snippet="${markers}\n\n$(tail -n 80 ci-test.log)"
+            details=$(printf "%b" "$snippet" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g')
             echo "::error title=Node test failed::$details"
             exit 1
           }
