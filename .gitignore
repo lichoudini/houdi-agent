@@ -32,3 +32,8 @@ tools/experiments/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local codex/runtime scratch
+.codex/
+tmp/
+temp/

@@ -48,7 +48,7 @@ const CLI_LOCAL_BRIDGE_MESSAGE_PATH = "/internal/cli/message";
 const CLI_LOCAL_BRIDGE_HEALTH_PATH = "/internal/cli/health";
 const CLI_LOCAL_BRIDGE_TIMEOUT_MS = 90_000;
 const VRAND_QUOTE =
-  "The currents before us are ever changing. We must adapt and press forward if we are to see our journey's end.";
+  "The currents before us are ever changing. We must adapt and press forward, if we are to see our journey's end.";
 
 function printUsage(): void {
   const lines = [

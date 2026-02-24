@@ -56,7 +56,7 @@ const HOUDI_GRADIENT = [
   "\x1b[38;5;39m",
 ];
 const HOUDI_QUOTE =
-  "Las corrientes frente a nosotros cambian constantemente. Debemos adaptarnos, avanzar, para llegar al destino.";
+  "The currents before us are ever changing. We must adapt and press forward, if we are to see our journey's end.";
 
 function buildHoudiAsciiLines(): string[] {
   // 8-line ASCII banner (height fixed at 8), thicker body.

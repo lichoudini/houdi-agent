@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 
 const repoRoot = process.cwd();
 
@@ -79,6 +80,16 @@ const forbiddenPathRules = [
     message: "No versionar tools/experiments internos.",
     test: (file) => /^tools\/experiments\//i.test(file),
   },
+  {
+    id: "path.codex-local",
+    message: "No versionar carpetas locales de Codex (.codex/*).",
+    test: (file) => /^\.codex\//i.test(file),
+  },
+  {
+    id: "path.temp-root",
+    message: "No versionar carpetas temporales en la raíz (tmp|temp).",
+    test: (file) => /^(tmp|temp)\//i.test(file),
+  },
 ];
 
 const blockedInternalWord = String.fromCharCode(108, 105, 109);
@@ -113,6 +124,52 @@ const sensitiveEnvKeys = new Set([
   "WHATSAPP_APP_SECRET",
   "HOUDI_LOCAL_API_TOKEN",
 ]);
+
+const skillFileReferenceRegex = /\(\s*file:\s*([^)]+SKILL\.md)\s*\)/gi;
+
+function normalizeSkillReference(rawPath) {
+  return rawPath.trim().replace(/^["'`]/, "").replace(/["'`]$/, "");
+}
+
+function validateSkillReference(params) {
+  const refRaw = normalizeSkillReference(params.ref);
+  if (!refRaw) {
+    return null;
+  }
+
+  const ref = refRaw.replace(/\\/g, "/");
+  if (/^\//.test(ref) || /^~\//.test(ref) || /^\$[A-Z0-9_]+/i.test(ref)) {
+    return {
+      type: "content.skill-reference-nonportable",
+      file: params.file,
+      line: params.line,
+      detail: `Referencia de skill no portable: ${refRaw}`,
+    };
+  }
+
+  const resolved = path.resolve(repoRoot, ref);
+  const repoResolved = path.resolve(repoRoot);
+  const inRepo = resolved === repoResolved || resolved.startsWith(`${repoResolved}${path.sep}`);
+  if (!inRepo) {
+    return {
+      type: "content.skill-reference-outside-repo",
+      file: params.file,
+      line: params.line,
+      detail: `Referencia de skill fuera del repo: ${refRaw}`,
+    };
+  }
+
+  if (!existsSync(resolved)) {
+    return {
+      type: "content.skill-reference-missing",
+      file: params.file,
+      line: params.line,
+      detail: `SKILL.md referenciado no existe: ${refRaw}`,
+    };
+  }
+
+  return null;
+}
 
 const trackedFiles = listTrackedFiles();
 const findings = [];
@@ -185,6 +242,20 @@ for (const file of trackedFiles) {
         });
       }
     }
+
+    let skillMatch;
+    while ((skillMatch = skillFileReferenceRegex.exec(line)) !== null) {
+      const ref = skillMatch[1] ?? "";
+      const finding = validateSkillReference({
+        file,
+        line: lineNumber,
+        ref,
+      });
+      if (finding) {
+        findings.push(finding);
+      }
+    }
+    skillFileReferenceRegex.lastIndex = 0;
   }
 }
 
