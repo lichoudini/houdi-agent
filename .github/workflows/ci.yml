@@ -26,4 +26,13 @@ jobs:
           cache: "npm"
       - run: npm ci
       - run: npm run build
-      - run: npm run test
+      - name: Run tests (with debug tail on failure)
+        run: |
+          set -o pipefail
+          node --test dist/**/*.test.js > ci-test.log 2>&1 || {
+            echo "---- tail(ci-test.log) ----"
+            tail -n 200 ci-test.log || true
+            details=$(tail -n 60 ci-test.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Node test failed::$details"
+            exit 1
+          }
