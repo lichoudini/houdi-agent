@@ -1,4 +1,4 @@
-# Houdi Agent (Telegram + agentes locales)
+# Houdi Agent | El primer Agente IA de LATAM
 
 Proyecto base desde cero para arrancar un asistente de operación de PC por Telegram, con una arquitectura simple que puedas escalar.
 
