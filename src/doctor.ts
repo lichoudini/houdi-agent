@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { config } from "./config.js";
 
 export type DoctorCheckLevel = "ok" | "warn" | "fail";
 
@@ -31,6 +30,13 @@ export type DoctorRuntimeInput = {
   openAiConfigured: boolean;
   gmail: GmailDoctorStatus;
   botToken: string;
+};
+
+export type DoctorRuntimeConfig = {
+  workspaceDir: string;
+  stateDbFile: string;
+  auditLogPath: string;
+  localApiHost: string;
 };
 
 function parseNodeVersionMajor(version: string): number {
@@ -74,7 +80,21 @@ function buildCheck(level: DoctorCheckLevel, id: string, message: string, hint?:
   return { level, id, message, ...(hint ? { hint } : {}) };
 }
 
-export async function runDoctor(input: DoctorRuntimeInput): Promise<DoctorReport> {
+async function loadRuntimeConfig(): Promise<DoctorRuntimeConfig> {
+  const { config } = await import("./config.js");
+  return {
+    workspaceDir: config.workspaceDir,
+    stateDbFile: config.stateDbFile,
+    auditLogPath: config.auditLogPath,
+    localApiHost: config.localApiHost,
+  };
+}
+
+export async function runDoctor(
+  input: DoctorRuntimeInput,
+  runtimeConfigInput?: DoctorRuntimeConfig,
+): Promise<DoctorReport> {
+  const runtimeConfig = runtimeConfigInput ?? (await loadRuntimeConfig());
   const checks: DoctorCheck[] = [];
 
   const nodeMajor = parseNodeVersionMajor(process.version);
@@ -117,43 +137,43 @@ export async function runDoctor(input: DoctorRuntimeInput): Promise<DoctorReport
     );
   }
 
-  const workspaceWritable = await canWriteWorkspaceDir(config.workspaceDir);
+  const workspaceWritable = await canWriteWorkspaceDir(runtimeConfig.workspaceDir);
   if (workspaceWritable) {
-    checks.push(buildCheck("ok", "workspace.dir", `Workspace accesible: ${config.workspaceDir}`));
+    checks.push(buildCheck("ok", "workspace.dir", `Workspace accesible: ${runtimeConfig.workspaceDir}`));
   } else {
     checks.push(
       buildCheck(
         "fail",
         "workspace.dir",
-        `Sin permisos de escritura en workspace: ${config.workspaceDir}`,
+        `Sin permisos de escritura en workspace: ${runtimeConfig.workspaceDir}`,
         "Corrige permisos/owner del directorio.",
       ),
     );
   }
 
-  const dbWritable = await isPathWritable(config.stateDbFile);
+  const dbWritable = await isPathWritable(runtimeConfig.stateDbFile);
   if (dbWritable) {
-    checks.push(buildCheck("ok", "state.db", `State DB escribible: ${config.stateDbFile}`));
+    checks.push(buildCheck("ok", "state.db", `State DB escribible: ${runtimeConfig.stateDbFile}`));
   } else {
     checks.push(
       buildCheck(
         "fail",
         "state.db",
-        `State DB no escribible: ${config.stateDbFile}`,
+        `State DB no escribible: ${runtimeConfig.stateDbFile}`,
         "Verifica permisos del directorio state.",
       ),
     );
   }
 
-  const auditWritable = await isPathWritable(config.auditLogPath);
+  const auditWritable = await isPathWritable(runtimeConfig.auditLogPath);
   if (auditWritable) {
-    checks.push(buildCheck("ok", "audit.log", `Audit log escribible: ${config.auditLogPath}`));
+    checks.push(buildCheck("ok", "audit.log", `Audit log escribible: ${runtimeConfig.auditLogPath}`));
   } else {
     checks.push(
       buildCheck(
         "warn",
         "audit.log",
-        `No se puede escribir audit log: ${config.auditLogPath}`,
+        `No se puede escribir audit log: ${runtimeConfig.auditLogPath}`,
         "Revisa permisos para no perder trazabilidad.",
       ),
     );
@@ -180,14 +200,14 @@ export async function runDoctor(input: DoctorRuntimeInput): Promise<DoctorReport
     );
   }
 
-  if (hostLooksLoopback(config.localApiHost)) {
-    checks.push(buildCheck("ok", "bridge.bind", `Bridge local bind seguro (${config.localApiHost})`));
+  if (hostLooksLoopback(runtimeConfig.localApiHost)) {
+    checks.push(buildCheck("ok", "bridge.bind", `Bridge local bind seguro (${runtimeConfig.localApiHost})`));
   } else {
     checks.push(
       buildCheck(
         "warn",
         "bridge.bind",
-        `Bridge local expuesto en host no-loopback (${config.localApiHost})`,
+        `Bridge local expuesto en host no-loopback (${runtimeConfig.localApiHost})`,
         "Usa 127.0.0.1 salvo necesidad explícita de red.",
       ),
     );

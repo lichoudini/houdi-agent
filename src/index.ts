@@ -17128,6 +17128,11 @@ bot.command("doctor", async (ctx) => {
       openAiConfigured: openAi.isConfigured(),
       gmail: gmailAccount.getStatus(),
       botToken: config.telegramBotToken,
+    }, {
+      workspaceDir: config.workspaceDir,
+      stateDbFile: config.stateDbFile,
+      auditLogPath: config.auditLogPath,
+      localApiHost: config.localApiHost,
     });
     await replyLong(ctx, formatDoctorReport(report));
     await safeAudit({
