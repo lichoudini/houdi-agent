@@ -203,11 +203,22 @@ export class WorkspaceFilesService {
     };
   }
 
-  formatWorkspaceEntries(entries: WorkspaceEntry[]): string[] {
+  formatWorkspaceEntries(
+    entries: WorkspaceEntry[],
+    options?: { parentRelPath?: string },
+  ): string[] {
+    const parentRaw = options?.parentRelPath?.trim() ?? "";
+    const parentNormalized = parentRaw
+      .replace(/^\/+/, "")
+      .replace(/^workspace(?:\/|$)/i, "")
+      .replace(/\/+$/, "");
+
     return entries.map((entry, index) => {
       const prefix = entry.kind === "dir" ? "[DIR]" : entry.kind === "file" ? "[FILE]" : `[${entry.kind.toUpperCase()}]`;
       const sizeText = typeof entry.size === "number" ? ` (${this.formatBytes(entry.size)})` : "";
-      return `${index + 1}. ${prefix} ${entry.name}${sizeText}`;
+      const relPath = parentNormalized ? `${parentNormalized}/${entry.name}` : entry.name;
+      const touchRef = `workspace/${relPath}`;
+      return `${index + 1}. ${prefix} ${entry.name}${sizeText} | ref: #${touchRef}`;
     });
   }
 

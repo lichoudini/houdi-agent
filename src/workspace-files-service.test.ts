@@ -201,3 +201,33 @@ test("workspace files service keeps unresolved for non-exact candidate", async (
 
   await fs.rm(tempDir, { recursive: true, force: true });
 });
+
+test("workspace files service formats entries with touch-friendly hash reference", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-format-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log"]),
+  );
+
+  const lines = service.formatWorkspaceEntries(
+    [
+      { name: "docs", kind: "dir" },
+      { name: "reporte.csv", kind: "file", size: 12 },
+    ],
+    { parentRelPath: "workspace/files" },
+  );
+  assert.equal(
+    lines[0],
+    "1. [DIR] docs | ref: #workspace/files/docs",
+  );
+  assert.equal(
+    lines[1],
+    "2. [FILE] reporte.csv (12b) | ref: #workspace/files/reporte.csv",
+  );
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});

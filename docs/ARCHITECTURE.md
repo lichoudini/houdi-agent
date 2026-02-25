@@ -7,6 +7,31 @@
   - Pipeline de intención natural (documentos, web, Gmail) antes del fallback general de chat
   - API local `POST /internal/cli/message` para reutilizar el mismo pipeline desde CLI
   - Orquestación de agentes, aprobaciones y ejecución
+  - Mantiene wiring y composición, con handlers pesados extraídos a módulos de `src/orchestration/*`
+- `src/orchestration/incoming-text-handler.ts`
+  - Handler principal de mensajes de texto con DI (clarificación, loops, pending approvals/plans, pipeline natural y fallback IA)
+- `src/orchestration/local-bridge-handler.ts`
+  - Handler HTTP del bridge local con auth, parsing JSON, idempotencia, encolado y respuesta estructurada
+- `src/orchestration/sequence-planner.ts`
+  - Parseo/planificación de instrucciones secuenciadas con IA
+  - Materialización de pasos con contenido AI inyectable (`{{ai_content}}`)
+- `src/orchestration/router-engine.ts`
+  - Motor de decisión de routing natural (layers, jerárquico, filtro contextual, semántico, AI-judge y ensemble)
+  - Entrega orden de handlers y señales de abstención/clarificación sin acoplar al runtime principal
+- `src/orchestration/intent-executor.ts`
+  - Ejecución multi-intent top-N desacoplada (delegación por subagente + ejecución resiliente)
+- `src/orchestration/intent-handler-loop.ts`
+  - Loop principal de handlers enruteados (typed-missing, delegación por subagente, reply-guard y cierre de ejecución)
+- `src/orchestration/clarification-logic.ts`
+  - Lógica de clarificaciones pendientes (detectar respuesta válida, invalidar por nuevo intento y construir follow-up)
+- `src/orchestration/clarification-state.ts`
+  - Store de clarificaciones pendientes con TTL (register/peek/consume/clear), separado del runtime principal
+- `src/orchestration/intent-router-dataset.ts`
+  - Constructor común de entradas del dataset del intent router (reduce duplicación y riesgo de drift en métricas)
+- `src/orchestration/intent-action-outcome-state.ts`
+  - Store de resultados de ejecución por intención (set/consume), desacoplado de la orquestación principal
+- `src/orchestration/runtime-start.ts`
+  - Arranque coordinado de bridge local + workers + bot start con manejo unificado de errores
 - `src/cli.ts`
   - Entrada CLI local (`npm run cli`) para consultar al agente sin Telegram
   - `transport=auto|bridge|local` para paridad con Telegram cuando el bridge está activo
