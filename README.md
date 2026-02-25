@@ -1123,4 +1123,4 @@ npm run dev
 4. Cola de trabajos y workers separados
 5. Plugin system para acciones (archivos, browser, RDP, etc.)
 
-Contacto operativo: patagonads@gmail.com
+Contacto operativo: houdi@houdiagent.com
