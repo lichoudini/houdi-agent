@@ -2,7 +2,6 @@ import type { IntentRouteName, SemanticRouteDecision } from "../intent-semantic-
 
 export type NaturalIntentRouteName =
   | "self-maintenance"
-  | "connector"
   | "schedule"
   | "memory"
   | "gmail-recipients"
@@ -85,7 +84,6 @@ export type RoutingResolution = {
 export type ResolveNaturalIntentRoutingDeps = {
   getIndexedListKind: (chatId: number) => "workspace-list" | "stored-files" | "web-results" | "gmail-list" | null;
   hasPendingWorkspaceDeleteConfirmation: (chatId: number) => boolean;
-  hasRecentConnectorContext: (chatId: number) => boolean;
   applyIntentRouteLayers: (
     candidates: NaturalIntentRouteName[],
     params: {
@@ -108,7 +106,6 @@ export type ResolveNaturalIntentRoutingDeps = {
     hasMemoryRecallCue: boolean;
     indexedListKind: "workspace-list" | "stored-files" | "web-results" | "gmail-list" | null;
     hasPendingWorkspaceDelete: boolean;
-    hasRecentConnectorContext: boolean;
   }) => HierarchicalIntentDecisionLike | null;
   buildIntentRouterContextFilter: (params: {
     chatId: number;
@@ -196,7 +193,6 @@ export async function resolveNaturalIntentRouting(
     hasMemoryRecallCue,
     indexedListKind,
     hasPendingWorkspaceDelete,
-    hasRecentConnectorContext: deps.hasRecentConnectorContext(params.chatId),
   });
 
   const hierarchyAllowedCandidatesRaw = hierarchyDecision

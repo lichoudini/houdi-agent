@@ -39,7 +39,7 @@
   - Comandos de memoria (`memory status/search/view`, `remember`)
 - `src/onboard.ts`
   - Wizard interactivo de instalación (`npm run onboard`)
-  - Setup guiado de `.env` (Telegram, Gmail, workspace, bridge local, WhatsApp bridge y conector externo opcional)
+  - Setup guiado de `.env` (Telegram, Gmail, workspace, bridge local y WhatsApp bridge)
   - Opcionalmente instala dependencias/build y servicio systemd
 - `src/whatsapp-bridge.ts`
   - Bridge de WhatsApp Cloud API (webhook verify + inbound + outbound)

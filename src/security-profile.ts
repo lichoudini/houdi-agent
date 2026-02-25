@@ -5,7 +5,6 @@ export type SecurityProfilePolicy = {
   allowAiShell: boolean;
   allowReboot: boolean;
   forceApprovalMode: boolean;
-  requiresApprovalForConnectorCommands: boolean;
 };
 
 function normalizeProfileName(input: string | undefined): SecurityProfileName {
@@ -24,7 +23,6 @@ export function resolveSecurityProfile(input: string | undefined): SecurityProfi
       allowAiShell: true,
       allowReboot: true,
       forceApprovalMode: false,
-      requiresApprovalForConnectorCommands: false,
     };
   }
   return {
@@ -32,6 +30,5 @@ export function resolveSecurityProfile(input: string | undefined): SecurityProfi
     allowAiShell: false,
     allowReboot: false,
     forceApprovalMode: true,
-    requiresApprovalForConnectorCommands: true,
   };
 }

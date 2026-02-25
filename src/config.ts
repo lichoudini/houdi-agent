@@ -99,14 +99,6 @@ const EnvSchema = z.object({
   GMAIL_REFRESH_TOKEN: z.string().trim().optional(),
   GMAIL_ACCOUNT_EMAIL: z.string().trim().optional(),
   GMAIL_MAX_RESULTS: z.coerce.number().int().positive().max(100).default(5),
-  ENABLE_CONNECTOR_CONTROL: z.string().optional(),
-  CONNECTOR_APP_DIR: z.string().trim().optional(),
-  CONNECTOR_APP_SERVICE: z.string().trim().optional(),
-  CONNECTOR_TUNNEL_SERVICE: z.string().trim().optional(),
-  CONNECTOR_LOCAL_HEALTH_URL: z.string().trim().optional(),
-  CONNECTOR_PUBLIC_HEALTH_URL: z.string().trim().optional(),
-  CONNECTOR_HEALTH_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).optional(),
-  CONNECTOR_SOURCE_ACCOUNT_MAP_JSON: z.string().trim().optional(),
   HOUDI_LOCAL_API_ENABLED: z.string().optional(),
   HOUDI_LOCAL_API_HOST: z.string().trim().default("127.0.0.1"),
   HOUDI_LOCAL_API_PORT: z.coerce.number().int().positive().max(65535).default(3210),
@@ -184,7 +176,6 @@ function parseIntentRouteAlphaMapJson(value: string | undefined): Record<string,
     }
     const allowed = new Set([
       "self-maintenance",
-      "connector",
       "schedule",
       "memory",
       "gmail-recipients",
@@ -196,7 +187,7 @@ function parseIntentRouteAlphaMapJson(value: string | undefined): Record<string,
     const output: Record<string, number> = {};
     for (const [rawKey, rawValue] of Object.entries(parsed as Record<string, unknown>)) {
       const keyRaw = rawKey.trim();
-      const key = keyRaw === "connector" ? "connector" : keyRaw;
+      const key = keyRaw;
       if (!allowed.has(key)) {
         continue;
       }
@@ -210,29 +201,6 @@ function parseIntentRouteAlphaMapJson(value: string | undefined): Record<string,
   } catch {
     return {};
   }
-}
-
-function normalizeConnectorSourceMapKey(value: string): string {
-  return value
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
-
-function parseConnectorSourceAccountMapJson(value: string | undefined): Record<string, string> {
-  const base = parseStringMapJson(value);
-  const output: Record<string, string> = {};
-  for (const [rawKey, rawValue] of Object.entries(base)) {
-    const normalizedKey = normalizeConnectorSourceMapKey(rawKey);
-    const normalizedValue = rawValue.trim();
-    if (!normalizedKey || !normalizedValue) {
-      continue;
-    }
-    output[normalizedKey] = normalizedValue;
-  }
-  return output;
 }
 
 function isValidIPv4(host: string): boolean {
@@ -375,14 +343,6 @@ export const config = {
   gmailRefreshToken: env.GMAIL_REFRESH_TOKEN?.trim() || undefined,
   gmailAccountEmail: env.GMAIL_ACCOUNT_EMAIL?.trim() || undefined,
   gmailMaxResults: env.GMAIL_MAX_RESULTS,
-  enableConnectorControl: parseBooleanFlag(env.ENABLE_CONNECTOR_CONTROL, false),
-  connectorAppDir: path.resolve(process.cwd(), env.CONNECTOR_APP_DIR || "./connector-app"),
-  connectorAppService: env.CONNECTOR_APP_SERVICE || "houdi-connector-app.service",
-  connectorTunnelService: env.CONNECTOR_TUNNEL_SERVICE || "houdi-connector-tunnel.service",
-  connectorLocalHealthUrl: env.CONNECTOR_LOCAL_HEALTH_URL || "http://127.0.0.1:3333/health",
-  connectorPublicHealthUrl: env.CONNECTOR_PUBLIC_HEALTH_URL || "http://127.0.0.1:3333/health",
-  connectorHealthTimeoutMs: env.CONNECTOR_HEALTH_TIMEOUT_MS ?? 7000,
-  connectorSourceAccountMap: parseConnectorSourceAccountMapJson(env.CONNECTOR_SOURCE_ACCOUNT_MAP_JSON),
   localApiEnabled: parseBooleanFlag(env.HOUDI_LOCAL_API_ENABLED, true),
   localApiHost: normalizeLocalApiHost(env.HOUDI_LOCAL_API_HOST),
   localApiPort: env.HOUDI_LOCAL_API_PORT,

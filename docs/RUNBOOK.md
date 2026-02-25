@@ -2,7 +2,7 @@
 
 ## 0. Perfiles de operación
 - `full-control` (host propio): mantener `DEFAULT_AGENT=operator` y usar `/agent set admin` solo para acciones puntuales de alto privilegio. Monitorear `journalctl`.
-- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false`/`ENABLE_CONNECTOR_CONTROL=false` salvo necesidad.
+- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false` salvo necesidad.
 
 ## 1. Arranque normal
 ```bash

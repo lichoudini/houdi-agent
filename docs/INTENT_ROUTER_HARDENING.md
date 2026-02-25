@@ -6,7 +6,6 @@ Fecha: 2026-02-21
 
 Elevar robustez del enrutamiento natural para reducir:
 
-- falsas ejecuciones de dominios sensibles (`gmail`, `workspace`, `connector`, `schedule`)
 - ambiguedad en pedidos cortos o multi-intent
 - degradacion silenciosa de canary/experimentos sin control
 
@@ -19,7 +18,6 @@ Elevar robustez del enrutamiento natural para reducir:
    - dominios macro: `communication`, `files`, `operations`, `planning-memory`, `knowledge`, `social`
    - archivo: `src/domains/router/hierarchical.ts`
 3. filtro contextual:
-   - pending confirm, referencias indexadas, follow-up corto, pistas explicitas CONNECTOR/Gmail/workspace
    - archivo: `src/domains/router/context-filter.ts`
 4. router semantico hibrido:
    - lexical cosine + BM25 + char n-grams + negativos por ruta
@@ -59,7 +57,6 @@ Formula conceptual:
 - gating de campos requeridos para acciones sensibles:
   - `gmail.send`: `to`, `subject/body` segun accion
   - `workspace`: ruta/selectores/nuevo nombre segun accion
-  - `connector(CONNECTOR)`: `first_name`, `last_name`, `fuente`
   - `schedule edit/delete`: identificador de tarea
   - `gmail-recipients`: nombre/email segun ABM
 
@@ -67,7 +64,7 @@ Formula conceptual:
 
 Se habilita ejecucion secuencial de multiples dominios solo cuando:
 
-- hay conectores linguistico-logicos (`luego`, `despues`, `ademas`, `tambien`)
+- hay nexos linguistico-logicos (`luego`, `despues`, `ademas`, `tambien`)
 - top candidatos del ensemble tienen soporte de parser por dominio
 
 Resultado:

@@ -1,4 +1,4 @@
-export type ScheduledAutomationDomain = "gmail" | "web" | "workspace" | "connector" | "command";
+export type ScheduledAutomationDomain = "gmail" | "web" | "workspace" | "command";
 
 export type ScheduledAutomationIntent = {
   instruction?: string;
@@ -78,9 +78,6 @@ function detectAutomationDomain(
 ): ScheduledAutomationDomain | undefined {
   const normalized = normalizeIntentText(instruction);
 
-  if (/\b(connector|lista\s+connector|consulta\s+connector|buscar\s+connector|revisar\s+connector)\b/.test(normalized)) {
-    return "connector";
-  }
   if (/\b(workspace|archivo|archivos|carpeta|carpetas|directorio|directorios|\/workspace|\/images|\/img|\/files)\b/.test(normalized)) {
     return "workspace";
   }
@@ -91,7 +88,7 @@ function detectAutomationDomain(
     return "web";
   }
   if (
-    /\b(ejecuta(?:r)?|run|comando|shell|script|lista\s+connector)\b/.test(normalized) ||
+    /\b(ejecuta(?:r)?|run|comando|shell|script)\b/.test(normalized) ||
     /(?:^|\s)\/(?:status|health|task)\b/.test(normalized)
   ) {
     return "command";

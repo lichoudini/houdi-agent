@@ -1,7 +1,6 @@
 # Proximos Pasos
 
 ## Estado general
-El proyecto ya esta en un punto funcional para uso real (onboarding, systemd, runbook, memoria, CONNECTOR/Gmail, CLI + Telegram).  
 Para elevar robustez y mantenibilidad a nivel produccion, se priorizan las siguientes mejoras.
 
 ## Avances ya aplicados (resumen)
@@ -16,11 +15,9 @@ Para elevar robustez y mantenibilidad a nivel produccion, se priorizan las sigui
 ## Prioridad alta
 1. Completar modularizacion de `src/index.ts` (todavia centraliza demasiada orquestacion).
 - Riesgo actual: alta probabilidad de regresiones y baja mantenibilidad.
-- Accion: separar por dominios (`intents`, `workspace`, `gmail`, `connector`, `scheduler`, `router`).
 
 2. Incorporar tests automatizados.
 - Riesgo actual: cambios en lenguaje natural pueden romper flujos existentes.
-- Accion: tests para parser/intents, confirmaciones, file ops, CONNECTOR routing y Gmail compose/send.
 
 3. Crear CI/CD base.
 - Riesgo actual: no hay validacion automatica en cada cambio.

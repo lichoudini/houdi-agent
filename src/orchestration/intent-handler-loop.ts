@@ -162,7 +162,7 @@ export async function runRoutedIntentHandlers<Ctx extends { chat: { id: number }
         }),
     });
 
-    if (handled && handler.name !== "connector") {
+    if (handled) {
       const gotResponse = handlerObservedReply || deps.hasAssistantResponseSince(params.ctx.chat.id, handlerStartedAtMs);
       if (!gotResponse) {
         const guardMessage = `No pude confirmar la respuesta del dominio ${handler.name}. Reintentá la instrucción en una sola frase.`;

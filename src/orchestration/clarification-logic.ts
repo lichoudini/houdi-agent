@@ -163,7 +163,7 @@ export function shouldTreatAsClarificationReply(params: {
   if (missing.has("target") && (/\bresultado\s+\d{1,2}\b/i.test(raw) || /\bhttps?:\/\/\S+/i.test(raw))) {
     return true;
   }
-  if (missing.size > 0 && /\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|email|web|connector|memoria|recordatorio|tarea)\b/i.test(raw)) {
+  if (missing.size > 0 && /\b(tsk[-_]|workspace|archivo|carpeta|gmail|correo|email|web|memoria|recordatorio|tarea)\b/i.test(raw)) {
     return true;
   }
 
@@ -193,7 +193,7 @@ export function shouldDropPendingClarificationForFreshIntent(
   const verbs =
     /\b(ver|mostrar|lista|listar|crear|crea|editar|edita|enviar|enviame|buscar|busca|abrir|abre|eliminar|borra|programa|recorda|recordar|ejecuta|revisar|consulta|analiza|resumi|resumir|actualiza|modifica|mueve|renombra)\b/;
   const domains =
-    /\b(gmail|correo|email|destinatario|workspace|archivo|carpeta|documento|pdf|tarea|task|tsk|web|url|noticia|memoria|connector|shell|exec|comando|skill|habilidad)\b/;
+    /\b(gmail|correo|email|destinatario|workspace|archivo|carpeta|documento|pdf|tarea|task|tsk|web|url|noticia|memoria|shell|exec|comando|skill|habilidad)\b/;
   return verbs.test(normalized) || domains.test(normalized);
 }
 

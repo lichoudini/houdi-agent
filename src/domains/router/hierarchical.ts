@@ -21,13 +21,12 @@ type HierarchicalIntentParams = {
   hasMemoryRecallCue: boolean;
   indexedListKind?: "workspace-list" | "stored-files" | "web-results" | "gmail-list" | null;
   hasPendingWorkspaceDelete: boolean;
-  hasRecentConnectorContext?: boolean;
 };
 
 const DOMAIN_TO_HANDLERS: Record<IntentCoarseDomain, string[]> = {
   communication: ["gmail", "gmail-recipients"],
   files: ["workspace", "document"],
-  operations: ["connector", "self-maintenance"],
+  operations: ["self-maintenance"],
   "planning-memory": ["schedule", "memory"],
   knowledge: ["web"],
 };
@@ -78,9 +77,7 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
   ) {
     add("planning-memory", 0.54);
   }
-  if (
-    /\b(connector|conector|cloudflared|tunnel|systemctl|servicio|reinicia el agente|actualiza el repositorio|skill)\b/.test(t)
-  ) {
+  if (/\b(systemctl|servicio|reinicia el agente|actualiza el repositorio|skill)\b/.test(t)) {
     add("operations", 0.68);
   }
   if (params.indexedListKind === "gmail-list") {
@@ -94,10 +91,6 @@ function scoreDomains(params: HierarchicalIntentParams): Array<{ domain: IntentC
   if (params.hasPendingWorkspaceDelete) {
     add("files", 0.45);
   }
-  if (params.hasRecentConnectorContext && /\b(connector|conector|servicio|tunnel|estado|start|stop|restart)\b/.test(t)) {
-    add("operations", 0.35);
-  }
-
   return [...scores.entries()]
     .map(([domain, score]) => ({ domain, score }))
     .sort((a, b) => b.score - a.score);

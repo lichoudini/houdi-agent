@@ -4,26 +4,28 @@ import { buildIntentRouterContextFilter } from "./context-filter.js";
 import { applyIntentRouteLayers } from "./route-layers.js";
 import { buildHierarchicalIntentDecision } from "./hierarchical.js";
 
+function baseDeps() {
+  return {
+    normalizeIntentText: (text: string) => text.toLowerCase().trim(),
+    parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
+    getIndexedListContext: () => null,
+    getPendingWorkspaceDelete: () => null,
+    getPendingWorkspaceDeletePath: () => null,
+    getLastGmailResultsCount: () => 0,
+    getLastListedFilesCount: () => 0,
+  };
+}
+
 test("context filter enforces strict exhaustion when explicit route has no overlap", () => {
   const decision = buildIntentRouterContextFilter(
     {
       chatId: 1,
       text: "eliminar archivo temporal",
-      candidates: ["gmail", "connector"],
+      candidates: ["gmail", "schedule"],
       hasMailContext: false,
       hasMemoryRecallCue: false,
     },
-    {
-      normalizeIntentText: (text) => text.toLowerCase().trim(),
-      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
-      getIndexedListContext: () => null,
-      getPendingWorkspaceDelete: () => null,
-      getPendingWorkspaceDeletePath: () => null,
-      getLastGmailResultsCount: () => 0,
-      getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
-    },
+    baseDeps(),
   );
   assert.ok(decision);
   assert.equal(decision.strict, true);
@@ -92,15 +94,8 @@ test("context filter prioritizes indexed list context for 'abri el 2'", () => {
       hasMemoryRecallCue: false,
     },
     {
-      normalizeIntentText: (text) => text.toLowerCase().trim(),
-      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
-      getIndexedListContext: () => ({ kind: "gmail-list" }),
-      getPendingWorkspaceDelete: () => null,
-      getPendingWorkspaceDeletePath: () => null,
-      getLastGmailResultsCount: () => 0,
-      getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
+      ...baseDeps(),
+      getIndexedListContext: () => ({ kind: "gmail-list" as const }),
     },
   );
   assert.ok(decision);
@@ -111,7 +106,7 @@ test("context filter prioritizes indexed list context for 'abri el 2'", () => {
 test("hierarchical router returns strict exhaustion when top domain is incompatible", () => {
   const decision = buildHierarchicalIntentDecision({
     normalizedText: "eliminar archivo de workspace",
-    candidates: ["gmail", "connector"],
+    candidates: ["gmail", "schedule"],
     hasMailContext: false,
     hasMemoryRecallCue: false,
     indexedListKind: null,
@@ -132,17 +127,7 @@ test("context filter does not misroute 'leer correos' to workspace", () => {
       hasMailContext: true,
       hasMemoryRecallCue: false,
     },
-    {
-      normalizeIntentText: (text) => text.toLowerCase().trim(),
-      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
-      getIndexedListContext: () => null,
-      getPendingWorkspaceDelete: () => null,
-      getPendingWorkspaceDeletePath: () => null,
-      getLastGmailResultsCount: () => 0,
-      getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
-    },
+    baseDeps(),
   );
   if (decision) {
     assert.equal(decision.exhausted, false);
@@ -162,17 +147,7 @@ test("context filter prioriza self-maintenance para skill natural", () => {
       hasMailContext: false,
       hasMemoryRecallCue: false,
     },
-    {
-      normalizeIntentText: (text) => text.toLowerCase().trim(),
-      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
-      getIndexedListContext: () => null,
-      getPendingWorkspaceDelete: () => null,
-      getPendingWorkspaceDeletePath: () => null,
-      getLastGmailResultsCount: () => 0,
-      getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
-    },
+    baseDeps(),
   );
   assert.ok(decision);
   assert.equal(decision?.strict, true);
@@ -245,17 +220,7 @@ test("context filter prioriza schedule para eliminar tsk parcial", () => {
       hasMailContext: false,
       hasMemoryRecallCue: false,
     },
-    {
-      normalizeIntentText: (text) => text.toLowerCase().trim(),
-      parseIndexedListReferenceIntent: () => ({ shouldHandle: false }),
-      getIndexedListContext: () => null,
-      getPendingWorkspaceDelete: () => null,
-      getPendingWorkspaceDeletePath: () => null,
-      getLastGmailResultsCount: () => 0,
-      getLastListedFilesCount: () => 0,
-      getLastConnectorContextAt: () => 0,
-      connectorContextTtlMs: 60_000,
-    },
+    baseDeps(),
   );
   assert.ok(decision);
   assert.equal(decision?.strict, true);

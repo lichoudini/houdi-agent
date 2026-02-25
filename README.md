@@ -100,14 +100,12 @@ Perfil `full-control` (equipo propio y de confianza):
 
 - Objetivo: máxima autonomía operativa.
 - Mantener `DEFAULT_AGENT=operator` y cambiar temporalmente a `admin` solo para acciones puntuales.
-- Sugerido: habilitar solo lo que realmente uses (`ENABLE_REBOOT_COMMAND`, `ENABLE_CONNECTOR_CONTROL`, `ENABLE_GMAIL_ACCOUNT`).
 - Ejecutar en host dedicado y con monitoreo de logs.
 
 Perfil `moderated` (entorno compartido o más estricto):
 
 - Objetivo: minimizar riesgo de ejecución accidental.
 - Requerido: `DEFAULT_AGENT=operator` (default del proyecto).
-- Sugerido: mantener `ENABLE_REBOOT_COMMAND=false` y `ENABLE_CONNECTOR_CONTROL=false` si no son imprescindibles.
 - Para tareas sensibles, cambiar agente temporalmente: `/agent set admin` y luego volver a `/agent set operator`.
 - Reducir allowlists en `agents/operator.json` y reservar `agents/admin.json` para casos puntuales.
 
@@ -376,14 +374,6 @@ cp .env.example .env
 - `GMAIL_REFRESH_TOKEN` (refresh token del usuario Gmail)
 - `GMAIL_ACCOUNT_EMAIL` (opcional, solo informativo)
 - `GMAIL_MAX_RESULTS` (default: `10`)
-- `ENABLE_CONNECTOR_CONTROL` (default: `false`)
-- `CONNECTOR_APP_DIR` (default: `./connector-app`)
-- `CONNECTOR_APP_SERVICE` (default: `houdi-connector-app.service`)
-- `CONNECTOR_TUNNEL_SERVICE` (default: `houdi-connector-tunnel.service`)
-- `CONNECTOR_LOCAL_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
-- `CONNECTOR_PUBLIC_HEALTH_URL` (default: `http://127.0.0.1:3333/health`)
-- `CONNECTOR_HEALTH_TIMEOUT_MS` (default: `7000`)
-- `CONNECTOR_SOURCE_ACCOUNT_MAP_JSON` (opcional, mapeo `fuente -> account`, JSON string)
 - `HOUDI_LOCAL_API_ENABLED` (default: `true`, habilita bridge local CLI->bot)
 - `HOUDI_LOCAL_API_HOST` (default: `127.0.0.1`)
 - `HOUDI_LOCAL_API_PORT` (default: `3210`)
@@ -653,7 +643,6 @@ Memoria por CLI:
 
 ```bash
 npm run cli -- memory status
-npm run cli -- memory search "CONNECTOR"
 npm run cli -- memory view memory/2026-02-20.md 1 80
 npm run cli -- remember "nota rápida desde CLI"
 ```
@@ -832,58 +821,32 @@ Nota de seguridad:
 - El bot exige que el agente activo tenga `gmail-api` en `allowCommands` (incluido en `operator` y `admin`).
 - En las respuestas, los IDs se muestran como `#<valor>` (además del valor crudo en `` `...` ``), sin prefijo `id_`.
 
-## Control CONNECTOR (natural)
 
-Con `ENABLE_CONNECTOR_CONTROL=true`, puedes operar una app externa y su túnel sin comandos:
 
-- `estado de CONNECTOR`
-- `levantá CONNECTOR`
-- `reiniciá CONNECTOR`
-- `apagá CONNECTOR`
-- `levantá CONNECTOR solo app` (sin tunnel)
 
 Regla de activación:
 
-- El dominio CONNECTOR solo se activa si el mensaje incluye explícitamente `CONNECTOR`/`connector` (o `/connector`).
-- Si no aparece `connector`, el bot no entra al flujo CONNECTOR (evita confusiones con otras conversaciones).
 
-Consulta directa de mensajes CONNECTOR (contacto + fuente):
 
-- `/connector first_name:Juan last_name:Perez fuente:source_demo count:5`
-- `/connector list [limit:5]`
-- `/connector account_demo` (consulta por cuenta/perfiles)
-- `/connector actualidad` (alias a `account_news`)
-- `consulta CONNECTOR first_name:Juan last_name:Perez fuente:source_demo`
-- `revisar CONNECTOR de Persona Ejemplo en linkedin profile_a`
 - `trae los ultimos 5 mensajes de Persona Ejemplo en linkedin profile_a`
-- `historial connector`
-- `connector account_demo`
 
-Notas de consulta CONNECTOR:
 
 - En lenguaje natural, `count` por defecto es `5` (max `5`).
 - La lectura prioriza mensajes del prospecto (entrantes/no propios).
 - El parser usa estrategia híbrida (reglas + fallback IA) para extraer `first_name`, `last_name`, `fuente` y reducir errores de interpretación en frases libres.
-- En `/connector list`, `limit` por defecto es `5` y el máximo es `5`.
-- Consulta por cuenta (`connector <cuenta>`) usa historial global CONNECTOR y devuelve hasta 5 mensajes recientes cruzando todos los perfiles de esa cuenta.
 
 `fuente` se normaliza a `account`. Si necesitas alias personalizados usa:
 
 ```env
-CONNECTOR_SOURCE_ACCOUNT_MAP_JSON={"source_a":"account_main","source_b":"account_ops","news":"account_news"}
 ```
 
 Instalación de servicios `systemd --user` para dejarlo persistente:
 
 ```bash
 cd /home/houdi/houdi-agent
-./scripts/install-connector-user-services.sh
 ```
 
 El script crea:
-- `houdi-connector-app.service`
-- `houdi-connector-tunnel.service`
-- `houdi-connector-stack.target`
 
 ## Navegación Web
 

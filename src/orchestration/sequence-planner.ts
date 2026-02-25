@@ -98,7 +98,7 @@ export async function classifySequencedIntentPlanWithAi(
     "Si es sequence, devuelve pasos concretos en orden de ejecucion.",
     "Devuelve SOLO JSON valido.",
     "",
-    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, connector, self-maintenance.",
+    "Dominios de ejecucion disponibles: workspace, gmail, gmail-recipients, web, document, memory, schedule, self-maintenance.",
     "",
     "Reglas:",
     "- Usa mode=sequence solo si hay 2 o mas acciones distintas o dependientes.",

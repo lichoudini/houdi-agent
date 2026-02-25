@@ -312,7 +312,7 @@ export async function handleIncomingTextMessageWithDeps(
       });
     }
     const responseText =
-      "SAFE mode: detecté una orden operativa, pero no hubo ejecución confirmada. Reformulá con acción+parámetros o usa comando explícito (/workspace, /gmail, /schedule, /connector, /shell).";
+      "SAFE mode: detecté una orden operativa, pero no hubo ejecución confirmada. Reformulá con acción+parámetros o usa comando explícito (/workspace, /gmail, /schedule, /shell).";
     await params.ctx.reply(responseText);
     await deps.appendConversationTurn({
       chatId: params.ctx.chat.id,
